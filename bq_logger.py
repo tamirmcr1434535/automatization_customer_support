@@ -1,57 +1,42 @@
-import os, logging
-from datetime import datetime, timezone
+import os
+import logging
 from google.cloud import bigquery
+from datetime import datetime
 
-log = logging.getLogger("bq")
+logger = logging.getLogger(__name__)
 
-PROJECT   = os.getenv("GCP_PROJECT", "powerful-vine-426615-r2")
-BQ_TABLE  = f"{PROJECT}.zendesk_bot.cancellation_logs"
-_bq       = None
-
-SCHEMA = [
-    bigquery.SchemaField("ticket_id",  "STRING"),
-    bigquery.SchemaField("intent",     "STRING"),
-    bigquery.SchemaField("language",   "STRING"),
-    bigquery.SchemaField("action",     "STRING"),
-    bigquery.SchemaField("status",     "STRING"),
-    bigquery.SchemaField("dry_run",    "BOOLEAN"),
-    bigquery.SchemaField("error",      "STRING"),
-    bigquery.SchemaField("logged_at",  "TIMESTAMP"),
-]
-
-def _client():
-    global _bq
-    if not _bq:
-        _bq = bigquery.Client(project=PROJECT)
-    return _bq
-
-def ensure_log_table():
-    c = _client()
+def log_ticket(ticket_id, intent, language, action, status, dry_run, 
+               reply_text=None, confidence=None, chargeback_risk=None, reasoning=None):
     try:
-        c.get_table(BQ_TABLE)
-    except Exception:
-        dataset = BQ_TABLE.split(".")[1]
-        try:
-            c.create_dataset(f"{PROJECT}.{dataset}")
-        except Exception:
-            pass
-        c.create_table(bigquery.Table(BQ_TABLE, schema=SCHEMA))
-        log.info(f"Created {BQ_TABLE}")
-
-def log_result(result: dict):
-    try:
-        row = {
-            "ticket_id":  str(result.get("ticket_id", "")),
-            "intent":     result.get("intent") or "",
-            "language":   result.get("language") or "",
-            "action":     result.get("action") or "",
-            "status":     result.get("status") or "",
-            "dry_run":    result.get("dry_run", True),
-            "error":      result.get("error") or "",
-            "logged_at":  datetime.now(timezone.utc).isoformat(),
-        }
-        errors = _client().insert_rows_json(BQ_TABLE, [row])
+        project_id = os.getenv("GCP_PROJECT", "powerful-vine-426615-r2")
+        client = bigquery.Client(project=project_id)
+        
+        table_id = f"{project_id}.zendesk_bot.cancellation_logs"
+        
+        row_to_insert =[{
+            "ticket_id": str(ticket_id),
+            "intent": intent,
+            "language": language,
+            "action": action,
+            "status": status,
+            "dry_run": dry_run,
+            "logged_at": datetime.utcnow().isoformat(),
+            
+            # Нові поля
+            "reply_text": reply_text,
+            "confidence": confidence,
+            "chargeback_risk": chargeback_risk,
+            "reasoning": reasoning
+        }]
+        
+        logger.info(f"[{ticket_id}] Sening data to BigQuery: {table_id}...")
+        
+        errors = client.insert_rows_json(table_id, row_to_insert)
+        
         if errors:
-            log.warning(f"BQ insert errors: {errors}")
+            logger.error(f"[{ticket_id}] BQ log failed: {errors}")
+        else:
+            logger.info(f"[{ticket_id}] ✅ Successfully logged to BigQuery!")
+            
     except Exception as e:
-        log.warning(f"BQ log failed (non-critical): {e}")
+        logger.error(f"[{ticket_id}] BQ log exception: {str(e)}", exc_info=True)
