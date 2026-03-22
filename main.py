@@ -20,7 +20,6 @@ from bq_logger import log_result, ensure_log_table
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-# ── CONFIG (з environment variables) ──────────────────────────────────────
 DRY_RUN    = os.getenv("DRY_RUN", "true").lower() == "true"
 TEST_MODE  = os.getenv("TEST_MODE", "true").lower() == "true"
 TEST_TAG   = "automation_test"
@@ -31,7 +30,6 @@ HANDLED_INTENTS = {
     "SUB_RENEWAL_CANCELLATION",
 }
 
-# Ініціалізуємо клієнтів один раз (між викликами функції — кешується)
 zendesk = ZendeskClient(
     subdomain  = os.getenv("ZENDESK_SUBDOMAIN"),
     email      = os.getenv("ZENDESK_EMAIL"),
@@ -44,15 +42,8 @@ stripe_cli = StripeClient(
 )
 
 
-# ── ENTRY POINT ────────────────────────────────────────────────────────────
 @functions_framework.http
 def zendesk_webhook(request):
-    """
-    Cloud Function entry point.
-    Zendesk шле POST сюди при кожному новому тікеті.
-    """
-
-    # Health check
     if request.method == "GET":
         return json.dumps({
             "status": "ok",
@@ -64,7 +55,6 @@ def zendesk_webhook(request):
     if request.method != "POST":
         return "Method not allowed", 405
 
-    # Parse payload
     try:
         payload = request.get_json(silent=True) or {}
     except Exception:
@@ -76,8 +66,6 @@ def zendesk_webhook(request):
 
     log.info(f"[{ticket_id}] Webhook received")
 
-    # Відповідаємо Zendesk одразу (200), обробляємо синхронно
-    # (Cloud Functions Gen 2 підтримує до 60 хв timeout)
     try:
         result = _process(ticket_id)
     except Exception as e:
@@ -87,7 +75,6 @@ def zendesk_webhook(request):
     return json.dumps(result), 200, {"Content-Type": "application/json"}
 
 
-# ── MAIN LOGIC ─────────────────────────────────────────────────────────────
 def _process(ticket_id: str) -> dict:
     result = {
         "ticket_id": ticket_id,
@@ -98,7 +85,6 @@ def _process(ticket_id: str) -> dict:
         "dry_run": DRY_RUN,
     }
 
-    # 1. Fetch ticket
     ticket = zendesk.get_ticket(ticket_id)
     if not ticket:
         log.warning(f"[{ticket_id}] Not found in Zendesk")
@@ -114,31 +100,30 @@ def _process(ticket_id: str) -> dict:
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
-    # 2. Test mode — тільки тікети з тегом automation_test
     if TEST_MODE and TEST_TAG not in tags:
         log.info(f"[{ticket_id}] Skip — test mode, missing tag '{TEST_TAG}'")
         result["status"] = "skipped_no_test_tag"
         log_result(result)
         return result
 
-    # 3. Classify
     classification = classify_ticket(subject, body)
     intent     = classification["intent"]
     language   = classification["language"]
     confidence = classification["confidence"]
 
-    result["intent"]   = intent
-    result["language"] = language
+    result["intent"]          = intent
+    result["language"]        = language
+    result["confidence"]      = confidence
+    result["chargeback_risk"] = classification.get("chargeback_risk", "")
+    result["reasoning"]       = classification.get("reasoning", "")
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
-    # 4. Не наш інтент — пропускаємо
     if intent not in HANDLED_INTENTS:
         log.info(f"[{ticket_id}] Skip — not a cancellation ({intent})")
         result["status"] = "skipped_not_handled"
         log_result(result)
         return result
 
-    # 5. Низька впевненість → людина
     if confidence < 0.75:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate")
         zendesk.add_tag(ticket_id, "bot_low_confidence")
@@ -150,11 +135,9 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 6. Cancel in Stripe
     cancel_result = stripe_cli.cancel_subscription(email)
     log.info(f"[{ticket_id}] Stripe: {cancel_result['status']}")
 
-    # 7. Generate reply
     reply_text = generate_reply(
         intent=intent,
         language=language,
@@ -162,7 +145,6 @@ def _process(ticket_id: str) -> dict:
         stripe_result=cancel_result,
     )
 
-    # 8. Zendesk: reply + tag + solve
     cancel_tag = {
         "TRIAL_CANCELLATION":       "trial_cancellation",
         "SUB_CANCELLATION":         "subscription_cancelled",
@@ -174,8 +156,9 @@ def _process(ticket_id: str) -> dict:
     zendesk.add_tag(ticket_id, "bot_handled")
     zendesk.solve_ticket(ticket_id)
 
-    result["status"] = "success"
-    result["action"] = "cancelled_and_replied"
+    result["status"]     = "success"
+    result["action"]     = "cancelled_and_replied"
+    result["reply_text"] = reply_text
     log.info(f"[{ticket_id}] ✅ Done")
 
     log_result(result)
