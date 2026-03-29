@@ -5,11 +5,11 @@ Handles trial and subscription cancellations via WooCommerce REST API v3.
 Requires the "WooCommerce Subscriptions" plugin to be active on the site.
 
 Logic:
-  1. Find customer by email
-  2. Fetch their subscriptions
-  3. If any subscription has an active trial period → cancel trial
-  4. Otherwise → cancel active subscription
-  5. Falls back gracefully if customer or subscription not found
+ 1. Find customer by email
+ 2. Fetch their subscriptions
+ 3. If any subscription has an active trial period → cancel trial
+ 4. Otherwise → cancel active subscription
+ 5. Falls back gracefully if customer or subscription not found
 """
 
 import logging
@@ -36,17 +36,25 @@ class WooCommerceClient:
             log.info("WooCommerceClient: DRY_RUN — no writes")
 
     # ------------------------------------------------------------------ #
-    #  Read operations (always real, even in dry_run)                      #
+    # Read operations (always real, even in dry_run)                       #
     # ------------------------------------------------------------------ #
 
     def get_customer_by_email(self, email: str) -> dict | None:
         """Return the first WooCommerce customer matching *email*, or None."""
-        resp = requests.get(
-            f"{self.base}/customers",
-            params={"email": email, "per_page": 1},
-            auth=self.auth,
-            timeout=10,
-        )
+        try:
+            resp = requests.get(
+                f"{self.base}/customers",
+                params={"email": email, "per_page": 1},
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC customer lookup error for {email}: {e}")
+            return None
+
+        if resp.status_code == 401:
+            log.error("WooCommerce 401 Unauthorized — check WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET in Secret Manager")
+            return None
         if resp.status_code == 404:
             return None
         if not resp.ok:
@@ -57,12 +65,17 @@ class WooCommerceClient:
 
     def get_subscriptions(self, customer_id: int) -> list[dict]:
         """Return all WooCommerce Subscriptions for a given customer ID."""
-        resp = requests.get(
-            f"{self.base}/subscriptions",
-            params={"customer": customer_id, "per_page": 20},
-            auth=self.auth,
-            timeout=10,
-        )
+        try:
+            resp = requests.get(
+                f"{self.base}/subscriptions",
+                params={"customer": customer_id, "per_page": 20},
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC subscriptions lookup error for customer {customer_id}: {e}")
+            return []
+
         if not resp.ok:
             log.warning(
                 f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
@@ -71,17 +84,13 @@ class WooCommerceClient:
         return resp.json()
 
     # ------------------------------------------------------------------ #
-    #  Trial detection                                                      #
+    # Trial detection                                                       #
     # ------------------------------------------------------------------ #
 
     @staticmethod
     def _is_trial_active(subscription: dict) -> bool:
         """
         Return True if the subscription is currently inside its trial period.
-
-        WooCommerce Subscriptions stores trial_end_date in site local time
-        (field "trial_end_date") and UTC (field "trial_end_date_gmt").
-        We prefer the GMT field; fall back to the local one.
         A value of "0000-00-00 00:00:00" or "" means no trial.
         """
         trial_end = (
@@ -92,7 +101,6 @@ class WooCommerceClient:
         if not trial_end or trial_end.startswith("0000"):
             return False
         try:
-            # Normalise ISO string — WC may omit the +00:00 suffix
             trial_end_dt = datetime.fromisoformat(
                 trial_end.replace("Z", "+00:00")
             )
@@ -104,7 +112,7 @@ class WooCommerceClient:
             return False
 
     # ------------------------------------------------------------------ #
-    #  Write operation                                                      #
+    # Write operation                                                       #
     # ------------------------------------------------------------------ #
 
     def _cancel_sub_by_id(self, subscription_id: int) -> dict:
@@ -116,12 +124,22 @@ class WooCommerceClient:
                 "subscription_id": subscription_id,
                 "cancelled": True,
             }
-        resp = requests.put(
-            f"{self.base}/subscriptions/{subscription_id}",
-            json={"status": "cancelled"},
-            auth=self.auth,
-            timeout=10,
-        )
+        try:
+            resp = requests.put(
+                f"{self.base}/subscriptions/{subscription_id}",
+                json={"status": "cancelled"},
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.error(f"WC cancel network error for #{subscription_id}: {e}")
+            return {
+                "status": "error",
+                "subscription_id": subscription_id,
+                "cancelled": False,
+                "error": str(e),
+            }
+
         if not resp.ok:
             log.error(
                 f"WC cancel failed for #{subscription_id}: {resp.status_code} {resp.text[:200]}"
@@ -140,7 +158,7 @@ class WooCommerceClient:
         }
 
     # ------------------------------------------------------------------ #
-    #  Main public method                                                   #
+    # Main public method                                                    #
     # ------------------------------------------------------------------ #
 
     def cancel_subscription(self, email: str) -> dict:
@@ -148,43 +166,36 @@ class WooCommerceClient:
         Find the customer by email, determine trial vs. paid subscription,
         and cancel appropriately.
 
+        DRY_RUN: still performs real READ operations (lookup), but skips the
+        actual cancel write. This way we always know the true subscription state.
+
         Return dict:
-          status            : "trial_cancelled" | "subscription_cancelled" |
-                              "not_found" | "no_active_sub" | "dry_run" | "error"
-          email             : str
-          cancelled         : bool
-          subscription_type : "trial" | "subscription" | None
-          subscription_id   : int | None
-          plan              : str
-          source            : "woocommerce"
+            status : "trial_cancelled" | "subscription_cancelled" |
+                     "dry_run" | "not_found" | "no_active_sub" | "error"
         """
-        base = {"email": email, "cancelled": False, "source": "woocommerce",
-                "subscription_type": None, "subscription_id": None, "plan": ""}
+        base_result = {
+            "email": email,
+            "cancelled": False,
+            "source": "woocommerce",
+            "subscription_type": None,
+            "subscription_id": None,
+            "plan": "",
+        }
 
-        # --- DRY RUN shortcut (still real for read ops in integration tests) ---
-        if self.dry_run:
-            log.info(f"[DRY] WC cancel for {email}")
-            return {
-                **base,
-                "status": "dry_run",
-                "cancelled": True,
-                "subscription_type": "trial",
-                "plan": "IQ Test Subscription",
-            }
-
-        # 1. Customer lookup
+        # 1. Customer lookup (always real, even in dry_run)
+        log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
         customer = self.get_customer_by_email(email)
         if not customer:
             log.info(f"WC: no customer found for {email}")
-            return {**base, "status": "not_found"}
+            return {**base_result, "status": "not_found"}
 
-        # 2. Subscriptions
+        # 2. Subscriptions (always real)
         all_subs = self.get_subscriptions(customer["id"])
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
 
         if not active_subs:
             log.info(f"WC: no active subscriptions for {email}")
-            return {**base, "status": "no_active_sub"}
+            return {**base_result, "status": "no_active_sub"}
 
         # 3. Prefer trial if active trial exists
         trial_sub = next((s for s in active_subs if self._is_trial_active(s)), None)
@@ -196,13 +207,19 @@ class WooCommerceClient:
         if line_items:
             plan = line_items[0].get("name", "")
 
-        # 4. Cancel
+        # 4. Cancel (skipped in dry_run, but we still return real sub info)
         cancel = self._cancel_sub_by_id(target["id"])
-        status_label = "trial_cancelled" if sub_type == "trial" else "subscription_cancelled"
+
+        if self.dry_run:
+            status_label = "dry_run"
+        elif cancel["cancelled"]:
+            status_label = "trial_cancelled" if sub_type == "trial" else "subscription_cancelled"
+        else:
+            status_label = cancel.get("status", "error")
 
         return {
-            **base,
-            "status": cancel.get("status") if not cancel["cancelled"] else status_label,
+            **base_result,
+            "status": status_label,
             "cancelled": cancel["cancelled"],
             "subscription_type": sub_type,
             "subscription_id": target["id"],
