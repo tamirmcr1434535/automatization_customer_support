@@ -88,28 +88,69 @@ class WooCommerceClient:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _is_trial_active(subscription: dict) -> bool:
+    def _get_sub_type(subscription: dict) -> str:
         """
-        Return True if the subscription is currently inside its trial period.
-        A value of "0000-00-00 00:00:00" or "" means no trial.
+        Determine whether subscription is a "trial" or "subscription".
+
+        Logic:
+          1. trial_end_date must exist and be in the future (still in trial).
+          2. trial_end_date - start_date <= 7 days  → "trial"  (1-week trial period)
+             trial_end_date - start_date  > 7 days  → "subscription" (already a paying sub)
+          3. No trial_end_date, or trial already ended → "subscription"
+
+        Examples (product "WW IQ Test 1 Week Trial Then 28 days"):
+          - start=2 days ago, trial_end=in 5 days  →  delta=7d  → "trial"
+          - start=30 days ago, trial_end=in 2 days →  delta=32d → "subscription"
+          - start=1 day ago,   trial_end="-"       →             → "subscription"
         """
-        trial_end = (
+        trial_end_raw = (
             subscription.get("trial_end_date_gmt")
             or subscription.get("trial_end_date")
             or ""
         )
-        if not trial_end or trial_end.startswith("0000"):
-            return False
+        start_raw = (
+            subscription.get("start_date_gmt")
+            or subscription.get("start_date")
+            or ""
+        )
+
+        # No trial info → paid subscription
+        if not trial_end_raw or trial_end_raw.startswith("0000"):
+            return "subscription"
+
         try:
-            trial_end_dt = datetime.fromisoformat(
-                trial_end.replace("Z", "+00:00")
+            def _parse(s: str):
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+            trial_end_dt = _parse(trial_end_raw)
+            now = datetime.now(timezone.utc)
+
+            # Trial already expired → subscription
+            if trial_end_dt <= now:
+                return "subscription"
+
+            # Need start_date to measure trial duration
+            if not start_raw or start_raw.startswith("0000"):
+                # No start date — assume trial if trial_end is in the future
+                return "trial"
+
+            start_dt = _parse(start_raw)
+            trial_duration_days = (trial_end_dt - start_dt).days
+
+            log.info(
+                f"WC trial check: start={start_dt.date()}, "
+                f"trial_end={trial_end_dt.date()}, "
+                f"duration={trial_duration_days}d"
             )
-            if trial_end_dt.tzinfo is None:
-                trial_end_dt = trial_end_dt.replace(tzinfo=timezone.utc)
-            return trial_end_dt > datetime.now(timezone.utc)
-        except (ValueError, AttributeError):
-            log.warning(f"Could not parse trial_end_date: {trial_end!r}")
-            return False
+
+            # <= 7 days from start → 1-week trial → TRIAL
+            # >  7 days → customer has been a subscriber already → SUB
+            return "trial" if trial_duration_days <= 7 else "subscription"
+
+        except (ValueError, AttributeError) as e:
+            log.warning(f"Could not parse trial dates (trial_end={trial_end_raw!r}, start={start_raw!r}): {e}")
+            return "subscription"
 
     # ------------------------------------------------------------------ #
     # Write operation                                                       #
@@ -197,10 +238,13 @@ class WooCommerceClient:
             log.info(f"WC: no active subscriptions for {email}")
             return {**base_result, "status": "no_active_sub"}
 
-        # 3. Prefer trial if active trial exists
-        trial_sub = next((s for s in active_subs if self._is_trial_active(s)), None)
-        target = trial_sub or active_subs[0]
-        sub_type = "trial" if trial_sub else "subscription"
+        # 3. Determine type for each active sub; prefer trial over paid sub
+        typed_subs = [
+            (s, self._get_sub_type(s)) for s in active_subs
+        ]
+        # Pick a trial sub first; if none — pick the first active sub
+        trial_entry = next(((s, t) for s, t in typed_subs if t == "trial"), None)
+        target, sub_type = trial_entry if trial_entry else typed_subs[0]
 
         plan = ""
         line_items = target.get("line_items") or []
