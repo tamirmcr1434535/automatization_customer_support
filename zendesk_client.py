@@ -29,6 +29,27 @@ class ZendeskClient:
                 ticket["requester"] = u.json()["user"]
         return ticket
 
+    def get_first_customer_comment(self, ticket_id: str) -> str | None:
+        """
+        Return the plain body of the FIRST public comment from the end-user.
+        Used for messaging/chat tickets where description is empty or just a header.
+        Always real, even in dry_run.
+        """
+        resp = requests.get(
+            f"{self.base}/tickets/{ticket_id}/comments.json",
+            auth=self.auth,
+            timeout=10,
+        )
+        if not resp.ok:
+            log.warning(f"Could not fetch comments for #{ticket_id}: {resp.status_code}")
+            return None
+
+        comments = resp.json().get("comments", [])
+        for comment in comments:  # oldest first
+            if comment.get("public") and not comment.get("author", {}).get("agent", False):
+                return comment.get("plain_body") or comment.get("body", "")
+        return None
+
     def get_last_customer_comment(self, ticket_id: str) -> str | None:
         """
         Return the plain body of the most recent public comment from the end-user
