@@ -1,24 +1,22 @@
 """
 Zendesk Cancellation Bot — Google Cloud Function (Gen 2)
 =========================================================
-Entry point: zendesk_webhook(request)
-
 Cancellation flow:
-  1. Receive Zendesk webhook with ticket_id
-  2. Fetch ticket from Zendesk
-  3. Classify intent with Claude Haiku
-  4. Try WooCommerce first → cancel trial or subscription
-  5. If not found in WooCommerce → fall back to Stripe
-  6. If not found anywhere → Slack alert + tag ticket for manual review
-  7. Generate multilingual reply with Claude Sonnet
-  8. Reply + tag + solve ticket in Zendesk
-  9. Log result to BigQuery
-
-Handles: Trial Cancel, Sub Cancel, Sub Renewal Cancel
-Languages: EN / JP / KR
+ 1. Check by email (WooCommerce → Stripe)
+ 2. Found → cancel → done
+ 3. Not found → ask for last 4 card digits (tag: awaiting_card_digits)
+    └─ 7 days no reply → Zendesk Automation closes ticket
+    └─ Customer replied:
+       ├─ Found → cancel → done
+       └─ Not found → ask for correct digits (tag: awaiting_card_digits_retry)
+          └─ 2 days no reply → Zendesk Automation closes ticket
+          └─ Customer replied:
+             ├─ Found → cancel → done
+             └─ Not found → close ticket
 """
 
 import os
+import re
 import json
 import logging
 import functions_framework
@@ -28,8 +26,13 @@ from zendesk_client import ZendeskClient
 from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
 from slack_client import SlackClient
-from reply_generator import generate_reply
-from bq_logger import log_result, ensure_log_table
+from reply_generator import (
+    generate_reply,
+    generate_ask_card_digits_reply,
+    generate_ask_card_digits_retry_reply,
+    generate_not_found_reply,
+)
+from bq_logger import log_result
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("bot")
@@ -46,7 +49,7 @@ HANDLED_INTENTS = {
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
-# ── Clients ────────────────────────────────────────────────────────────────── #
+# ── Clients ──────────────────────────────────────────────────────────── #
 
 zendesk = ZendeskClient(
     subdomain=ZENDESK_SUBDOMAIN,
@@ -54,35 +57,30 @@ zendesk = ZendeskClient(
     api_token=os.getenv("ZENDESK_API_TOKEN"),
     dry_run=DRY_RUN,
 )
-
 woo = WooCommerceClient(
     site_url=os.getenv("WOO_SITE_URL", "https://iqbooster.org"),
     consumer_key=os.getenv("WOO_CONSUMER_KEY", ""),
     consumer_secret=os.getenv("WOO_CONSUMER_SECRET", ""),
     dry_run=DRY_RUN,
 )
-
 stripe_cli = StripeClient(
     api_key=os.getenv("STRIPE_SECRET_KEY"),
     dry_run=DRY_RUN,
 )
-
 slack = SlackClient(
     webhook_url=os.getenv("SLACK_WEBHOOK_URL", ""),
     dry_run=DRY_RUN,
 )
 
 
-# ── HTTP handler ───────────────────────────────────────────────────────────── #
+# ── HTTP handler ──────────────────────────────────────────────────────── #
 
 @functions_framework.http
 def zendesk_webhook(request):
     if request.method == "GET":
         return json.dumps({
-            "status": "ok",
-            "dry_run": DRY_RUN,
-            "test_mode": TEST_MODE,
-            "handles": list(HANDLED_INTENTS),
+            "status": "ok", "dry_run": DRY_RUN,
+            "test_mode": TEST_MODE, "handles": list(HANDLED_INTENTS),
         }), 200, {"Content-Type": "application/json"}
 
     if request.method != "POST":
@@ -108,7 +106,7 @@ def zendesk_webhook(request):
     return json.dumps(result), 200, {"Content-Type": "application/json"}
 
 
-# ── Core logic ─────────────────────────────────────────────────────────────── #
+# ── Core logic ────────────────────────────────────────────────────────── #
 
 def _process(ticket_id: str) -> dict:
     result = {
@@ -144,20 +142,35 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 3. Classify
+    # 3. Classify (needed for language even in card-lookup flows)
     classification = classify_ticket(subject, body)
     intent     = classification["intent"]
     language   = classification["language"]
     confidence = classification["confidence"]
 
     result.update({
-        "intent":          intent,
-        "language":        language,
-        "confidence":      confidence,
+        "intent": intent,
+        "language": language,
+        "confidence": confidence,
         "chargeback_risk": classification.get("chargeback_risk", ""),
-        "reasoning":       classification.get("reasoning", ""),
+        "reasoning": classification.get("reasoning", ""),
     })
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
+
+    # ── CARD DIGITS FLOWS ─────────────────────────────────────────────── #
+    # Second attempt: customer replied after we asked again (retry)
+    if "awaiting_card_digits_retry" in tags:
+        return _handle_card_digits(
+            ticket_id, email, name, language, result, is_retry=True
+        )
+
+    # First attempt: customer replied with digits after first ask
+    if "awaiting_card_digits" in tags:
+        return _handle_card_digits(
+            ticket_id, email, name, language, result, is_retry=False
+        )
+
+    # ── NORMAL CANCELLATION FLOW ──────────────────────────────────────── #
 
     # 4. Skip unhandled intents
     if intent not in HANDLED_INTENTS:
@@ -178,8 +191,8 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 6. Cancel — WooCommerce first, Stripe as fallback
-    cancel_result = _cancel(email, ticket_id)
+    # 6. Cancel by email (WooCommerce → Stripe)
+    cancel_result = _cancel_by_email(email, ticket_id)
     cancel_status = cancel_result.get("status", "")
     result["cancel_source"] = cancel_result.get("source", "unknown")
 
@@ -188,33 +201,179 @@ def _process(ticket_id: str) -> dict:
         f"via {result['cancel_source']} | type={cancel_result.get('subscription_type')}"
     )
 
-    # 7. Customer not found anywhere → Slack alert, leave ticket open
+    # 7. Not found by email → ask for last 4 card digits (step 1)
     if cancel_status == "not_found_anywhere":
-        log.info(f"[{ticket_id}] Not found in WooCommerce or Stripe → Slack alert")
+        log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
 
-        zendesk.add_tag(ticket_id, "needs_manual_review")
+        reply_text = generate_ask_card_digits_reply(language=language, customer_name=name)
+        zendesk.post_reply(ticket_id, reply_text)
+        zendesk.add_tag(ticket_id, "awaiting_card_digits")
         zendesk.add_internal_note(
             ticket_id,
-            (
-                "🤖 Bot: could not find this customer in WooCommerce or Stripe "
-                f"(email: {email}). Manual review required — "
-                "please verify by last 4 digits of card or alternative email."
-            ),
+            f"🤖 Bot: customer not found by email ({email}). "
+            "Asked for last 4 card digits. Waiting up to 7 days.",
         )
 
-        slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-
-        result["status"] = "manual_review_required"
-        result["action"] = "slack_alerted"
+        result.update({
+            "status": "awaiting_card_digits",
+            "action": "asked_for_card_digits",
+            "reply_text": reply_text,
+        })
         log_result(result)
-        return result   # ← ticket stays OPEN, no reply sent
+        return result  # ticket stays OPEN
 
-    # 8. Generate reply
+    # 8. Override intent from actual subscription data (trial vs active sub)
+    #    Text classifier gives a hint, but the source of truth is WooCommerce/Stripe.
+    intent = _resolve_intent(intent, cancel_result)
+    result["intent"] = intent
+    log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
+
+    # 9. Found → generate reply, tag, solve
+    return _finish_cancellation(ticket_id, name, language, intent, cancel_result, result)
+
+
+# ── Card digits handler ───────────────────────────────────────────────── #
+
+def _handle_card_digits(
+    ticket_id: str,
+    email: str,
+    name: str,
+    language: str,
+    result: dict,
+    is_retry: bool,
+) -> dict:
+    """
+    Process customer's reply that should contain last 4 card digits.
+    is_retry=False → first attempt (came from awaiting_card_digits)
+    is_retry=True  → second attempt (came from awaiting_card_digits_retry)
+    """
+    step = "retry" if is_retry else "first"
+    log.info(f"[{ticket_id}] Card lookup ({step}) — reading last customer comment")
+
+    last_comment = zendesk.get_last_customer_comment(ticket_id)
+    if not last_comment:
+        log.warning(f"[{ticket_id}] No customer comment found yet — waiting")
+        result["status"] = "waiting_for_customer_reply"
+        return result
+
+    # Extract 4 consecutive digits
+    match = re.search(r'\b(\d{4})\b', last_comment)
+    if not match:
+        log.info(f"[{ticket_id}] No 4-digit sequence in reply")
+        # Treat as if digits were wrong — ask again or close
+        return _digits_not_found(ticket_id, name, language, result, is_retry)
+
+    last4 = match.group(1)
+    log.info(f"[{ticket_id}] Extracted last4={last4} — searching Stripe")
+
+    stripe_result = stripe_cli.find_and_cancel_by_last4(last4)
+
+    if stripe_result.get("found"):
+        # ✅ Found by card — cancel and close
+        cancel_result = {**stripe_result, "source": "stripe_by_card"}
+        result["cancel_source"] = "stripe_by_card"
+
+        # Clean up card-lookup tags
+        zendesk.remove_tag(ticket_id, "awaiting_card_digits")
+        zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
+
+        # Determine trial vs sub from actual Stripe data
+        final_intent = _resolve_intent(result.get("intent", "SUB_CANCELLATION"), cancel_result)
+        result["intent"] = final_intent
+
+        log.info(f"[{ticket_id}] ✅ Found by card last4={last4} — intent={final_intent} — cancelling")
+        return _finish_cancellation(
+            ticket_id, name, language, final_intent, cancel_result, result
+        )
+
+    # ❌ Digits not found in Stripe
+    return _digits_not_found(ticket_id, name, language, result, is_retry)
+
+
+def _digits_not_found(
+    ticket_id: str,
+    name: str,
+    language: str,
+    result: dict,
+    is_retry: bool,
+) -> dict:
+    """Called when Stripe search by last4 found nothing."""
+
+    if not is_retry:
+        # First failure: ask for correct digits one more time (2-day window)
+        log.info(f"[{ticket_id}] Digits not found (first attempt) → asking for correct ones")
+
+        reply_text = generate_ask_card_digits_retry_reply(
+            language=language, customer_name=name
+        )
+        zendesk.post_reply(ticket_id, reply_text)
+        zendesk.remove_tag(ticket_id, "awaiting_card_digits")
+        zendesk.add_tag(ticket_id, "awaiting_card_digits_retry")
+        zendesk.add_internal_note(
+            ticket_id,
+            "🤖 Bot: card digits not found in Stripe. "
+            "Asked customer for correct digits. Waiting up to 2 days.",
+        )
+
+        result.update({
+            "status": "awaiting_card_digits_retry",
+            "action": "asked_for_correct_digits",
+            "reply_text": reply_text,
+        })
+        log_result(result)
+        return result  # ticket stays OPEN
+
+    else:
+        # Second failure: close ticket
+        log.info(f"[{ticket_id}] Digits not found (retry) → closing ticket")
+
+        reply_text = generate_not_found_reply(language=language, customer_name=name)
+        zendesk.post_reply(ticket_id, reply_text)
+        zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
+        zendesk.add_tag(ticket_id, "not_found_closed")
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.solve_ticket(ticket_id)
+
+        result.update({
+            "status": "not_found_closed",
+            "action": "closed_not_relevant",
+            "reply_text": reply_text,
+        })
+        log.info(f"[{ticket_id}] ❌ Closed as not relevant after 2 failed attempts")
+        log_result(result)
+        return result
+
+
+# ── Helpers ───────────────────────────────────────────────────────────── #
+
+def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
+    """
+    Determine final TRIAL_CANCELLATION vs SUB_CANCELLATION using actual data
+    returned by WooCommerce / Stripe — not just the text classifier.
+
+    Rules:
+    - subscription_type == "trial"        → TRIAL_CANCELLATION
+    - subscription_type == "subscription" → SUB_CANCELLATION
+    - anything else                       → keep text_intent as fallback
+    """
+    sub_type = cancel_result.get("subscription_type", "")
+    if sub_type == "trial":
+        return "TRIAL_CANCELLATION"
+    if sub_type in ("subscription", "active"):
+        return "SUB_CANCELLATION"
+    # Fallback: use whatever the text classifier said
+    return text_intent
+
+
+def _finish_cancellation(
+    ticket_id: str,
+    name: str,
+    language: str,
+    intent: str,
+    cancel_result: dict,
+    result: dict,
+) -> dict:
+    """Generate reply, tag, and solve the ticket after a successful cancellation."""
     reply_text = generate_reply(
         intent=intent,
         language=language,
@@ -222,7 +381,6 @@ def _process(ticket_id: str) -> dict:
         cancel_result=cancel_result,
     )
 
-    # 9. Zendesk actions
     cancel_tag = {
         "TRIAL_CANCELLATION":       "trial_cancellation",
         "SUB_CANCELLATION":         "subscription_cancelled",
@@ -235,34 +393,27 @@ def _process(ticket_id: str) -> dict:
     zendesk.solve_ticket(ticket_id)
 
     result.update({
-        "status":     "success",
-        "action":     "cancelled_and_replied",
+        "status": "success",
+        "action": "cancelled_and_replied",
         "reply_text": reply_text,
     })
     log.info(f"[{ticket_id}] ✅ Done")
-
     log_result(result)
     return result
 
 
-# ── Cancellation helpers ───────────────────────────────────────────────────── #
-
-def _cancel(email: str, ticket_id: str) -> dict:
-    """
-    Try WooCommerce → Stripe → if both fail, return not_found_anywhere.
-    """
-    # WooCommerce
-    woo_result = woo.cancel_subscription(email)
-    woo_status = woo_result.get("status", "")
+def _cancel_by_email(email: str, ticket_id: str) -> dict:
+    """WooCommerce → Stripe by email → not_found_anywhere."""
+    woo_result  = woo.cancel_subscription(email)
+    woo_status  = woo_result.get("status", "")
 
     if woo_status not in ("not_found", "no_active_sub", "error"):
         return {**woo_result, "source": "woocommerce"}
 
     log.info(f"[{ticket_id}] WooCommerce: {woo_status} → trying Stripe")
 
-    # Stripe fallback
-    stripe_result = stripe_cli.cancel_subscription(email)
-    stripe_status = stripe_result.get("status", "")
+    stripe_result  = stripe_cli.cancel_subscription(email)
+    stripe_status  = stripe_result.get("status", "")
 
     if stripe_status not in ("not_found", "no_active_sub", "error"):
         return {
@@ -271,9 +422,7 @@ def _cancel(email: str, ticket_id: str) -> dict:
             "subscription_type": "trial" if stripe_status == "trialing" else "subscription",
         }
 
-    log.info(f"[{ticket_id}] Stripe: {stripe_status} → customer not found anywhere")
-
-    # Neither found
+    log.info(f"[{ticket_id}] Stripe: {stripe_status} → not found anywhere")
     return {
         "status": "not_found_anywhere",
         "email": email,
