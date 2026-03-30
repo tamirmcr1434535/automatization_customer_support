@@ -142,6 +142,13 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
+    # 2b. Messaging/chat tickets have empty description — fetch first real customer comment
+    if len(body.strip()) < 30:
+        first_comment = zendesk.get_first_customer_comment(ticket_id)
+        if first_comment:
+            log.info(f"[{ticket_id}] Empty description — using first customer comment for classification")
+            body = first_comment
+
     # 3. Classify (needed for language even in card-lookup flows)
     classification = classify_ticket(subject, body)
     intent     = classification["intent"]
@@ -180,7 +187,7 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 5. Low confidence → escalate
-    if confidence < 0.75:
+    if confidence < 0.65:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate")
         zendesk.add_tag(ticket_id, "bot_low_confidence")
         zendesk.add_internal_note(
