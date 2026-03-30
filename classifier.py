@@ -3,36 +3,38 @@ from anthropic import Anthropic
 
 _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
-PROMPT = """You are a classifier for a support ticket system of an IQ test subscription service.
+PROMPT = """You are a classifier for a support ticket system of an IQ test + brain training subscription service.
+
+Your job is to detect the CUSTOMER'S PURPOSE — not the subscription type.
+NOTE: the distinction between TRIAL_CANCELLATION and SUB_CANCELLATION is resolved later by
+checking the actual subscription data in WooCommerce and Stripe. Your task is to correctly
+identify the overall intent category.
 
 Classify into ONE intent:
-- TRIAL_CANCELLATION     — wants to cancel a free trial (explicitly or implicitly).
-                           ALSO USE when: customer says they signed up for something by mistake
-                           and it appears to be a trial period, or they want to stop before being charged.
-- SUB_CANCELLATION       — wants to cancel a paid subscription.
-                           ALSO USE when: customer says they did not intend to sign up for a subscription,
-                           discovered an unexpected charge or enrollment, and wants it cancelled.
-                           If the customer says "I want to cancel" about any subscription or plan — use this.
+- TRIAL_CANCELLATION     — wants to cancel a free trial or a subscription they signed up for
+                           without realising it (by mistake, didn't know they'd be charged, etc.).
+- SUB_CANCELLATION       — clearly wants to cancel an active paid subscription they knowingly have.
+                           Use this when customer explicitly mentions ongoing monthly charges
+                           and wants them stopped.
+                           NOTE: if uncertain between TRIAL and SUB → always pick TRIAL_CANCELLATION.
 - SUB_RENEWAL_CANCELLATION — wants to stop auto-renewal before next billing date
 - REFUND_REQUEST         — wants a refund for a charge that already happened
 - SUB_RENEWAL_REFUND     — was charged for a renewal and wants that specific charge refunded
 - CHARGEBACK_THREAT      — explicitly threatens a chargeback, dispute, or PayPal claim
 - PAYPAL_DISPUTE         — PayPal or bank dispute already opened
-- TECHNICAL_ISSUE        — STRICTLY technical access problems: cannot log in, did not receive
-                           login credentials, wrong email used, account access error.
-                           Do NOT use for billing questions or unwanted subscriptions.
+- TECHNICAL_ISSUE        — STRICTLY: cannot log in, did not receive credentials, wrong email,
+                           account access error. NEVER use for billing or cancellation requests.
 - GENERAL_QUESTION       — general question about the service or account, no action needed
 - UNSUBSCRIBE_EMAIL      — only wants to be removed from mailing/marketing list
 - DUPLICATE              — repeat of an existing ticket
 - UNKNOWN                — genuinely unclear intent
 
 IMPORTANT RULES:
-1. If the customer says any form of "cancel", "キャンセル", "취소", "解約" — always pick a cancellation intent.
-2. "I only wanted to pay for X but got signed up for Y, please cancel" → SUB_CANCELLATION.
-3. "I don't want brain training / subscription" + cancel request → SUB_CANCELLATION or TRIAL_CANCELLATION.
-4. TECHNICAL_ISSUE is ONLY for login/access problems, never for billing or enrollment disputes.
-5. When in doubt between TRIAL_CANCELLATION and SUB_CANCELLATION, pick TRIAL_CANCELLATION if
-   the customer mentions a trial, free period, or hasn't been charged yet.
+1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会" → always a cancellation intent.
+2. "I only wanted the IQ test / 知能テスト but got a subscription" → TRIAL_CANCELLATION.
+3. "I signed up by mistake / didn't know I'd be charged" → TRIAL_CANCELLATION.
+4. TECHNICAL_ISSUE is ONLY for login/access problems — never for billing or subscription issues.
+5. Default for any ambiguous cancellation → TRIAL_CANCELLATION.
 
 Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
