@@ -114,43 +114,60 @@ class WooCommerceClient:
             or ""
         )
 
-        # No trial info → paid subscription
-        if not trial_end_raw or trial_end_raw.startswith("0000"):
-            return "subscription"
+        def _parse(s: str):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
-        try:
-            def _parse(s: str):
-                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        # ── Path A: trial_end_date is set ─────────────────────────────── #
+        if trial_end_raw and not trial_end_raw.startswith("0000"):
+            try:
+                trial_end_dt = _parse(trial_end_raw)
+                now = datetime.now(timezone.utc)
 
-            trial_end_dt = _parse(trial_end_raw)
-            now = datetime.now(timezone.utc)
+                # Trial already expired → subscription
+                if trial_end_dt <= now:
+                    return "subscription"
 
-            # Trial already expired → subscription
-            if trial_end_dt <= now:
-                return "subscription"
+                if not start_raw or start_raw.startswith("0000"):
+                    return "trial"  # no start date but future trial_end → trial
 
-            # Need start_date to measure trial duration
-            if not start_raw or start_raw.startswith("0000"):
-                # No start date — assume trial if trial_end is in the future
-                return "trial"
+                start_dt = _parse(start_raw)
+                trial_duration_days = (trial_end_dt - start_dt).days
+                log.info(
+                    f"WC trial check (via trial_end): start={start_dt.date()}, "
+                    f"trial_end={trial_end_dt.date()}, duration={trial_duration_days}d"
+                )
+                return "trial" if trial_duration_days <= 7 else "subscription"
 
-            start_dt = _parse(start_raw)
-            trial_duration_days = (trial_end_dt - start_dt).days
+            except (ValueError, AttributeError) as e:
+                log.warning(f"Could not parse trial_end: {trial_end_raw!r} — {e}")
 
-            log.info(
-                f"WC trial check: start={start_dt.date()}, "
-                f"trial_end={trial_end_dt.date()}, "
-                f"duration={trial_duration_days}d"
-            )
+        # ── Path B: trial_end_date is empty (e.g. pending-cancel clears it) ─ #
+        # Fall back to: end_date - start_date <= 7 days → trial
+        end_raw = (
+            subscription.get("end_date_gmt")
+            or subscription.get("end_date")
+            or ""
+        )
+        if (
+            end_raw and not end_raw.startswith("0000")
+            and start_raw and not start_raw.startswith("0000")
+        ):
+            try:
+                end_dt   = _parse(end_raw)
+                start_dt = _parse(start_raw)
+                total_days = (end_dt - start_dt).days
+                log.info(
+                    f"WC trial check (via end_date fallback): start={start_dt.date()}, "
+                    f"end={end_dt.date()}, total={total_days}d"
+                )
+                # <= 7 days total window → 1-week trial product
+                return "trial" if total_days <= 7 else "subscription"
 
-            # <= 7 days from start → 1-week trial → TRIAL
-            # >  7 days → customer has been a subscriber already → SUB
-            return "trial" if trial_duration_days <= 7 else "subscription"
+            except (ValueError, AttributeError) as e:
+                log.warning(f"Could not parse end/start dates: {e}")
 
-        except (ValueError, AttributeError) as e:
-            log.warning(f"Could not parse trial dates (trial_end={trial_end_raw!r}, start={start_raw!r}): {e}")
-            return "subscription"
+        return "subscription"
 
     # ------------------------------------------------------------------ #
     # Write operation                                                       #
