@@ -2,9 +2,11 @@
 Zendesk Cancellation Bot — Google Cloud Function (Gen 2)
 =========================================================
 Cancellation flow:
- 1. Check by email (WooCommerce → Stripe)
+ 1. Check by Zendesk email (WooCommerce → Stripe)
  2. Found → cancel → done
- 3. Not found → ask for last 4 card digits (tag: awaiting_card_digits)
+ 3. Not found → extract any emails mentioned in ticket body → try each one
+    └─ Found by alt email → cancel → done
+ 4. Still not found → ask for last 4 card digits (tag: awaiting_card_digits)
     └─ 7 days no reply → Zendesk Automation closes ticket
     └─ Customer replied:
        ├─ Found → cancel → done
@@ -234,8 +236,30 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 7b. Email not found anywhere → ask for last 4 card digits (step 1)
+    # 7b. Email not found → try alternative emails from ticket body first
     if cancel_status == "not_found_anywhere":
+        alt_emails = _extract_emails(body, exclude=email)
+        if alt_emails:
+            log.info(f"[{ticket_id}] Not found by Zendesk email — trying alt emails from body: {alt_emails}")
+        for alt_email in alt_emails:
+            alt_result = _cancel_by_email(alt_email, ticket_id)
+            alt_status = alt_result.get("status", "")
+            if alt_status not in ("not_found_anywhere", "found_no_active_sub", "error"):
+                # ✅ Found by alternative email
+                log.info(f"[{ticket_id}] ✅ Found by alt email {alt_email} → cancelling")
+                zendesk.add_internal_note(
+                    ticket_id,
+                    f"🤖 Bot: Zendesk email ({email}) not found. "
+                    f"Cancelled using alternative email from message: {alt_email}",
+                )
+                alt_intent = _resolve_intent(intent, alt_result)
+                result["intent"] = alt_intent
+                result["cancel_source"] = alt_result.get("source", "unknown")
+                return _finish_cancellation(ticket_id, name, language, alt_intent, alt_result, result)
+            elif alt_status == "found_no_active_sub":
+                log.info(f"[{ticket_id}] Alt email {alt_email} found but no active sub → continue")
+
+        # Still not found → ask for last 4 card digits (step 1)
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
 
         reply_text = generate_ask_card_digits_reply(language=language, customer_name=name)
@@ -378,6 +402,26 @@ def _digits_not_found(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────── #
+
+def _extract_emails(text: str, exclude: str = "") -> list[str]:
+    """
+    Extract email addresses from ticket text.
+    Handles both ASCII @ and full-width ＠ (common in Japanese tickets).
+    Returns unique emails excluding the one already tried (Zendesk email).
+    """
+    # Normalise full-width ＠ → @
+    normalized = text.replace("＠", "@")
+    found = re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', normalized)
+    seen = set()
+    result = []
+    exclude_lower = exclude.lower()
+    for email in found:
+        e = email.lower()
+        if e != exclude_lower and e not in seen:
+            seen.add(e)
+            result.append(email)
+    return result
+
 
 def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
     """
