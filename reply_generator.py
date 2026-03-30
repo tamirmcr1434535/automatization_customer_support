@@ -16,7 +16,47 @@ Language rules:
 - Korean (KR): formal 존댓말 — 〜드립니다, 〜하시겠습니까, 진심으로 사과드립니다
 - English (EN): warm, professional, concise
 
-Output ONLY the reply text, ready to send. No subject line, no sign-off template."""
+Output ONLY the reply text, ready to send. No subject line, no sign-off template.
+
+---
+REFERENCE EXAMPLES (follow this tone, structure and length exactly):
+
+[JP | TRIAL_CANCELLATION]
+こんにちは。
+お問い合わせいただきありがとうございます。
+お客様のIQ Boosterの7日間無料トライアルは正常にキャンセルされたことを確認いたしました。今後、お客様のアカウントに料金が請求されることはございません。
+ご不明な点やその他サポートが必要な場合は、どうぞお気軽にご連絡ください。いつでもお手伝いさせていただきます。
+
+[JP | SUB_CANCELLATION]
+こんにちは。
+お問い合わせいただきありがとうございます。
+お客様のサブスクリプションは正常にキャンセルされたことを確認いたします。現在の請求期間終了まではサービスをご利用いただけますが、それ以降は追加料金は発生いたしません。
+ご不明な点がございましたら、いつでもお気軽にご連絡ください。
+
+[KR | TRIAL_CANCELLATION]
+안녕하세요.
+문의해 주셔서 감사합니다.
+고객님의 7일 무료 체험이 성공적으로 취소되었음을 확인해 드립니다. 앞으로 고객님의 계정에 추가 요금이 청구되지 않을 것입니다.
+궁금하신 점이나 추가 도움이 필요하신 경우 언제든지 연락해 주세요.
+
+[KR | SUB_CANCELLATION]
+안녕하세요.
+문의해 주셔서 감사합니다.
+고객님의 구독이 성공적으로 취소되었습니다. 현재 결제 기간이 끝날 때까지 서비스를 이용하실 수 있으며, 이후에는 추가 요금이 발생하지 않습니다.
+다른 문의 사항이 있으시면 언제든지 연락해 주세요.
+
+[EN | TRIAL_CANCELLATION]
+Hi,
+Thank you for reaching out to us.
+I have successfully cancelled your 7-day free trial. You will not be charged going forward.
+If you have any other questions, please don't hesitate to contact us.
+
+[EN | SUB_CANCELLATION]
+Hi,
+Thank you for contacting us.
+Your subscription has been successfully cancelled. You will continue to have access until the end of your current billing period, after which no further charges will occur.
+Please feel free to reach out if you need any further assistance.
+---"""
 
 INTENT_CONTEXT = {
     "TRIAL_CANCELLATION": "The free trial has been cancelled. No charge will occur.",
@@ -51,15 +91,13 @@ def generate_reply(intent: str, language: str, customer_name: str, cancel_result
     source = cancel_result.get("source", "")
 
     prompt = f"""Language: {language}
+Intent: {intent}
 Customer name: {customer_name or 'the customer'}
 Situation: {situation}
 Cancellation status: {cancel_status}{f' (via {source})' if source else ''}
 
-Structure (3-5 sentences):
-1. Thank customer for contacting
-2. Confirm action taken (cancelled / will not renew)
-3. Reassure: no further charges
-4. Offer further help
+Follow the reference example for [{language} | {intent}] from the REFERENCE EXAMPLES above.
+Use the same tone, structure, and length. Replace placeholders with the actual customer name if provided.
 
 Write the customer reply:"""
 
