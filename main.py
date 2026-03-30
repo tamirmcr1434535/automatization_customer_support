@@ -201,7 +201,33 @@ def _process(ticket_id: str) -> dict:
         f"via {result['cancel_source']} | type={cancel_result.get('subscription_type')}"
     )
 
-    # 7. Not found by email → ask for last 4 card digits (step 1)
+    # 7a. Customer found but no active subscription → Slack alert (already cancelled or wrong system)
+    if cancel_status == "found_no_active_sub":
+        found_in = cancel_result.get("found_in", "system")
+        log.info(
+            f"[{ticket_id}] Found in {found_in} but no active sub → Slack alert"
+        )
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: customer email ({email}) found in {found_in} but has NO active subscription. "
+            "Subscription may already be cancelled, or registered under a different email. "
+            "Manual review required.",
+        )
+        slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=email,
+            intent=intent,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result.update({
+            "status": "manual_review_required",
+            "action": "slack_alerted_no_active_sub",
+        })
+        log_result(result)
+        return result
+
+    # 7b. Email not found anywhere → ask for last 4 card digits (step 1)
     if cancel_status == "not_found_anywhere":
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
 
@@ -403,17 +429,26 @@ def _finish_cancellation(
 
 
 def _cancel_by_email(email: str, ticket_id: str) -> dict:
-    """WooCommerce → Stripe by email → not_found_anywhere."""
-    woo_result  = woo.cancel_subscription(email)
-    woo_status  = woo_result.get("status", "")
+    """
+    WooCommerce → Stripe by email.
+
+    Returns one of:
+      - cancel result dict           — found and cancelled
+      - status="not_found_anywhere"  — email unknown in BOTH systems → ask card digits
+      - status="found_no_active_sub" — email found somewhere but NO active subscription
+                                       (already cancelled or in different system) → Slack alert
+    """
+    woo_result = woo.cancel_subscription(email)
+    woo_status = woo_result.get("status", "")
 
     if woo_status not in ("not_found", "no_active_sub", "error"):
         return {**woo_result, "source": "woocommerce"}
 
+    woo_customer_found = woo_status == "no_active_sub"  # customer exists but no active sub
     log.info(f"[{ticket_id}] WooCommerce: {woo_status} → trying Stripe")
 
-    stripe_result  = stripe_cli.cancel_subscription(email)
-    stripe_status  = stripe_result.get("status", "")
+    stripe_result = stripe_cli.cancel_subscription(email)
+    stripe_status = stripe_result.get("status", "")
 
     if stripe_status not in ("not_found", "no_active_sub", "error"):
         return {
@@ -422,7 +457,25 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "subscription_type": "trial" if stripe_status == "trialing" else "subscription",
         }
 
-    log.info(f"[{ticket_id}] Stripe: {stripe_status} → not found anywhere")
+    stripe_customer_found = stripe_status == "no_active_sub"  # customer exists in Stripe
+
+    # Customer found in at least one system but no active subscription
+    if woo_customer_found or stripe_customer_found:
+        found_in = "WooCommerce" if woo_customer_found else "Stripe"
+        log.info(
+            f"[{ticket_id}] Customer found in {found_in} but no active sub → "
+            "might already be cancelled or sub in different system"
+        )
+        return {
+            "status": "found_no_active_sub",
+            "email": email,
+            "cancelled": False,
+            "source": found_in.lower(),
+            "found_in": found_in,
+        }
+
+    # Email completely unknown in both systems → ask for card digits
+    log.info(f"[{ticket_id}] Email not found anywhere → ask for card digits")
     return {
         "status": "not_found_anywhere",
         "email": email,
