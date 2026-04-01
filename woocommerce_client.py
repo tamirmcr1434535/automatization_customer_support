@@ -83,6 +83,43 @@ class WooCommerceClient:
             return []
         return resp.json()
 
+    def get_subscriptions_by_billing_email(self, email: str) -> list[dict]:
+        """
+        Search subscriptions directly by billing email.
+
+        Fallback for cases where the customer's WooCommerce account email differs
+        from the billing email on the subscription (e.g. guest checkout, or the
+        customer changed their account email after subscribing).
+
+        Tries ?billing_email= first (WooCommerce Subscriptions plugin filter),
+        then ?search= as a secondary fallback.
+        """
+        for params in [
+            {"billing_email": email, "per_page": 10},
+            {"search": email,        "per_page": 10},
+        ]:
+            try:
+                resp = requests.get(
+                    f"{self.base}/subscriptions",
+                    params=params,
+                    auth=self.auth,
+                    timeout=10,
+                )
+            except requests.exceptions.RequestException as e:
+                log.warning(f"WC billing-email lookup error for {email} (params={params}): {e}")
+                continue
+
+            if resp.ok:
+                data = resp.json()
+                if isinstance(data, list) and data:
+                    log.info(
+                        f"WC: found {len(data)} subscription(s) by billing email "
+                        f"({list(params.keys())[0]}={email})"
+                    )
+                    return data
+
+        return []
+
     # ------------------------------------------------------------------ #
     # Trial detection                                                       #
     # ------------------------------------------------------------------ #
@@ -243,12 +280,22 @@ class WooCommerceClient:
         # 1. Customer lookup (always real, even in dry_run)
         log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
         customer = self.get_customer_by_email(email)
-        if not customer:
-            log.info(f"WC: no customer found for {email}")
-            return {**base_result, "status": "not_found"}
 
         # 2. Subscriptions (always real)
-        all_subs = self.get_subscriptions(customer["id"])
+        if customer:
+            all_subs = self.get_subscriptions(customer["id"])
+        else:
+            # Customer account not found by email — try searching subscriptions by billing email.
+            # This covers: guest checkouts, account email ≠ billing email,
+            # or customers whose WordPress account was created with a different address.
+            log.info(
+                f"WC: no customer account for {email} — "
+                "falling back to billing-email subscription search"
+            )
+            all_subs = self.get_subscriptions_by_billing_email(email)
+            if not all_subs:
+                log.info(f"WC: no subscriptions found by billing email for {email}")
+                return {**base_result, "status": "not_found"}
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
 
         if not active_subs:
