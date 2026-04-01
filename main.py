@@ -210,12 +210,23 @@ def _process(ticket_id: str) -> dict:
         f"via {result['cancel_source']} | type={cancel_result.get('subscription_type')}"
     )
 
-    # 7a. Customer found but no active subscription → Slack alert (already cancelled or wrong system)
+    # 7a. Customer found but no active subscription → try alt emails first, then Slack alert
     if cancel_status == "found_no_active_sub":
         found_in = cancel_result.get("found_in", "system")
         log.info(
-            f"[{ticket_id}] Found in {found_in} but no active sub → Slack alert"
+            f"[{ticket_id}] Found in {found_in} but no active sub → "
+            "searching all comments for alt emails before Slack alert"
         )
+        # Search ALL customer comments (not just description) — the customer may have
+        # mentioned a different email in a follow-up reply.
+        all_comments = zendesk.get_all_customer_comments_text(ticket_id)
+        search_text = f"{body}\n{all_comments}"
+        alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
+        if alt_found:
+            return alt_found
+
+        # No working alt email → Slack alert for manual review
+        log.info(f"[{ticket_id}] No alt email worked → Slack alert")
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_internal_note(
             ticket_id,
@@ -236,28 +247,15 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 7b. Email not found → try alternative emails from ticket body first
+    # 7b. Email not found → try alternative emails from ALL comments (not just description)
     if cancel_status == "not_found_anywhere":
-        alt_emails = _extract_emails(body, exclude=email)
-        if alt_emails:
-            log.info(f"[{ticket_id}] Not found by Zendesk email — trying alt emails from body: {alt_emails}")
-        for alt_email in alt_emails:
-            alt_result = _cancel_by_email(alt_email, ticket_id)
-            alt_status = alt_result.get("status", "")
-            if alt_status not in ("not_found_anywhere", "found_no_active_sub", "error"):
-                # ✅ Found by alternative email
-                log.info(f"[{ticket_id}] ✅ Found by alt email {alt_email} → cancelling")
-                zendesk.add_internal_note(
-                    ticket_id,
-                    f"🤖 Bot: Zendesk email ({email}) not found. "
-                    f"Cancelled using alternative email from message: {alt_email}",
-                )
-                alt_intent = _resolve_intent(intent, alt_result)
-                result["intent"] = alt_intent
-                result["cancel_source"] = alt_result.get("source", "unknown")
-                return _finish_cancellation(ticket_id, name, language, alt_intent, alt_result, result)
-            elif alt_status == "found_no_active_sub":
-                log.info(f"[{ticket_id}] Alt email {alt_email} found but no active sub → continue")
+        # Fetch all customer comments to cover emails mentioned in follow-up replies,
+        # not only the initial ticket description.
+        all_comments = zendesk.get_all_customer_comments_text(ticket_id)
+        search_text = f"{body}\n{all_comments}"
+        alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
+        if alt_found:
+            return alt_found
 
         # Still not found → ask for last 4 card digits (step 1)
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
@@ -402,6 +400,47 @@ def _digits_not_found(
 
 
 # ── Helpers ───────────────────────────────────────────────────────────── #
+
+def _try_alt_emails(
+    ticket_id: str,
+    primary_email: str,
+    search_text: str,
+    intent: str,
+    name: str,
+    language: str,
+    result: dict,
+) -> dict | None:
+    """
+    Extract email addresses from search_text (ticket body + all comments),
+    try to cancel by each one in turn.
+
+    Returns a completed result dict if any alt email succeeded,
+    or None if none of them worked (caller should then fall back to card digits / Slack).
+    """
+    alt_emails = _extract_emails(search_text, exclude=primary_email)
+    if not alt_emails:
+        return None
+
+    log.info(f"[{ticket_id}] Trying alt emails found in comments: {alt_emails}")
+    for alt_email in alt_emails:
+        alt_result = _cancel_by_email(alt_email, ticket_id)
+        alt_status = alt_result.get("status", "")
+        if alt_status not in ("not_found_anywhere", "found_no_active_sub", "error"):
+            # ✅ Found by alternative email — cancel and close
+            log.info(f"[{ticket_id}] ✅ Cancelled via alt email: {alt_email}")
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: primary email ({primary_email}) not matched. "
+                f"Cancelled using alt email found in message: {alt_email}",
+            )
+            final_intent = _resolve_intent(intent, alt_result)
+            result["intent"] = final_intent
+            result["cancel_source"] = alt_result.get("source", "unknown")
+            return _finish_cancellation(ticket_id, name, language, final_intent, alt_result, result)
+        elif alt_status == "found_no_active_sub":
+            log.info(f"[{ticket_id}] Alt email {alt_email} found but no active sub → try next")
+    return None
+
 
 def _extract_emails(text: str, exclude: str = "") -> list[str]:
     """
