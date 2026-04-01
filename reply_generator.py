@@ -134,7 +134,7 @@ Bei weiteren Fragen stehen wir Ihnen jederzeit gerne zur Verfügung.
 ---"""
 
 
-INTENT_CONTEXT = {{
+INTENT_CONTEXT = {
     "TRIAL_CANCELLATION": "The free trial has been cancelled. No charge will occur.",
     "SUB_CANCELLATION": (
         "The subscription has been cancelled. "
@@ -144,15 +144,15 @@ INTENT_CONTEXT = {{
         "Auto-renewal has been disabled. "
         "Current access continues until the period end, then the subscription ends automatically."
     ),
-}}
+}
 
-SUB_TYPE_CONTEXT = {{
+SUB_TYPE_CONTEXT = {
     "trial": "The free trial has been cancelled. No charge will occur.",
     "subscription": (
         "The subscription has been cancelled. "
         "Access continues until the end of the current billing period, then no further charges."
     ),
-}}
+}
 
 
 def generate_reply(intent: str, language: str, customer_name: str, cancel_result: dict) -> str:
@@ -171,9 +171,9 @@ def generate_reply(intent: str, language: str, customer_name: str, cancel_result
 Intent: {intent}
 Customer name: {customer_name or 'the customer'}
 Situation: {situation}
-Cancellation status: {cancel_status}{f' (via {{source}})' if source else ''}
+Cancellation status: {cancel_status}{f" (via {source})" if source else ""}
 
-Follow the reference template for [{{language}} | {{intent}}] from the REFERENCE TEMPLATES above.
+Follow the reference template for [{language} | {intent}] from the REFERENCE TEMPLATES above.
 Use the same tone, structure, and length.
 Replace [Name] with the actual customer name if provided.
 
@@ -185,7 +185,7 @@ Write the full reply (body + sign-off):"""
     r = _client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=500,
-        messages=[{{"role": "user", "content": f"{{SYSTEM}}\n\n{{prompt}}"}}],
+        messages=[{"role": "user", "content": f"{SYSTEM}\n\n{prompt}"}],
     )
     return r.content[0].text.strip()
 
@@ -225,7 +225,7 @@ Write the full reply (body + sign-off):"""
     r = _client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=400,
-        messages=[{{"role": "user", "content": f"{{SYSTEM}}\n\n{{prompt}}"}}],
+        messages=[{"role": "user", "content": f"{SYSTEM}\n\n{prompt}"}],
     )
     return r.content[0].text.strip()
 
@@ -259,7 +259,7 @@ Write the full reply (body + sign-off):"""
     r = _client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=400,
-        messages=[{{"role": "user", "content": f"{{SYSTEM}}\n\n{{prompt}}"}}],
+        messages=[{"role": "user", "content": f"{SYSTEM}\n\n{prompt}"}],
     )
     return r.content[0].text.strip()
 
@@ -293,6 +293,6 @@ Write the full reply (body + sign-off):"""
     r = _client.messages.create(
         model="claude-sonnet-4-5",
         max_tokens=450,
-        messages=[{{"role": "user", "content": f"{{SYSTEM}}\n\n{{prompt}}"}}],
+        messages=[{"role": "user", "content": f"{SYSTEM}\n\n{prompt}"}],
     )
     return r.content[0].text.strip()
