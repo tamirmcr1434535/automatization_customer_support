@@ -296,3 +296,39 @@ Write the full reply (body + sign-off):"""
         messages=[{"role": "user", "content": f"{SYSTEM}\n\n{prompt}"}],
     )
     return r.content[0].text.strip()
+
+
+def generate_timeout_reply(language: str, customer_name: str) -> str:
+    """
+    Timeout close: customer did not respond within AWAITING_CARD_DAYS days.
+    Sent by the bot when Zendesk Automation adds the 'card_digits_timeout' tag.
+    """
+    signoff = _signoff(language)
+
+    prompt = f"""Language: {language}
+Customer name: {customer_name or 'the customer'}
+
+Situation: We previously asked the customer to provide their registered email address,
+last 4 card digits, PayPal account, or a payment receipt so we could locate their account
+and process their cancellation request. We have not received a reply for several days
+and are now closing this ticket.
+
+Write a reply that:
+1. Apologises that we haven't heard back from them
+2. Explains that because we did not receive the requested information we are now closing
+   this ticket automatically
+3. Invites them to open a new ticket or reply here if they still need help — we will
+   be happy to assist
+4. Warm, empathetic tone — do NOT sound dismissive (3–4 sentences)
+
+After the reply body, append the following sign-off block EXACTLY as written:
+{signoff}
+
+Write the full reply (body + sign-off):"""
+
+    r = _client.messages.create(
+        model="claude-sonnet-4-5",
+        max_tokens=400,
+        messages=[{"role": "user", "content": f"{SYSTEM}\n\n{prompt}"}],
+    )
+    return r.content[0].text.strip()
