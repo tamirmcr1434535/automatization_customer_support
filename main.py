@@ -33,15 +33,19 @@ from reply_generator import (
     generate_ask_card_digits_reply,
     generate_ask_card_digits_retry_reply,
     generate_not_found_reply,
+    generate_timeout_reply,
 )
 from bq_logger import log_result
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
-DRY_RUN   = os.getenv("DRY_RUN", "true").lower() == "true"
-TEST_MODE = os.getenv("TEST_MODE", "true").lower() == "true"
-TEST_TAG  = "automation_test"
+DRY_RUN            = os.getenv("DRY_RUN", "true").lower() == "true"
+TEST_MODE          = os.getenv("TEST_MODE", "true").lower() == "true"
+TEST_TAG           = "automation_test"
+# How many days to wait for card/payment info before auto-closing the ticket.
+# Controlled via env var so it can be changed without a code deploy.
+AWAITING_CARD_DAYS = int(os.getenv("AWAITING_CARD_DAYS", "7"))
 
 HANDLED_INTENTS = {
     "TRIAL_CANCELLATION",
@@ -167,6 +171,10 @@ def _process(ticket_id: str) -> dict:
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
     # ── CARD DIGITS FLOWS ─────────────────────────────────────────────── #
+    # Timeout: Zendesk Automation added tag after AWAITING_CARD_DAYS days of no reply
+    if "card_digits_timeout" in tags:
+        return _handle_card_digits_timeout(ticket_id, name, language, result)
+
     # Second attempt: customer replied after we asked again (retry)
     if "awaiting_card_digits_retry" in tags:
         return _handle_card_digits(
@@ -397,6 +405,44 @@ def _digits_not_found(
         log.info(f"[{ticket_id}] ❌ Closed as not relevant after 2 failed attempts")
         log_result(result)
         return result
+
+
+# ── Card digits timeout ───────────────────────────────────────────────── #
+
+def _handle_card_digits_timeout(
+    ticket_id: str,
+    name: str,
+    language: str,
+    result: dict,
+) -> dict:
+    """
+    Called by the Zendesk Automation after AWAITING_CARD_DAYS days of no reply.
+    The automation adds tag 'card_digits_timeout', which triggers this webhook call.
+    Sends a sorry-we-didn't-hear-from-you message and closes the ticket.
+    """
+    log.info(
+        f"[{ticket_id}] No reply in {AWAITING_CARD_DAYS}d (card_digits_timeout) → closing"
+    )
+
+    reply_text = generate_timeout_reply(language=language, customer_name=name)
+    zendesk.post_reply(ticket_id, reply_text)
+
+    # Clean up all awaiting tags
+    zendesk.remove_tag(ticket_id, "awaiting_card_digits")
+    zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
+    zendesk.remove_tag(ticket_id, "card_digits_timeout")
+    zendesk.add_tag(ticket_id, "closed_no_response")
+    zendesk.add_tag(ticket_id, "bot_handled")
+    zendesk.solve_ticket(ticket_id)
+
+    result.update({
+        "status": "closed_no_response",
+        "action": f"timeout_closed_{AWAITING_CARD_DAYS}d",
+        "reply_text": reply_text,
+    })
+    log.info(f"[{ticket_id}] ⏰ Closed — no response within {AWAITING_CARD_DAYS} days")
+    log_result(result)
+    return result
 
 
 # ── Helpers ───────────────────────────────────────────────────────────── #
