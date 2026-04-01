@@ -40,10 +40,24 @@ Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
   "intent": "...",
   "confidence": 0.0,
-  "language": "EN|JP|KR|OTHER",
+  "language": "<ISO 639-1 code of the language the customer wrote in: EN, JP, KR, DE, FR, ZH, ES, PT, IT, RU, etc.>",
   "chargeback_risk": false,
   "reasoning": "one line"
-}"""
+}
+
+Language detection rules:
+- EN  = English
+- JP  = Japanese (ひらがな / カタカナ / 漢字)
+- KR  = Korean (한글)
+- DE  = German (Hallo, bitte, Kündigung, danke)
+- FR  = French (bonjour, annuler, abonnement)
+- ZH  = Chinese (Simplified or Traditional)
+- ES  = Spanish
+- PT  = Portuguese
+- RU  = Russian (Кириллица)
+- IT  = Italian
+- Use the primary language of the customer's message body.
+- If the message contains multiple languages, pick the dominant one."""
 
 
 def classify_ticket(subject: str, body: str) -> dict:
