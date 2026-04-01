@@ -50,6 +50,29 @@ class ZendeskClient:
                 return comment.get("plain_body") or comment.get("body", "")
         return None
 
+    def get_all_customer_comments_text(self, ticket_id: str) -> str:
+        """
+        Return concatenated text of ALL public customer comments (oldest first).
+        Used to search for alternative email addresses when primary lookup fails —
+        covers cases where a customer mentioned a different email in a follow-up reply.
+        Always real, even in dry_run.
+        """
+        resp = requests.get(
+            f"{self.base}/tickets/{ticket_id}/comments.json",
+            auth=self.auth,
+            timeout=10,
+        )
+        if not resp.ok:
+            log.warning(f"Could not fetch comments for #{ticket_id}: {resp.status_code}")
+            return ""
+
+        comments = resp.json().get("comments", [])
+        return "\n".join(
+            comment.get("plain_body") or comment.get("body", "")
+            for comment in comments
+            if comment.get("public") and not comment.get("author", {}).get("agent", False)
+        )
+
     def get_last_customer_comment(self, ticket_id: str) -> str | None:
         """
         Return the plain body of the most recent public comment from the end-user
