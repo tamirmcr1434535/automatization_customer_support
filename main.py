@@ -217,12 +217,21 @@ def _process(ticket_id: str) -> dict:
 
     # 5. Low confidence → escalate
     if confidence < 0.65:
-        log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate")
+        log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent")
         zendesk.add_tag(ticket_id, "bot_low_confidence")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_tag(ticket_id, "bot_handled")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: detected {intent} but confidence {confidence:.0%} — needs human review.",
+            f"🤖 Bot: detected {intent} but confidence {confidence:.0%} is too low to act automatically. "
+            "Please review and handle manually.",
+        )
+        zendesk.set_open(ticket_id)
+        slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=email,
+            intent=intent,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
         )
         result["status"] = "escalated_low_confidence"
         log_result(result)
@@ -254,15 +263,17 @@ def _process(ticket_id: str) -> dict:
             return alt_found
 
         # No working alt email → Slack alert for manual review
-        log.info(f"[{ticket_id}] No alt email worked → Slack alert")
+        log.info(f"[{ticket_id}] No alt email worked → Slack alert + escalate to agent")
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_tag(ticket_id, "bot_handled")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: customer email ({email}) found in {found_in} but has NO active subscription. "
             "Subscription may already be cancelled, or registered under a different email. "
-            "Manual review required.",
+            "Please review and handle manually.",
         )
+        zendesk.set_open(ticket_id)
         slack.notify_manual_review(
             ticket_id=ticket_id,
             email=email,
