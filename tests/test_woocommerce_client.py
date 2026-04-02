@@ -23,6 +23,8 @@ Test scenarios:
   17. _get_sub_type: no start_date + zero trial_end → subscription
   18. _get_sub_type: no start_date, no trial_end → subscription
   19. _get_sub_type: start_date with Z suffix parsed correctly
+  20. get_subscriptions_by_billing_email: ?search= returns empty billing.email →
+      individual detail fetch resolves meta_data._billing_email match
 """
 
 import pytest
@@ -314,3 +316,83 @@ class TestGetSubType:
         start = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
         sub = {"start_date_gmt": start}
         assert WooCommerceClient._get_sub_type(sub, order_count=1) == "trial"
+
+
+# ── 20. get_subscriptions_by_billing_email detail-fetch fallback ─────────── #
+
+@patch("woocommerce_client.requests.get")
+def test_billing_email_search_detail_fetch_fallback(mock_get_fn):
+    """
+    When ?search= returns a subscription with empty billing.email,
+    the client should fetch the individual subscription detail and
+    match via meta_data._billing_email.
+
+    Simulates: WC REST list responses omit billing.email (stored only in
+    WP post meta _billing_email), but the detail endpoint returns it.
+    This was the root cause for satoru_fighting_forever@yahoo.co.jp not
+    being found even though the subscription existed in WC admin.
+    """
+    email = "satoru_fighting_forever@yahoo.co.jp"
+    sub_id = 3305071
+    start = (datetime.now(timezone.utc) - timedelta(days=11)).isoformat()
+
+    # List response has empty billing.email (post-meta-only billing)
+    list_sub = {
+        "id": sub_id,
+        "status": "active",
+        "billing": {"email": ""},   # empty — stored in post meta only
+        "meta_data": [],             # not populated in list responses
+        "start_date_gmt": start,
+        "line_items": [{"name": "WW Personality Test 1 Week Trial Then 28 days"}],
+    }
+
+    # Detail response includes meta_data with _billing_email
+    detail_sub = {
+        **list_sub,
+        "billing": {"email": ""},    # still empty in billing obj
+        "meta_data": [
+            {"key": "_billing_email", "value": email},
+        ],
+    }
+
+    call_count = [0]
+
+    def _mock_get(url, **kwargs):
+        resp = MagicMock()
+        resp.ok = True
+        resp.status_code = 200
+        resp.headers.get.return_value = None
+
+        # 1st call: customers endpoint → no customer found
+        if "/customers" in url:
+            resp.json.return_value = []
+            return resp
+
+        # 2nd call: ?billing_email= on subscriptions → empty (filter not supported)
+        if "/subscriptions" in url and "billing_email" in str(kwargs.get("params", {})):
+            resp.json.return_value = []
+            return resp
+
+        # 3rd call: ?search= on subscriptions → returns sub with empty billing.email
+        if "/subscriptions" in url and "search" in str(kwargs.get("params", {})):
+            resp.json.return_value = [list_sub]
+            return resp
+
+        # 4th call: individual detail GET /subscriptions/{id}
+        if f"/subscriptions/{sub_id}" in url:
+            resp.json.return_value = detail_sub
+            return resp
+
+        resp.json.return_value = []
+        return resp
+
+    mock_get_fn.side_effect = _mock_get
+
+    client = make_client()
+    result = client.cancel_subscription(email)
+
+    # Should have found the subscription via detail-fetch fallback
+    assert result["status"] != "not_found", (
+        f"Expected subscription to be found via detail-fetch, got: {result}"
+    )
+    assert result["subscription_id"] == sub_id
