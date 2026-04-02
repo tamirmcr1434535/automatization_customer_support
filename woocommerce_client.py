@@ -494,6 +494,22 @@ class WooCommerceClient:
         # 2. Subscriptions (always real)
         if customer:
             all_subs = self.get_subscriptions(customer["id"])
+            if not all_subs:
+                # Subscription lookup returned empty — could be a real timeout/error
+                # (get_subscriptions uses 25s timeout, but the WC server can still fail).
+                # Fall back to billing-email search before giving up, so a WC timeout
+                # doesn't cause the caller to fall through to Stripe and misclassify as trial.
+                log.info(
+                    f"WC: no subs found by customer_id={customer['id']} — "
+                    "also checking billing email (handles possible API timeout)"
+                )
+                billing_subs = self.get_subscriptions_by_billing_email(email)
+                if billing_subs:
+                    log.info(
+                        f"WC: found {len(billing_subs)} subscription(s) via billing email "
+                        f"fallback for customer #{customer['id']}"
+                    )
+                    all_subs = billing_subs
         else:
             # No WP customer account found at all — fall back to searching
             # subscriptions directly by billing email.
