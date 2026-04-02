@@ -230,20 +230,6 @@ def _process(ticket_id: str) -> dict:
         f"via {result['cancel_source']} | type={cancel_result.get('subscription_type')}"
     )
 
-    # Override text-classifier intent when WC/Stripe returned no subscription type data.
-    # The text classifier over-classifies "1 Week Trial Then X days" product names as
-    # TRIAL_CANCELLATION even for paying subscribers who are cancelling a renewal.
-    # Rule: if no WC/Stripe subscription data → default to SUB_CANCELLATION.
-    # (A genuine trial cancellation will still be correctly classified when WC lookup
-    # succeeds and returns subscription_type="trial".)
-    if intent == "TRIAL_CANCELLATION" and not cancel_result.get("subscription_type"):
-        intent = "SUB_CANCELLATION"
-        result["intent"] = intent
-        log.info(
-            f"[{ticket_id}] Override TRIAL_CANCELLATION → SUB_CANCELLATION "
-            "(no WC/Stripe subscription type resolved — product name 'trial' is misleading)"
-        )
-
     # 7a. Customer found but no active subscription → try alt emails first, then Slack alert
     if cancel_status == "found_no_active_sub":
         found_in = cancel_result.get("found_in", "system")
