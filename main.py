@@ -74,7 +74,8 @@ stripe_cli = StripeClient(
     dry_run=DRY_RUN,
 )
 slack = SlackClient(
-    webhook_url=os.getenv("SLACK_WEBHOOK_URL", ""),
+    bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
+    target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
     dry_run=DRY_RUN,
 )
 
@@ -123,6 +124,7 @@ def _process(ticket_id: str) -> dict:
         "action": None,
         "dry_run": DRY_RUN,
         "cancel_source": None,
+        "email": None,
     }
 
     # 1. Fetch ticket
@@ -138,6 +140,7 @@ def _process(ticket_id: str) -> dict:
     requester = ticket.get("requester", {})
     email     = requester.get("email", "")
     name      = requester.get("name", "")
+    result["email"] = email
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
@@ -200,6 +203,7 @@ def _process(ticket_id: str) -> dict:
     if confidence < 0.65:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate")
         zendesk.add_tag(ticket_id, "bot_low_confidence")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: detected {intent} but confidence {confidence:.0%} — needs human review.",
@@ -236,6 +240,7 @@ def _process(ticket_id: str) -> dict:
         # No working alt email → Slack alert for manual review
         log.info(f"[{ticket_id}] No alt email worked → Slack alert")
         zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: customer email ({email}) found in {found_in} but has NO active subscription. "
@@ -395,7 +400,15 @@ def _digits_not_found(
         zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
         zendesk.add_tag(ticket_id, "not_found_closed")
         zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.solve_ticket(ticket_id)
+
+        # Slack alert so the team knows this customer slipped through
+        slack.notify_not_found(
+            ticket_id=ticket_id,
+            email=result.get("email", "unknown"),
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
 
         result.update({
             "status": "not_found_closed",
@@ -433,6 +446,7 @@ def _handle_card_digits_timeout(
     zendesk.remove_tag(ticket_id, "card_digits_timeout")
     zendesk.add_tag(ticket_id, "closed_no_response")
     zendesk.add_tag(ticket_id, "bot_handled")
+    zendesk.add_tag(ticket_id, "ai_bot_failed")
     zendesk.solve_ticket(ticket_id)
 
     result.update({
@@ -552,6 +566,7 @@ def _finish_cancellation(
     zendesk.post_reply(ticket_id, reply_text)
     zendesk.add_tag(ticket_id, cancel_tag)
     zendesk.add_tag(ticket_id, "bot_handled")
+    zendesk.add_tag(ticket_id, "ai_bot_success")
     zendesk.solve_ticket(ticket_id)
 
     result.update({
