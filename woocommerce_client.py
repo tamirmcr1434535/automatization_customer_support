@@ -111,13 +111,23 @@ class WooCommerceClient:
         return None
 
     def get_subscriptions(self, customer_id: int) -> list[dict]:
-        """Return all WooCommerce Subscriptions for a given customer ID."""
+        """
+        Return active WooCommerce Subscriptions for a given customer ID.
+
+        Filters by status=active,pending-cancel,on-hold,pending to reduce server-side
+        query cost (WooCommerce has 179K+ subscriptions — unfiltered queries time out).
+        Timeout is 25s because the WooCommerce server is slow under load.
+        """
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions",
-                params={"customer": customer_id, "per_page": 20},
+                params={
+                    "customer": customer_id,
+                    "per_page": 10,
+                    "status": "active,pending-cancel,on-hold,pending",
+                },
                 auth=self.auth,
-                timeout=10,
+                timeout=25,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC subscriptions lookup error for customer {customer_id}: {e}")
@@ -289,29 +299,39 @@ class WooCommerceClient:
         Determine whether subscription is a "trial" or "subscription".
 
         Priority order:
+          0. trial_end_date NOT set (empty / "0000-...") → "subscription"
+             A trial ALWAYS has a trial_end_date. If it's missing, the subscription
+             never had a free trial — it's a paid subscription (possibly a renewal
+             cancellation). This is the fastest and most reliable check.
           1. end_date - start_date > 7 days → "subscription"
-             The subscription has a paid billing cycle beyond the trial window,
-             meaning the customer was already charged. This is the most reliable
-             signal regardless of what trial_end_date says.
+             Paid billing cycle exists beyond the trial window.
           2. trial_end_date <= NOW → "subscription" (trial already expired)
           3. trial_end_date in future AND (trial_end - start) <= 7 days → "trial"
-          4. No usable dates → "subscription" (safe default)
+          4. trial_end_date in future AND (trial_end - start) > 7 days → "subscription"
+          5. No usable dates → "subscription" (safe default)
 
         Examples (product "IQ Booster 1 Week Trial Then 28 days"):
-          - start=March 20, end=April 24 (35d), trial_end=March 27 future
-            → 35 > 7 → "subscription"   ← was wrong before (returned "trial")
-          - start=today,    end=0000,     trial_end=in 7 days (7d)
-            → no end_date → trial_end in future, duration=7d → "trial"
-          - start=30d ago,  end=0000,     trial_end=in 2d (32d)
-            → no end_date → trial_end in future, but duration=32d > 7 → "subscription"
-          - start=2d ago,   end=0000,     trial_end="-"
-            → no end_date, no trial_end → "subscription" (default)
+          - start=March 25, end=April 29 (35d), trial_end="-"
+            → no trial_end → "subscription"  (pending-cancel renewal)
+          - start=today,    end=0000,          trial_end=in 7 days (7d)
+            → trial_end set, future, duration=7d → "trial"
+          - start=March 20, end=April 24 (35d), trial_end=March 27 (future)
+            → trial_end set → end_date check: 35d > 7 → "subscription"
+          - start=30d ago,  end=0000,           trial_end=in 2d (32d since start)
+            → trial_end set, future, duration=32d > 7 → "subscription"
         """
         trial_end_raw = (
             subscription.get("trial_end_date_gmt")
             or subscription.get("trial_end_date")
             or ""
         )
+
+        # ── Path 0: no trial_end_date at all → subscription ──────────── #
+        # A trial product always has a trial_end_date. If it's absent or zeroed,
+        # there was never a free-trial period → this is a paid subscription.
+        if not trial_end_raw or trial_end_raw.startswith("0000"):
+            log.info("WC sub_type (no trial_end): trial_end_date not set → subscription")
+            return "subscription"
         start_raw = (
             subscription.get("start_date_gmt")
             or subscription.get("start_date")
@@ -358,24 +378,8 @@ class WooCommerceClient:
             except (ValueError, AttributeError) as e:
                 log.warning(f"WC: could not parse end_date {end_raw!r}: {e}")
 
-        # ── Path 1.5: days since start > 7 AND no trial_end → subscription ─ #
-        # Safety net for cases where the API returns end_date as "0000-00-00"
-        # (e.g. some WooCommerce Subscriptions plugin versions don't populate
-        # end_date_gmt for pending-cancel subscriptions).
-        # If start_date was more than 7 days ago AND there is no trial_end_date,
-        # the trial window has definitely closed → paid subscription.
-        if start_dt is not None:
-            if not (trial_end_raw and not trial_end_raw.startswith("0000")):
-                # no trial_end info available at all
-                days_since_start = (now - start_dt).days
-                log.info(
-                    f"WC sub_type (days-since-start path): {days_since_start}d since start, "
-                    f"no trial_end → {'subscription' if days_since_start > 7 else 'trial'}"
-                )
-                if days_since_start > 7:
-                    return "subscription"
-
         # ── Path 2: trial_end_date check ─────────────────────────────── #
+        # trial_end_raw is guaranteed non-empty here (Path 0 already handled missing case)
         if trial_end_raw and not trial_end_raw.startswith("0000"):
             try:
                 trial_end_dt = _parse(trial_end_raw)
