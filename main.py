@@ -300,6 +300,11 @@ def _process(ticket_id: str) -> dict:
 
     # 8. Override intent from actual subscription data (trial vs active sub)
     #    Text classifier gives a hint, but the source of truth is WooCommerce/Stripe.
+    if cancel_status == "already_cancelled":
+        log.info(
+            f"[{ticket_id}] Subscription already cancelled in WC — "
+            f"type={cancel_result.get('subscription_type')} → confirming to customer"
+        )
     intent = _resolve_intent(intent, cancel_result)
     result["intent"] = intent
     log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
