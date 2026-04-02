@@ -570,6 +570,38 @@ class WooCommerceClient:
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
 
         if not active_subs:
+            # No active subscription — check if one was already cancelled.
+            # This covers: manual cancellations by human agents, DRY_RUN test tickets,
+            # or customers who submitted duplicate cancellation requests.
+            # In all these cases we should confirm cancellation rather than escalate.
+            cancelled_subs = [s for s in all_subs if s.get("status") == "cancelled"]
+            if cancelled_subs:
+                # Pick the most recently started cancelled sub
+                cancelled_subs.sort(
+                    key=lambda s: s.get("start_date_gmt") or s.get("start_date") or "",
+                    reverse=True,
+                )
+                target = cancelled_subs[0]
+                order_count = self.get_order_count(target["id"])
+                sub_type = self._get_sub_type(target, order_count=order_count)
+                plan = ""
+                line_items = target.get("line_items") or []
+                if line_items:
+                    plan = line_items[0].get("name", "")
+                log.info(
+                    f"WC: no active subs for {email} — "
+                    f"found already-cancelled sub #{target['id']} "
+                    f"(type={sub_type}, orders={order_count})"
+                )
+                return {
+                    **base_result,
+                    "status": "already_cancelled",
+                    "cancelled": True,
+                    "subscription_type": sub_type,
+                    "subscription_id": target["id"],
+                    "plan": plan or "IQ Test Subscription",
+                }
+
             log.info(f"WC: no active subscriptions for {email}")
             return {**base_result, "status": "no_active_sub"}
 
