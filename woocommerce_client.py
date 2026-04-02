@@ -302,6 +302,58 @@ class WooCommerceClient:
             log.info(f"WC: ?search= returned {len(data)} sub(s) for {email}, none matched")
         return matched
 
+    def get_order_count(self, subscription_id: int) -> int | None:
+        """
+        Return the number of orders (initial + renewals) attached to a subscription.
+
+        We only need to know whether count == 1 or > 1, so per_page=2 is enough:
+        - 1 result  → orders == 1  (customer signed up but no renewal charged yet)
+        - 2 results → orders >= 2  (at least one renewal → definitely a paid subscription)
+
+        Returns None on timeout or API error (caller falls back to date-only logic).
+        """
+        try:
+            resp = requests.get(
+                f"{self.base}/subscriptions/{subscription_id}/orders",
+                params={"per_page": 2},
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC: order count lookup error for sub #{subscription_id}: {e}")
+            return None
+
+        if not resp.ok:
+            log.warning(
+                f"WC: order count lookup failed for sub #{subscription_id}: {resp.status_code}"
+            )
+            return None
+
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+
+        # Prefer X-WP-Total header (actual total) when available
+        total_header = resp.headers.get("X-WP-Total")
+        if total_header is not None:
+            try:
+                count = int(total_header)
+                log.info(
+                    f"WC: sub #{subscription_id} has {count} order(s) "
+                    f"(via X-WP-Total header)"
+                )
+                return count
+            except ValueError:
+                pass
+
+        # Fallback: count from response body (capped at per_page=2)
+        count = len(data)
+        log.info(
+            f"WC: sub #{subscription_id} has {count} order(s) "
+            f"(fetched up to 2, no X-WP-Total header)"
+        )
+        return count
+
     @staticmethod
     def _subscription_matches_email(sub: dict, email_lower: str) -> bool:
         """
@@ -328,31 +380,29 @@ class WooCommerceClient:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _get_sub_type(subscription: dict) -> str:
+    def _get_sub_type(subscription: dict, order_count: int | None = None) -> str:
         """
         Determine whether subscription is a "trial" or "subscription".
 
-        Priority order:
+        Rules (applied in order):
           0. trial_end_date NOT set (empty / "0000-...") → "subscription"
-             A trial ALWAYS has a trial_end_date. If it's missing, the subscription
-             never had a free trial — it's a paid subscription (possibly a renewal
-             cancellation). This is the fastest and most reliable check.
-          1. end_date - start_date > 7 days → "subscription"
-             Paid billing cycle exists beyond the trial window.
-          2. trial_end_date <= NOW → "subscription" (trial already expired)
-          3. trial_end_date in future AND (trial_end - start) <= 7 days → "trial"
-          4. trial_end_date in future AND (trial_end - start) > 7 days → "subscription"
-          5. No usable dates → "subscription" (safe default)
+             A trial ALWAYS has a trial_end_date. If it's missing the subscription
+             never had a free-trial period → it's a paid subscription.
+          1. order_count > 1 → "subscription"
+             Can't be a trial if more than one order has been charged.
+          2. trial_end_date set + order_count == 1 + days_since_start ≤ 8 → "trial"
+             Customer signed up within the last 8 days with exactly one order and
+             a trial period configured → genuine free trial.
+          3. Everything else → "subscription"
+             (order_count unknown: fall back to days_since_start alone)
 
-        Examples (product "IQ Booster 1 Week Trial Then 28 days"):
-          - start=March 25, end=April 29 (35d), trial_end="-"
-            → no trial_end → "subscription"  (pending-cancel renewal)
-          - start=today,    end=0000,          trial_end=in 7 days (7d)
-            → trial_end set, future, duration=7d → "trial"
-          - start=March 20, end=April 24 (35d), trial_end=March 27 (future)
-            → trial_end set → end_date check: 35d > 7 → "subscription"
-          - start=30d ago,  end=0000,           trial_end=in 2d (32d since start)
-            → trial_end set, future, duration=32d > 7 → "subscription"
+        Examples:
+          - trial_end="-", orders=2  → no trial_end → "subscription"
+          - trial_end set, orders=2  → orders > 1   → "subscription"
+          - trial_end set, orders=1, started 3d ago  → "trial"
+          - trial_end set, orders=1, started 15d ago → days > 8 → "subscription"
+          - trial_end set, orders=None, started 3d ago → "trial" (unknown count, ≤8d)
+          - trial_end set, orders=None, started 20d ago → "subscription" (>8d)
         """
         trial_end_raw = (
             subscription.get("trial_end_date_gmt")
@@ -360,20 +410,20 @@ class WooCommerceClient:
             or ""
         )
 
-        # ── Path 0: no trial_end_date at all → subscription ──────────── #
-        # A trial product always has a trial_end_date. If it's absent or zeroed,
-        # there was never a free-trial period → this is a paid subscription.
+        # ── Path 0: no trial_end_date → subscription ─────────────────── #
         if not trial_end_raw or trial_end_raw.startswith("0000"):
-            log.info("WC sub_type (no trial_end): trial_end_date not set → subscription")
+            log.info("WC sub_type: trial_end_date not set → subscription")
             return "subscription"
+
+        # ── Path 1: order_count > 1 → subscription ───────────────────── #
+        if order_count is not None and order_count > 1:
+            log.info(f"WC sub_type: order_count={order_count} > 1 → subscription")
+            return "subscription"
+
+        # ── Paths 2-3: trial_end IS set; use days_since_start ────────── #
         start_raw = (
             subscription.get("start_date_gmt")
             or subscription.get("start_date")
-            or ""
-        )
-        end_raw = (
-            subscription.get("end_date_gmt")
-            or subscription.get("end_date")
             or ""
         )
 
@@ -383,7 +433,6 @@ class WooCommerceClient:
 
         now = datetime.now(timezone.utc)
 
-        # Parse start_date once (needed by multiple paths below)
         start_dt = None
         if start_raw and not start_raw.startswith("0000"):
             try:
@@ -391,58 +440,23 @@ class WooCommerceClient:
             except (ValueError, AttributeError) as e:
                 log.warning(f"WC: could not parse start_date {start_raw!r}: {e}")
 
-        # ── Path 1: end_date - start_date > 7 days → already a paid sub ─ #
-        # Fires when the subscription has an end_date set that is more than
-        # 7 days from start, meaning at least one paid billing cycle has occurred.
-        if (
-            end_raw and not end_raw.startswith("0000")
-            and start_dt is not None
-        ):
-            try:
-                end_dt     = _parse(end_raw)
-                total_days = (end_dt - start_dt).days
-                log.info(
-                    f"WC sub_type (end_date path): start={start_dt.date()}, "
-                    f"end={end_dt.date()}, total={total_days}d "
-                    f"→ {'subscription' if total_days > 7 else 'checking trial_end...'}"
-                )
-                if total_days > 7:
-                    return "subscription"
-                # total_days <= 7: still within trial window — fall through
-            except (ValueError, AttributeError) as e:
-                log.warning(f"WC: could not parse end_date {end_raw!r}: {e}")
+        if start_dt is not None:
+            days_since_start = (now - start_dt).days
+            # Trial: single order, subscription started ≤ 8 days ago
+            is_trial = (order_count is None or order_count == 1) and days_since_start <= 8
+            log.info(
+                f"WC sub_type: trial_end set, order_count={order_count}, "
+                f"days_since_start={days_since_start} "
+                f"→ {'trial' if is_trial else 'subscription'}"
+            )
+            return "trial" if is_trial else "subscription"
 
-        # ── Path 2: trial_end_date check ─────────────────────────────── #
-        # trial_end_raw is guaranteed non-empty here (Path 0 already handled missing case)
-        if trial_end_raw and not trial_end_raw.startswith("0000"):
-            try:
-                trial_end_dt = _parse(trial_end_raw)
+        # No start_date — if order_count==1 assume trial, else subscription
+        if order_count == 1:
+            log.info("WC sub_type: trial_end set, order_count=1, no start_date → trial")
+            return "trial"
 
-                # Trial already expired → subscription
-                if trial_end_dt <= now:
-                    log.info(
-                        f"WC sub_type (trial_end expired): "
-                        f"trial_end={trial_end_dt.date()} ≤ now → subscription"
-                    )
-                    return "subscription"
-
-                # Trial still active: check duration
-                if start_dt is not None:
-                    trial_duration_days = (trial_end_dt - start_dt).days
-                    log.info(
-                        f"WC sub_type (trial_end future): start={start_dt.date()}, "
-                        f"trial_end={trial_end_dt.date()}, duration={trial_duration_days}d "
-                        f"→ {'trial' if trial_duration_days <= 7 else 'subscription'}"
-                    )
-                    return "trial" if trial_duration_days <= 7 else "subscription"
-                else:
-                    # No start_date but future trial_end → assume trial
-                    return "trial"
-
-            except (ValueError, AttributeError) as e:
-                log.warning(f"WC: could not parse trial_end {trial_end_raw!r}: {e}")
-
-        # ── Default: no usable date info ─────────────────────────────── #
+        log.info("WC sub_type: trial_end set but no usable dates → subscription (safe default)")
         return "subscription"
 
     # ------------------------------------------------------------------ #
@@ -568,9 +582,19 @@ class WooCommerceClient:
         # Rationale: a customer asking to cancel almost certainly means their CURRENT
         # paid subscription. If they also have a fresh trial (e.g. signed up again
         # on the same email), we should NOT cancel the trial instead of the paid sub.
-        typed_subs = [
-            (s, self._get_sub_type(s)) for s in active_subs
-        ]
+        #
+        # Order count is only fetched when trial_end_date IS set — avoids a network
+        # round-trip for clear-cut subscriptions (Path 0 exits early in _get_sub_type).
+        typed_subs = []
+        for s in active_subs:
+            trial_end_raw = (
+                s.get("trial_end_date_gmt") or s.get("trial_end_date") or ""
+            )
+            order_count: int | None = None
+            if trial_end_raw and not trial_end_raw.startswith("0000"):
+                # trial_end is set → fetch order count to distinguish trial from renewal
+                order_count = self.get_order_count(s["id"])
+            typed_subs.append((s, self._get_sub_type(s, order_count=order_count)))
 
         def _select_priority(entry: tuple) -> tuple:
             sub, sub_type = entry
