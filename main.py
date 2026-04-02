@@ -144,7 +144,15 @@ def _process(ticket_id: str) -> dict:
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
-    # 2. TEST_MODE gate
+    # 2. Idempotency check — skip if bot already handled this ticket.
+    #    Prevents duplicate replies from double Zendesk webhook triggers.
+    #    (Zendesk sometimes fires the same trigger twice in quick succession.)
+    if "bot_handled" in tags:
+        log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping duplicate webhook")
+        result["status"] = "skipped_already_handled"
+        return result
+
+    # 3. TEST_MODE gate
     if TEST_MODE and TEST_TAG not in tags:
         log.info(f"[{ticket_id}] Skip — test mode, missing tag '{TEST_TAG}'")
         result["status"] = "skipped_no_test_tag"
