@@ -40,28 +40,45 @@ class WooCommerceClient:
     # ------------------------------------------------------------------ #
 
     def get_customer_by_email(self, email: str) -> dict | None:
-        """Return the first WooCommerce customer matching *email* (exact), or None."""
-        try:
-            resp = requests.get(
-                f"{self.base}/customers",
-                params={"email": email, "per_page": 1},
-                auth=self.auth,
-                timeout=10,
-            )
-        except requests.exceptions.RequestException as e:
-            log.warning(f"WC customer lookup error for {email}: {e}")
-            return None
+        """
+        Return the first WooCommerce customer matching *email* (exact), or None.
 
-        if resp.status_code == 401:
-            log.error("WooCommerce 401 Unauthorized — check WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET in Secret Manager")
-            return None
-        if resp.status_code == 404:
-            return None
-        if not resp.ok:
-            log.warning(f"WC customer lookup failed for {email}: {resp.status_code}")
-            return None
-        data = resp.json()
-        return data[0] if data else None
+        Tries two passes:
+          1. ?role=all  — finds users of ANY WordPress role (subscriber, customer,
+             administrator, etc.).  PayPal subscribers often get the 'subscriber'
+             role rather than 'customer', so the default endpoint misses them.
+          2. Default (no role filter) — fallback for WC versions that reject role=all.
+        """
+        for params in [
+            {"email": email, "per_page": 1, "role": "all"},
+            {"email": email, "per_page": 1},
+        ]:
+            try:
+                resp = requests.get(
+                    f"{self.base}/customers",
+                    params=params,
+                    auth=self.auth,
+                    timeout=10,
+                )
+            except requests.exceptions.RequestException as e:
+                log.warning(f"WC customer lookup error for {email}: {e}")
+                continue
+
+            if resp.status_code == 401:
+                log.error("WooCommerce 401 Unauthorized — check WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET in Secret Manager")
+                return None
+            if resp.status_code == 404:
+                continue
+            if not resp.ok:
+                log.warning(f"WC customer lookup failed for {email} (params={params}): {resp.status_code}")
+                continue
+
+            data = resp.json()
+            if data:
+                log.info(f"WC: found customer for {email} via params={list(params.keys())} (id={data[0]['id']})")
+                return data[0]
+
+        return None
 
     def search_customer_by_email(self, email: str) -> dict | None:
         """
