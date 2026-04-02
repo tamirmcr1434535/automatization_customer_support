@@ -344,13 +344,35 @@ class WooCommerceClient:
             log.info(f"WC: no active subscriptions for {email}")
             return {**base_result, "status": "no_active_sub"}
 
-        # 3. Determine type for each active sub; prefer trial over paid sub
+        # 3. Determine type for each active sub and select by priority:
+        #    pending-cancel (paid) → active (paid) → pending-cancel (trial) → active (trial)
+        #
+        # Rationale: a customer asking to cancel almost certainly means their CURRENT
+        # paid subscription. If they also have a fresh trial (e.g. signed up again
+        # on the same email), we should NOT cancel the trial instead of the paid sub.
         typed_subs = [
             (s, self._get_sub_type(s)) for s in active_subs
         ]
-        # Pick a trial sub first; if none — pick the first active sub
-        trial_entry = next(((s, t) for s, t in typed_subs if t == "trial"), None)
-        target, sub_type = trial_entry if trial_entry else typed_subs[0]
+
+        def _select_priority(entry: tuple) -> tuple:
+            sub, sub_type = entry
+            status = sub.get("status", "")
+            # Lower tuple = higher priority (sort ascending)
+            if status == "pending-cancel" and sub_type == "subscription":
+                return (0,)   # highest: already-requested paid cancellation
+            elif status == "active" and sub_type == "subscription":
+                return (1,)   # active paid subscription
+            elif status == "pending-cancel" and sub_type == "trial":
+                return (2,)   # pending-cancel trial
+            elif sub_type == "subscription":
+                return (3,)   # other status, paid
+            elif sub_type == "trial":
+                return (4,)   # trial — lowest priority
+            else:
+                return (5,)
+
+        typed_subs.sort(key=_select_priority)
+        target, sub_type = typed_subs[0]
 
         plan = ""
         line_items = target.get("line_items") or []
