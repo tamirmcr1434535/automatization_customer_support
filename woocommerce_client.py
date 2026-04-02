@@ -121,58 +121,125 @@ class WooCommerceClient:
         from the billing email on the subscription (e.g. guest checkout, or the
         customer changed their account email after subscribing).
 
-        Tries ?billing_email= first (WooCommerce Subscriptions plugin filter),
-        then ?search= as a secondary fallback.
+        Strategy:
+          1. ?billing_email= with pagination (up to MAX_PAGES × 50 results).
+             WooCommerce Subscriptions plugin should filter server-side.
+             We trust this filter partially: subscriptions whose billing.email
+             matches are kept (strict); subscriptions whose billing.email is
+             EMPTY are also kept — WC often stores the email in WordPress post
+             meta (_billing_email) which is NOT returned in list API responses,
+             so billing.email is blank even for matching subscriptions.
+             If we see any subscription with a *non-empty, non-matching* billing
+             email we know the server-side filter is broken → reject whole page.
+          2. ?search= as secondary fallback (strict email validation only).
 
-        IMPORTANT: The ?billing_email= parameter is NOT guaranteed to filter results
-        server-side in all WooCommerce Subscriptions plugin versions — some versions
-        ignore unknown query parameters and return all recent subscriptions instead.
-        We always validate the returned results by checking billing.email explicitly.
+        IMPORTANT: Always call cancel_subscription() via customer_id when possible
+        (?customer= filter) — that path is reliable. This method is last-resort.
         """
         email_lower = email.lower().strip()
+        MAX_PAGES   = 5   # scan up to 5 × 50 = 250 subscriptions per filter
 
-        for params in [
-            {"billing_email": email, "per_page": 50},
-            {"search": email,        "per_page": 50},
-        ]:
+        # ── Pass 1: ?billing_email= with pagination ───────────────────── #
+        for page in range(1, MAX_PAGES + 1):
             try:
                 resp = requests.get(
                     f"{self.base}/subscriptions",
-                    params=params,
+                    params={"billing_email": email, "per_page": 50, "page": page},
                     auth=self.auth,
                     timeout=10,
                 )
             except requests.exceptions.RequestException as e:
-                log.warning(f"WC billing-email lookup error for {email} (params={params}): {e}")
-                continue
+                log.warning(f"WC billing_email lookup error for {email} page={page}: {e}")
+                break
 
             if not resp.ok:
-                continue
+                log.warning(f"WC billing_email lookup failed for {email}: {resp.status_code}")
+                break
 
             data = resp.json()
-            if not isinstance(data, list):
-                continue
+            if not isinstance(data, list) or not data:
+                break  # no more pages
 
-            # ── Validate: keep only subscriptions whose email matches ────────
-            # Guards against API versions that ignore the filter parameter.
-            # Checks both billing.email (REST API field) and meta_data._billing_email
-            # (WordPress post meta — where WC actually stores the billing email,
-            # especially for PayPal subscriptions where billing.email may differ).
-            matched = [s for s in data if self._subscription_matches_email(s, email_lower)]
+            # Classify results:
+            #  - exact_match  : billing.email == our email  (or meta_data._billing_email)
+            #  - empty_email  : billing.email is "" or missing  (server may have filtered correctly
+            #                   but doesn't serialize email in list responses — trust it)
+            #  - wrong_email  : billing.email is a *different* email  (filter is broken/ignored)
+            exact_match  = []
+            empty_email  = []
+            filter_broken = False
 
-            if matched:
+            for s in data:
+                if self._subscription_matches_email(s, email_lower):
+                    exact_match.append(s)
+                else:
+                    billing_email_in_response = s.get("billing", {}).get("email", "").strip()
+                    if billing_email_in_response:
+                        # Server returned a sub with a DIFFERENT non-empty billing email
+                        # → server-side filter is broken/ignored for this WC version
+                        filter_broken = True
+                    else:
+                        empty_email.append(s)
+
+            if exact_match:
                 log.info(
-                    f"WC: found {len(matched)} subscription(s) matching billing email "
-                    f"{email} (API returned {len(data)}, filtered to exact match)"
+                    f"WC: found {len(exact_match)} subscription(s) with exact billing email "
+                    f"match for {email} (page {page}, total returned {len(data)})"
                 )
-                return matched
+                return exact_match
 
+            if empty_email and not filter_broken:
+                # billing.email is empty for ALL results — common for PayPal subs where
+                # email lives only in WP post meta _billing_email (not in REST list response).
+                # The server-side ?billing_email= filter appears to be working (no wrong emails
+                # in the results), so these subscriptions most likely belong to our customer.
+                log.info(
+                    f"WC: ?billing_email= returned {len(empty_email)} subscription(s) with "
+                    f"empty billing.email for {email} page={page} — trusting server filter "
+                    f"(PayPal/post-meta-only billing email pattern)"
+                )
+                return empty_email
+
+            if filter_broken:
+                log.info(
+                    f"WC: ?billing_email= filter appears broken for {email} "
+                    f"(page {page} returned subscriptions with different billing emails) — "
+                    "not trusting results, skipping to ?search="
+                )
+                break  # server ignores the filter — pagination won't help
+
+            # All 50 had empty email AND filter looks broken? Shouldn't reach here,
+            # but break to be safe.
             log.info(
-                f"WC: API returned {len(data)} subscription(s) for "
-                f"{list(params.keys())[0]}={email} but none matched billing.email — skipping"
+                f"WC: ?billing_email= page {page} returned {len(data)} sub(s), "
+                f"none matched {email} — trying next page"
             )
 
-        return []
+        # ── Pass 2: ?search= (strict validation only) ─────────────────── #
+        try:
+            resp = requests.get(
+                f"{self.base}/subscriptions",
+                params={"search": email, "per_page": 50},
+                auth=self.auth,
+                timeout=15,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC ?search= lookup error for {email}: {e}")
+            return []
+
+        if not resp.ok:
+            return []
+
+        data = resp.json()
+        if not isinstance(data, list):
+            return []
+
+        matched = [s for s in data if self._subscription_matches_email(s, email_lower)]
+        if matched:
+            log.info(f"WC: found {len(matched)} subscription(s) via ?search= for {email}")
+        else:
+            log.info(f"WC: ?search= returned {len(data)} sub(s) for {email}, none matched")
+        return matched
 
     @staticmethod
     def _subscription_matches_email(sub: dict, email_lower: str) -> bool:
