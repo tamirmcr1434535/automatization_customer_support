@@ -160,6 +160,17 @@ def _process(ticket_id: str) -> dict:
         result["status"] = "skipped_merged"
         return result
 
+    # 2c. Skip if a human agent already replied publicly.
+    #     If the last public comment is from our team, they are already handling it —
+    #     no need for the bot to classify, escalate, or interfere.
+    if zendesk.last_public_comment_is_from_agent(ticket_id):
+        log.info(
+            f"[{ticket_id}] Last public comment is from an agent — "
+            "skipping (human already replied)"
+        )
+        result["status"] = "skipped_agent_already_replied"
+        return result
+
     # 3. TEST_MODE gate
     if TEST_MODE and TEST_TAG not in tags:
         log.info(f"[{ticket_id}] Skip — test mode, missing tag '{TEST_TAG}'")
