@@ -40,7 +40,7 @@ class WooCommerceClient:
     # ------------------------------------------------------------------ #
 
     def get_customer_by_email(self, email: str) -> dict | None:
-        """Return the first WooCommerce customer matching *email*, or None."""
+        """Return the first WooCommerce customer matching *email* (exact), or None."""
         try:
             resp = requests.get(
                 f"{self.base}/customers",
@@ -62,6 +62,36 @@ class WooCommerceClient:
             return None
         data = resp.json()
         return data[0] if data else None
+
+    def search_customer_by_email(self, email: str) -> dict | None:
+        """
+        Broader customer search via ?search= — handles edge cases where
+        ?email= fails (different casing, partial WP account, etc.).
+        Validates the returned customer's email matches.
+        """
+        try:
+            resp = requests.get(
+                f"{self.base}/customers",
+                params={"search": email, "per_page": 10},
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC customer search error for {email}: {e}")
+            return None
+
+        if not resp.ok:
+            return None
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+
+        email_lower = email.lower().strip()
+        for customer in data:
+            if customer.get("email", "").lower().strip() == email_lower:
+                log.info(f"WC: found customer via ?search= for {email} (id={customer['id']})")
+                return customer
+        return None
 
     def get_subscriptions(self, customer_id: int) -> list[dict]:
         """Return all WooCommerce Subscriptions for a given customer ID."""
@@ -123,13 +153,12 @@ class WooCommerceClient:
             if not isinstance(data, list):
                 continue
 
-            # ── Validate: keep only subscriptions whose billing.email matches ──
-            # This guards against API versions that ignore the filter parameter
-            # and return all recent subscriptions instead.
-            matched = [
-                s for s in data
-                if s.get("billing", {}).get("email", "").lower().strip() == email_lower
-            ]
+            # ── Validate: keep only subscriptions whose email matches ────────
+            # Guards against API versions that ignore the filter parameter.
+            # Checks both billing.email (REST API field) and meta_data._billing_email
+            # (WordPress post meta — where WC actually stores the billing email,
+            # especially for PayPal subscriptions where billing.email may differ).
+            matched = [s for s in data if self._subscription_matches_email(s, email_lower)]
 
             if matched:
                 log.info(
@@ -144,6 +173,27 @@ class WooCommerceClient:
             )
 
         return []
+
+    @staticmethod
+    def _subscription_matches_email(sub: dict, email_lower: str) -> bool:
+        """
+        Check if a subscription is associated with the given email (lowercased).
+
+        Checks in order:
+        1. billing.email (REST API billing address field)
+        2. meta_data._billing_email (WordPress post meta — the canonical store,
+           sometimes differs from billing.email for PayPal subscriptions)
+        3. meta_data.billing_email (alternate meta key used by some plugins)
+        """
+        # 1. REST API billing object
+        if sub.get("billing", {}).get("email", "").lower().strip() == email_lower:
+            return True
+        # 2 & 3. WordPress post meta
+        for meta in sub.get("meta_data", []):
+            if meta.get("key") in ("_billing_email", "billing_email"):
+                if meta.get("value", "").lower().strip() == email_lower:
+                    return True
+        return False
 
     # ------------------------------------------------------------------ #
     # Trial detection                                                       #
@@ -348,13 +398,18 @@ class WooCommerceClient:
         log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
         customer = self.get_customer_by_email(email)
 
+        if not customer:
+            # Exact email lookup failed — try broader ?search= before giving up on
+            # the customer-ID path (covers slight email variations, WP account quirks).
+            customer = self.search_customer_by_email(email)
+
         # 2. Subscriptions (always real)
         if customer:
             all_subs = self.get_subscriptions(customer["id"])
         else:
-            # Customer account not found by email — try searching subscriptions by billing email.
-            # This covers: guest checkouts, account email ≠ billing email,
-            # or customers whose WordPress account was created with a different address.
+            # No WP customer account found at all — fall back to searching
+            # subscriptions directly by billing email.
+            # Covers: guest checkouts, PayPal-only accounts, account email ≠ billing email.
             log.info(
                 f"WC: no customer account for {email} — "
                 "falling back to billing-email subscription search"
