@@ -129,16 +129,24 @@ class WooCommerceClient:
         """
         Determine whether subscription is a "trial" or "subscription".
 
-        Logic:
-          1. trial_end_date must exist and be in the future (still in trial).
-          2. trial_end_date - start_date <= 7 days  → "trial"  (1-week trial period)
-             trial_end_date - start_date  > 7 days  → "subscription" (already a paying sub)
-          3. No trial_end_date, or trial already ended → "subscription"
+        Priority order:
+          1. end_date - start_date > 7 days → "subscription"
+             The subscription has a paid billing cycle beyond the trial window,
+             meaning the customer was already charged. This is the most reliable
+             signal regardless of what trial_end_date says.
+          2. trial_end_date <= NOW → "subscription" (trial already expired)
+          3. trial_end_date in future AND (trial_end - start) <= 7 days → "trial"
+          4. No usable dates → "subscription" (safe default)
 
-        Examples (product "WW IQ Test 1 Week Trial Then 28 days"):
-          - start=2 days ago, trial_end=in 5 days  →  delta=7d  → "trial"
-          - start=30 days ago, trial_end=in 2 days →  delta=32d → "subscription"
-          - start=1 day ago,   trial_end="-"       →             → "subscription"
+        Examples (product "IQ Booster 1 Week Trial Then 28 days"):
+          - start=March 20, end=April 24 (35d), trial_end=March 27 future
+            → 35 > 7 → "subscription"   ← was wrong before (returned "trial")
+          - start=today,    end=0000,     trial_end=in 7 days (7d)
+            → no end_date → trial_end in future, duration=7d → "trial"
+          - start=30d ago,  end=0000,     trial_end=in 2d (32d)
+            → no end_date → trial_end in future, but duration=32d > 7 → "subscription"
+          - start=2d ago,   end=0000,     trial_end="-"
+            → no end_date, no trial_end → "subscription" (default)
         """
         trial_end_raw = (
             subscription.get("trial_end_date_gmt")
@@ -150,60 +158,78 @@ class WooCommerceClient:
             or subscription.get("start_date")
             or ""
         )
-
-        def _parse(s: str):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-        # ── Path A: trial_end_date is set ─────────────────────────────── #
-        if trial_end_raw and not trial_end_raw.startswith("0000"):
-            try:
-                trial_end_dt = _parse(trial_end_raw)
-                now = datetime.now(timezone.utc)
-
-                # Trial already expired → subscription
-                if trial_end_dt <= now:
-                    return "subscription"
-
-                if not start_raw or start_raw.startswith("0000"):
-                    return "trial"  # no start date but future trial_end → trial
-
-                start_dt = _parse(start_raw)
-                trial_duration_days = (trial_end_dt - start_dt).days
-                log.info(
-                    f"WC trial check (via trial_end): start={start_dt.date()}, "
-                    f"trial_end={trial_end_dt.date()}, duration={trial_duration_days}d"
-                )
-                return "trial" if trial_duration_days <= 7 else "subscription"
-
-            except (ValueError, AttributeError) as e:
-                log.warning(f"Could not parse trial_end: {trial_end_raw!r} — {e}")
-
-        # ── Path B: trial_end_date is empty (e.g. pending-cancel clears it) ─ #
-        # Fall back to: end_date - start_date <= 7 days → trial
         end_raw = (
             subscription.get("end_date_gmt")
             or subscription.get("end_date")
             or ""
         )
+
+        def _parse(s: str):
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+
+        # Parse start_date once (needed by multiple paths below)
+        start_dt = None
+        if start_raw and not start_raw.startswith("0000"):
+            try:
+                start_dt = _parse(start_raw)
+            except (ValueError, AttributeError) as e:
+                log.warning(f"WC: could not parse start_date {start_raw!r}: {e}")
+
+        # ── Path 1: end_date - start_date > 7 days → already a paid sub ─ #
+        # This fires when a pending-cancel (or active) sub has an end_date set,
+        # meaning the billing period has extended beyond the initial trial window.
         if (
             end_raw and not end_raw.startswith("0000")
-            and start_raw and not start_raw.startswith("0000")
+            and start_dt is not None
         ):
             try:
-                end_dt   = _parse(end_raw)
-                start_dt = _parse(start_raw)
+                end_dt     = _parse(end_raw)
                 total_days = (end_dt - start_dt).days
                 log.info(
-                    f"WC trial check (via end_date fallback): start={start_dt.date()}, "
-                    f"end={end_dt.date()}, total={total_days}d"
+                    f"WC sub_type (end_date path): start={start_dt.date()}, "
+                    f"end={end_dt.date()}, total={total_days}d "
+                    f"→ {'subscription' if total_days > 7 else 'checking trial_end...'}"
                 )
-                # <= 7 days total window → 1-week trial product
-                return "trial" if total_days <= 7 else "subscription"
+                if total_days > 7:
+                    return "subscription"
+                # total_days <= 7: still within trial window — fall through to
+                # trial_end_date check to confirm
+            except (ValueError, AttributeError) as e:
+                log.warning(f"WC: could not parse end_date {end_raw!r}: {e}")
+
+        # ── Path 2: trial_end_date check ─────────────────────────────── #
+        if trial_end_raw and not trial_end_raw.startswith("0000"):
+            try:
+                trial_end_dt = _parse(trial_end_raw)
+
+                # Trial already expired → subscription
+                if trial_end_dt <= now:
+                    log.info(
+                        f"WC sub_type (trial_end expired): "
+                        f"trial_end={trial_end_dt.date()} ≤ now → subscription"
+                    )
+                    return "subscription"
+
+                # Trial still active: check duration
+                if start_dt is not None:
+                    trial_duration_days = (trial_end_dt - start_dt).days
+                    log.info(
+                        f"WC sub_type (trial_end future): start={start_dt.date()}, "
+                        f"trial_end={trial_end_dt.date()}, duration={trial_duration_days}d "
+                        f"→ {'trial' if trial_duration_days <= 7 else 'subscription'}"
+                    )
+                    return "trial" if trial_duration_days <= 7 else "subscription"
+                else:
+                    # No start_date but future trial_end → assume trial
+                    return "trial"
 
             except (ValueError, AttributeError) as e:
-                log.warning(f"Could not parse end/start dates: {e}")
+                log.warning(f"WC: could not parse trial_end {trial_end_raw!r}: {e}")
 
+        # ── Default: no usable date info ─────────────────────────────── #
         return "subscription"
 
     # ------------------------------------------------------------------ #
