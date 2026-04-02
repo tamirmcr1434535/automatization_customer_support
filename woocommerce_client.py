@@ -179,8 +179,8 @@ class WooCommerceClient:
                 log.warning(f"WC: could not parse start_date {start_raw!r}: {e}")
 
         # ── Path 1: end_date - start_date > 7 days → already a paid sub ─ #
-        # This fires when a pending-cancel (or active) sub has an end_date set,
-        # meaning the billing period has extended beyond the initial trial window.
+        # Fires when the subscription has an end_date set that is more than
+        # 7 days from start, meaning at least one paid billing cycle has occurred.
         if (
             end_raw and not end_raw.startswith("0000")
             and start_dt is not None
@@ -195,10 +195,26 @@ class WooCommerceClient:
                 )
                 if total_days > 7:
                     return "subscription"
-                # total_days <= 7: still within trial window — fall through to
-                # trial_end_date check to confirm
+                # total_days <= 7: still within trial window — fall through
             except (ValueError, AttributeError) as e:
                 log.warning(f"WC: could not parse end_date {end_raw!r}: {e}")
+
+        # ── Path 1.5: days since start > 7 AND no trial_end → subscription ─ #
+        # Safety net for cases where the API returns end_date as "0000-00-00"
+        # (e.g. some WooCommerce Subscriptions plugin versions don't populate
+        # end_date_gmt for pending-cancel subscriptions).
+        # If start_date was more than 7 days ago AND there is no trial_end_date,
+        # the trial window has definitely closed → paid subscription.
+        if start_dt is not None:
+            if not (trial_end_raw and not trial_end_raw.startswith("0000")):
+                # no trial_end info available at all
+                days_since_start = (now - start_dt).days
+                log.info(
+                    f"WC sub_type (days-since-start path): {days_since_start}d since start, "
+                    f"no trial_end → {'subscription' if days_since_start > 7 else 'trial'}"
+                )
+                if days_since_start > 7:
+                    return "subscription"
 
         # ── Path 2: trial_end_date check ─────────────────────────────── #
         if trial_end_raw and not trial_end_raw.startswith("0000"):
