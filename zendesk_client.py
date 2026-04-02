@@ -29,48 +29,61 @@ class ZendeskClient:
                 ticket["requester"] = u.json()["user"]
         return ticket
 
-    def get_first_customer_comment(self, ticket_id: str) -> str | None:
+    def _fetch_comments_with_agent_ids(self, ticket_id: str) -> tuple[list, set]:
         """
-        Return the plain body of the FIRST public comment from the end-user.
-        Used for messaging/chat tickets where description is empty or just a header.
+        Fetch all comments for a ticket, returning (comments, agent_ids).
+
+        Uses ?include=users so we get user roles inline — the base comments endpoint
+        only returns author_id (no embedded author object), so we must include users
+        to reliably distinguish end-user comments from agent/bot comments.
+
+        agent_ids: set of user IDs whose role is "agent" or "admin".
         Always real, even in dry_run.
         """
         resp = requests.get(
             f"{self.base}/tickets/{ticket_id}/comments.json",
+            params={"include": "users"},
             auth=self.auth,
             timeout=10,
         )
         if not resp.ok:
             log.warning(f"Could not fetch comments for #{ticket_id}: {resp.status_code}")
-            return None
+            return [], set()
 
-        comments = resp.json().get("comments", [])
+        data = resp.json()
+        agent_ids = {
+            u["id"]
+            for u in data.get("users", [])
+            if u.get("role") in ("agent", "admin")
+        }
+        return data.get("comments", []), agent_ids
+
+    def get_first_customer_comment(self, ticket_id: str) -> str | None:
+        """
+        Return the plain body of the FIRST public comment from the end-user (non-agent).
+        Used for messaging/chat tickets where description is empty or just a header.
+        Always real, even in dry_run.
+        """
+        comments, agent_ids = self._fetch_comments_with_agent_ids(ticket_id)
         for comment in comments:  # oldest first
-            if comment.get("public") and not comment.get("author", {}).get("agent", False):
+            if (
+                comment.get("public")
+                and comment.get("author_id") not in agent_ids
+            ):
                 return comment.get("plain_body") or comment.get("body", "")
         return None
 
     def get_all_customer_comments_text(self, ticket_id: str) -> str:
         """
-        Return concatenated text of ALL public customer comments (oldest first).
-        Used to search for alternative email addresses when primary lookup fails —
-        covers cases where a customer mentioned a different email in a follow-up reply.
+        Return concatenated text of ALL public customer (non-agent) comments, oldest first.
+        Used to search for alternative email addresses when primary lookup fails.
         Always real, even in dry_run.
         """
-        resp = requests.get(
-            f"{self.base}/tickets/{ticket_id}/comments.json",
-            auth=self.auth,
-            timeout=10,
-        )
-        if not resp.ok:
-            log.warning(f"Could not fetch comments for #{ticket_id}: {resp.status_code}")
-            return ""
-
-        comments = resp.json().get("comments", [])
+        comments, agent_ids = self._fetch_comments_with_agent_ids(ticket_id)
         return "\n".join(
             comment.get("plain_body") or comment.get("body", "")
             for comment in comments
-            if comment.get("public") and not comment.get("author", {}).get("agent", False)
+            if comment.get("public") and comment.get("author_id") not in agent_ids
         )
 
     def get_last_customer_comment(self, ticket_id: str) -> str | None:
@@ -78,18 +91,12 @@ class ZendeskClient:
         Return the plain body of the most recent public comment from the end-user
         (non-agent). Always real, even in dry_run.
         """
-        resp = requests.get(
-            f"{self.base}/tickets/{ticket_id}/comments.json",
-            auth=self.auth,
-            timeout=10,
-        )
-        if not resp.ok:
-            log.warning(f"Could not fetch comments for #{ticket_id}: {resp.status_code}")
-            return None
-
-        comments = resp.json().get("comments", [])
+        comments, agent_ids = self._fetch_comments_with_agent_ids(ticket_id)
         for comment in reversed(comments):
-            if comment.get("public") and not comment.get("author", {}).get("agent", False):
+            if (
+                comment.get("public")
+                and comment.get("author_id") not in agent_ids
+            ):
                 return comment.get("plain_body") or comment.get("body", "")
         return None
 
