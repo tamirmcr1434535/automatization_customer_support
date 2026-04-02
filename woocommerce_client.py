@@ -276,7 +276,11 @@ class WooCommerceClient:
                 f"none matched {email} — trying next page"
             )
 
-        # ── Pass 2: ?search= (strict validation only) ─────────────────── #
+        # ── Pass 2: ?search= with individual-fetch fallback ───────────── #
+        # WC REST list responses often omit billing.email (stored in WP post meta
+        # only). For subscriptions with empty billing.email in the list response,
+        # we fetch the individual subscription detail endpoint — which DOES include
+        # meta_data (_billing_email) — and re-check there.
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions",
@@ -295,11 +299,37 @@ class WooCommerceClient:
         if not isinstance(data, list):
             return []
 
-        matched = [s for s in data if self._subscription_matches_email(s, email_lower)]
+        matched = []
+        for s in data:
+            if self._subscription_matches_email(s, email_lower):
+                matched.append(s)
+            elif not s.get("billing", {}).get("email", "").strip():
+                # billing.email is empty in list response — fetch individual detail
+                # to check meta_data._billing_email (not serialized in list responses)
+                sub_id = s.get("id")
+                if not sub_id:
+                    continue
+                try:
+                    detail_resp = requests.get(
+                        f"{self.base}/subscriptions/{sub_id}",
+                        auth=self.auth,
+                        timeout=10,
+                    )
+                    if detail_resp.ok:
+                        detail = detail_resp.json()
+                        if self._subscription_matches_email(detail, email_lower):
+                            log.info(
+                                f"WC: ?search= sub #{sub_id} matched {email} "
+                                f"via individual detail fetch (meta_data._billing_email)"
+                            )
+                            matched.append(detail)
+                except requests.exceptions.RequestException as e:
+                    log.warning(f"WC: detail fetch error for sub #{sub_id}: {e}")
+
         if matched:
             log.info(f"WC: found {len(matched)} subscription(s) via ?search= for {email}")
         else:
-            log.info(f"WC: ?search= returned {len(data)} sub(s) for {email}, none matched")
+            log.info(f"WC: ?search= returned {len(data)} sub(s) for {email}, none matched after detail-fetch check")
         return matched
 
     def get_order_count(self, subscription_id: int) -> int | None:
