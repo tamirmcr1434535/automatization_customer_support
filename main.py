@@ -152,6 +152,14 @@ def _process(ticket_id: str) -> dict:
         result["status"] = "skipped_already_handled"
         return result
 
+    # 2b. Skip merged-away tickets (Zendesk adds 'merge' tag to the donor ticket
+    #     when it is merged into another ticket). The donor has no actionable content —
+    #     all conversation was moved to the target ticket which will be processed separately.
+    if "merge" in tags:
+        log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: merge)")
+        result["status"] = "skipped_merged"
+        return result
+
     # 3. TEST_MODE gate
     if TEST_MODE and TEST_TAG not in tags:
         log.info(f"[{ticket_id}] Skip — test mode, missing tag '{TEST_TAG}'")
@@ -282,7 +290,9 @@ def _process(ticket_id: str) -> dict:
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
 
         reply_text = generate_ask_card_digits_reply(language=language, customer_name=name)
-        zendesk.post_reply(ticket_id, reply_text)
+        # Set ticket to Pending so Zendesk trigger fires only on customer reply,
+        # not on bot/agent updates. Pending → Open transition triggers the webhook.
+        zendesk.post_reply_and_set_pending(ticket_id, reply_text)
         zendesk.add_tag(ticket_id, "awaiting_card_digits")
         zendesk.add_internal_note(
             ticket_id,
@@ -296,7 +306,7 @@ def _process(ticket_id: str) -> dict:
             "reply_text": reply_text,
         })
         log_result(result)
-        return result  # ticket stays OPEN
+        return result  # ticket set to Pending — awaiting customer reply
 
     # 8. Override intent from actual subscription data (trial vs active sub)
     #    Text classifier gives a hint, but the source of truth is WooCommerce/Stripe.
@@ -387,7 +397,8 @@ def _digits_not_found(
         reply_text = generate_ask_card_digits_retry_reply(
             language=language, customer_name=name
         )
-        zendesk.post_reply(ticket_id, reply_text)
+        # Keep ticket Pending so trigger fires only on customer reply
+        zendesk.post_reply_and_set_pending(ticket_id, reply_text)
         zendesk.remove_tag(ticket_id, "awaiting_card_digits")
         zendesk.add_tag(ticket_id, "awaiting_card_digits_retry")
         zendesk.add_internal_note(
@@ -402,7 +413,7 @@ def _digits_not_found(
             "reply_text": reply_text,
         })
         log_result(result)
-        return result  # ticket stays OPEN
+        return result  # ticket set to Pending — awaiting customer reply
 
     else:
         # Second failure: close ticket
