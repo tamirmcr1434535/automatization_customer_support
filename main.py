@@ -218,9 +218,9 @@ def _process(ticket_id: str) -> dict:
     # 5. Low confidence → escalate
     if confidence < 0.65:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent")
+        zendesk.add_tag(ticket_id, "bot_handled")        # first — blocks webhook re-fires
         zendesk.add_tag(ticket_id, "bot_low_confidence")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
-        zendesk.add_tag(ticket_id, "bot_handled")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: detected {intent} but confidence {confidence:.0%} is too low to act automatically. "
@@ -264,9 +264,9 @@ def _process(ticket_id: str) -> dict:
 
         # No working alt email → Slack alert for manual review
         log.info(f"[{ticket_id}] No alt email worked → Slack alert + escalate to agent")
+        zendesk.add_tag(ticket_id, "bot_handled")        # first — blocks webhook re-fires
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
-        zendesk.add_tag(ticket_id, "bot_handled")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: customer email ({email}) found in {found_in} but has NO active subscription. "
@@ -598,9 +598,9 @@ def _finish_cancellation(
         "SUB_RENEWAL_CANCELLATION": "renewal_cancellation",
     }.get(intent, "cancelled")
 
+    zendesk.add_tag(ticket_id, "bot_handled")   # first — blocks any re-entry from webhook re-fires
     zendesk.post_reply(ticket_id, reply_text)
     zendesk.add_tag(ticket_id, cancel_tag)
-    zendesk.add_tag(ticket_id, "bot_handled")
     zendesk.add_tag(ticket_id, "ai_bot_success")
     zendesk.solve_ticket(ticket_id)
 
