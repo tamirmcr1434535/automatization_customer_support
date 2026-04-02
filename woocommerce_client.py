@@ -91,7 +91,7 @@ class WooCommerceClient:
                 f"{self.base}/customers",
                 params={"search": email, "per_page": 10},
                 auth=self.auth,
-                timeout=10,
+                timeout=20,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC customer search error for {email}: {e}")
@@ -114,10 +114,16 @@ class WooCommerceClient:
         """
         Return active WooCommerce Subscriptions for a given customer ID.
 
-        Filters by status=active,pending-cancel,on-hold,pending to reduce server-side
-        query cost (WooCommerce has 179K+ subscriptions — unfiltered queries time out).
+        Tries two passes:
+          1. With status filter (active,pending-cancel,on-hold,pending) — faster query.
+             Some WC Subscriptions plugin versions accept comma-separated statuses;
+             if the filter is ignored or the query times out, fall through to pass 2.
+          2. Without status filter — returns all subscriptions for the customer
+             (slower, but guarantees we find active ones even if the status filter
+             is unsupported or the filtered query timed out).
         Timeout is 25s because the WooCommerce server is slow under load.
         """
+        # Pass 1: status-filtered query (lighter server load)
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions",
@@ -126,6 +132,34 @@ class WooCommerceClient:
                     "per_page": 10,
                     "status": "active,pending-cancel,on-hold,pending",
                 },
+                auth=self.auth,
+                timeout=25,
+            )
+            if resp.ok:
+                data = resp.json()
+                if data:  # got results — use them
+                    return data
+                # Empty result could mean the status filter is unsupported/ignored
+                # and returned 0 results. Fall through to unfiltered pass.
+                log.info(
+                    f"WC: status-filtered query returned 0 subs for customer {customer_id} "
+                    "— retrying without status filter"
+                )
+            else:
+                log.warning(
+                    f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
+                )
+        except requests.exceptions.RequestException as e:
+            log.warning(
+                f"WC subscriptions lookup error for customer {customer_id} (status-filtered): {e}"
+                " — retrying without status filter"
+            )
+
+        # Pass 2: unfiltered query — returns all statuses, Python will filter
+        try:
+            resp = requests.get(
+                f"{self.base}/subscriptions",
+                params={"customer": customer_id, "per_page": 20},
                 auth=self.auth,
                 timeout=25,
             )
@@ -248,7 +282,7 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"search": email, "per_page": 50},
                 auth=self.auth,
-                timeout=15,
+                timeout=20,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC ?search= lookup error for {email}: {e}")
