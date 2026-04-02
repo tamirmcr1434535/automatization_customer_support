@@ -384,43 +384,36 @@ class WooCommerceClient:
         """
         Determine whether subscription is a "trial" or "subscription".
 
-        Rules (applied in order):
-          0. trial_end_date NOT set (empty / "0000-...") → "subscription"
-             A trial ALWAYS has a trial_end_date. If it's missing the subscription
-             never had a free-trial period → it's a paid subscription.
-          1. order_count > 1 → "subscription"
+        Primary rules (order_count + days_since_start are the reliable signals):
+          0. order_count > 1 → "subscription"
              Can't be a trial if more than one order has been charged.
-          2. trial_end_date set + order_count == 1 + days_since_start ≤ 8 → "trial"
-             Customer signed up within the last 8 days with exactly one order and
-             a trial period configured → genuine free trial.
-          3. Everything else → "subscription"
-             (order_count unknown: fall back to days_since_start alone)
+          1. order_count ≤ 1 AND days_since_start ≤ 8 → "trial"
+             Single order, signed up within 8 days → genuine free trial.
+             NOTE: trial_end_date is intentionally NOT checked here because WC
+             does not always populate it for Stripe Multi Sync subscriptions.
+          2. order_count ≤ 1 AND days_since_start > 8 → "subscription"
+             Been active too long to be a fresh trial.
+
+        Fallback (no start_date available):
+          3. trial_end_date set AND order_count == 1 → "trial"
+          4. Everything else → "subscription" (safe default)
 
         Examples:
-          - trial_end="-", orders=2  → no trial_end → "subscription"
-          - trial_end set, orders=2  → orders > 1   → "subscription"
-          - trial_end set, orders=1, started 3d ago  → "trial"
-          - trial_end set, orders=1, started 15d ago → days > 8 → "subscription"
-          - trial_end set, orders=None, started 3d ago → "trial" (unknown count, ≤8d)
-          - trial_end set, orders=None, started 20d ago → "subscription" (>8d)
+          - orders=2, trial_end="-"         → orders > 1       → "subscription"
+          - orders=1, started 3d ago        → days ≤ 8         → "trial"
+          - orders=1, started 3d ago, trial_end="-"  → days ≤ 8 → "trial"  ← fixed
+          - orders=1, started 15d ago       → days > 8         → "subscription"
+          - orders=None, started 3d ago     → days ≤ 8         → "trial"
+          - orders=None, started 20d ago    → days > 8         → "subscription"
+          - orders=1, no start_date, trial_end set → "trial"
+          - orders=1, no start_date, trial_end missing → "subscription"
         """
-        trial_end_raw = (
-            subscription.get("trial_end_date_gmt")
-            or subscription.get("trial_end_date")
-            or ""
-        )
-
-        # ── Path 0: no trial_end_date → subscription ─────────────────── #
-        if not trial_end_raw or trial_end_raw.startswith("0000"):
-            log.info("WC sub_type: trial_end_date not set → subscription")
-            return "subscription"
-
-        # ── Path 1: order_count > 1 → subscription ───────────────────── #
+        # ── Path 0: order_count > 1 → subscription ───────────────────── #
         if order_count is not None and order_count > 1:
             log.info(f"WC sub_type: order_count={order_count} > 1 → subscription")
             return "subscription"
 
-        # ── Paths 2-3: trial_end IS set; use days_since_start ────────── #
+        # ── Paths 1-2: use days_since_start as primary trial signal ───── #
         start_raw = (
             subscription.get("start_date_gmt")
             or subscription.get("start_date")
@@ -442,21 +435,25 @@ class WooCommerceClient:
 
         if start_dt is not None:
             days_since_start = (now - start_dt).days
-            # Trial: single order, subscription started ≤ 8 days ago
             is_trial = (order_count is None or order_count == 1) and days_since_start <= 8
             log.info(
-                f"WC sub_type: trial_end set, order_count={order_count}, "
+                f"WC sub_type: order_count={order_count}, "
                 f"days_since_start={days_since_start} "
                 f"→ {'trial' if is_trial else 'subscription'}"
             )
             return "trial" if is_trial else "subscription"
 
-        # No start_date — if order_count==1 assume trial, else subscription
-        if order_count == 1:
-            log.info("WC sub_type: trial_end set, order_count=1, no start_date → trial")
+        # ── Fallback: no start_date — use trial_end_date + order_count ── #
+        trial_end_raw = (
+            subscription.get("trial_end_date_gmt")
+            or subscription.get("trial_end_date")
+            or ""
+        )
+        if trial_end_raw and not trial_end_raw.startswith("0000") and order_count == 1:
+            log.info("WC sub_type: no start_date, trial_end set, order_count=1 → trial")
             return "trial"
 
-        log.info("WC sub_type: trial_end set but no usable dates → subscription (safe default)")
+        log.info("WC sub_type: no usable start_date → subscription (safe default)")
         return "subscription"
 
     # ------------------------------------------------------------------ #
@@ -583,17 +580,12 @@ class WooCommerceClient:
         # paid subscription. If they also have a fresh trial (e.g. signed up again
         # on the same email), we should NOT cancel the trial instead of the paid sub.
         #
-        # Order count is only fetched when trial_end_date IS set — avoids a network
-        # round-trip for clear-cut subscriptions (Path 0 exits early in _get_sub_type).
+        # Order count is the primary trial/sub signal — always fetch it.
+        # (trial_end_date is NOT a reliable discriminator: WC sometimes omits it
+        # for Stripe Multi Sync subscriptions even for genuine trials.)
         typed_subs = []
         for s in active_subs:
-            trial_end_raw = (
-                s.get("trial_end_date_gmt") or s.get("trial_end_date") or ""
-            )
-            order_count: int | None = None
-            if trial_end_raw and not trial_end_raw.startswith("0000"):
-                # trial_end is set → fetch order count to distinguish trial from renewal
-                order_count = self.get_order_count(s["id"])
+            order_count = self.get_order_count(s["id"])
             typed_subs.append((s, self._get_sub_type(s, order_count=order_count)))
 
         def _select_priority(entry: tuple) -> tuple:
