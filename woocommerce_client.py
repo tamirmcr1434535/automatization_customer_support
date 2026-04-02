@@ -435,7 +435,7 @@ class WooCommerceClient:
 
         if start_dt is not None:
             days_since_start = (now - start_dt).days
-            is_trial = (order_count is None or order_count == 1) and days_since_start <= 8
+            is_trial = (order_count is None or order_count <= 1) and days_since_start <= 8
             log.info(
                 f"WC sub_type: order_count={order_count}, "
                 f"days_since_start={days_since_start} "
@@ -444,14 +444,28 @@ class WooCommerceClient:
             return "trial" if is_trial else "subscription"
 
         # ── Fallback: no start_date — use trial_end_date + order_count ── #
+        # Only trust trial_end if it is still in the future (expired ≠ active trial)
         trial_end_raw = (
             subscription.get("trial_end_date_gmt")
             or subscription.get("trial_end_date")
             or ""
         )
-        if trial_end_raw and not trial_end_raw.startswith("0000") and order_count == 1:
-            log.info("WC sub_type: no start_date, trial_end set, order_count=1 → trial")
-            return "trial"
+        if trial_end_raw and not trial_end_raw.startswith("0000") and (order_count is None or order_count <= 1):
+            try:
+                trial_end_dt = _parse(trial_end_raw)
+                if trial_end_dt > now:
+                    log.info(
+                        f"WC sub_type: no start_date, trial_end in future "
+                        f"({trial_end_raw}), order_count≤1 → trial"
+                    )
+                    return "trial"
+                else:
+                    log.info(
+                        f"WC sub_type: no start_date, trial_end already past "
+                        f"({trial_end_raw}) → subscription"
+                    )
+            except (ValueError, AttributeError) as e:
+                log.warning(f"WC: could not parse trial_end in fallback {trial_end_raw!r}: {e}")
 
         log.info("WC sub_type: no usable start_date → subscription (safe default)")
         return "subscription"
