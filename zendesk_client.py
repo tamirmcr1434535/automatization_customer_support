@@ -149,6 +149,17 @@ class ZendeskClient:
             json={"tags": [tag]}, auth=self.auth, timeout=10,
         ).raise_for_status()
 
+    def set_open(self, ticket_id: str):
+        """Set ticket status to Open so it appears in agent queues for manual handling."""
+        if self.dry_run:
+            log.info(f"[DRY] set open → #{ticket_id}")
+            return
+        requests.put(
+            f"{self.base}/tickets/{ticket_id}.json",
+            json={"ticket": {"status": "open"}},
+            auth=self.auth, timeout=10,
+        ).raise_for_status()
+
     def solve_ticket(self, ticket_id: str):
         if self.dry_run:
             log.info(f"[DRY] solve → #{ticket_id}")
