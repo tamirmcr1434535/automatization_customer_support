@@ -86,6 +86,20 @@ class ZendeskClient:
             if comment.get("public") and comment.get("author_id") not in agent_ids
         )
 
+    def last_public_comment_is_from_agent(self, ticket_id: str) -> bool:
+        """
+        Return True if the most recent PUBLIC comment was posted by an agent or admin.
+
+        Used to detect tickets where a human agent already replied — in that case
+        the bot should step aside and not escalate or interfere.
+        Always real, even in dry_run.
+        """
+        comments, agent_ids = self._fetch_comments_with_agent_ids(ticket_id)
+        for comment in reversed(comments):
+            if comment.get("public"):
+                return comment.get("author_id") in agent_ids
+        return False  # no public comments yet
+
     def get_last_customer_comment(self, ticket_id: str) -> str | None:
         """
         Return the plain body of the most recent public comment from the end-user
