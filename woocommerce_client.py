@@ -93,10 +93,17 @@ class WooCommerceClient:
 
         Tries ?billing_email= first (WooCommerce Subscriptions plugin filter),
         then ?search= as a secondary fallback.
+
+        IMPORTANT: The ?billing_email= parameter is NOT guaranteed to filter results
+        server-side in all WooCommerce Subscriptions plugin versions — some versions
+        ignore unknown query parameters and return all recent subscriptions instead.
+        We always validate the returned results by checking billing.email explicitly.
         """
+        email_lower = email.lower().strip()
+
         for params in [
-            {"billing_email": email, "per_page": 10},
-            {"search": email,        "per_page": 10},
+            {"billing_email": email, "per_page": 50},
+            {"search": email,        "per_page": 50},
         ]:
             try:
                 resp = requests.get(
@@ -109,14 +116,32 @@ class WooCommerceClient:
                 log.warning(f"WC billing-email lookup error for {email} (params={params}): {e}")
                 continue
 
-            if resp.ok:
-                data = resp.json()
-                if isinstance(data, list) and data:
-                    log.info(
-                        f"WC: found {len(data)} subscription(s) by billing email "
-                        f"({list(params.keys())[0]}={email})"
-                    )
-                    return data
+            if not resp.ok:
+                continue
+
+            data = resp.json()
+            if not isinstance(data, list):
+                continue
+
+            # ── Validate: keep only subscriptions whose billing.email matches ──
+            # This guards against API versions that ignore the filter parameter
+            # and return all recent subscriptions instead.
+            matched = [
+                s for s in data
+                if s.get("billing", {}).get("email", "").lower().strip() == email_lower
+            ]
+
+            if matched:
+                log.info(
+                    f"WC: found {len(matched)} subscription(s) matching billing email "
+                    f"{email} (API returned {len(data)}, filtered to exact match)"
+                )
+                return matched
+
+            log.info(
+                f"WC: API returned {len(data)} subscription(s) for "
+                f"{list(params.keys())[0]}={email} but none matched billing.email — skipping"
+            )
 
         return []
 
