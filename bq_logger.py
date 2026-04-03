@@ -54,7 +54,7 @@ def log_result(result: dict):
             "error":           result.get("error") or "",
             "reply_text":      result.get("reply_text") or "",
             "confidence":      float(result["confidence"]) if result.get("confidence") is not None else None,
-            "chargeback_risk": result.get("chargeback_risk") or "",
+            "chargeback_risk": str(result.get("chargeback_risk") or "").lower() if isinstance(result.get("chargeback_risk"), bool) else (result.get("chargeback_risk") or ""),
             "reasoning":       result.get("reasoning") or "",
             "logged_at":       datetime.now(timezone.utc).isoformat(),
         }
