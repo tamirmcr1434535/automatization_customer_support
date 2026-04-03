@@ -36,7 +36,9 @@ Classify into ONE intent:
 - UNKNOWN                — genuinely unclear intent
 
 IMPORTANT RULES:
-1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約"
+1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
+   "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
+   "annuleren", "avboka", "annullere"
    → ALWAYS a cancellation intent (TRIAL_CANCELLATION or SUB_CANCELLATION). NEVER REFUND_REQUEST
    or SUB_RENEWAL_REFUND if ANY cancellation word is present.
 2. "I noticed recurring/unexpected charges + please cancel" → TRIAL_CANCELLATION.
@@ -47,6 +49,14 @@ IMPORTANT RULES:
 6. Default for any ambiguous cancellation → TRIAL_CANCELLATION.
 7. SUB_RENEWAL_REFUND requires ALL THREE: (a) specific renewal charge already happened,
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
+8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT transcript.
+   The customer's messages are embedded in the conversation body.
+   → Scan the entire transcript for cancellation/refund intent.
+   → If the customer mentions subscription, charges, or cancellation ANYWHERE → TRIAL_CANCELLATION.
+   → Never return GENERAL_QUESTION or UNKNOWN for chat transcripts that mention a subscription charge.
+9. If the body mentions seeing an unexpected charge, a subscription the customer doesn't recognise,
+   or asks how to stop payments — even without the word "cancel" — → TRIAL_CANCELLATION.
+   Use GENERAL_QUESTION ONLY if the message has NO billing or subscription concern at all.
 
 Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
