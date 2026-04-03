@@ -91,7 +91,7 @@ class WooCommerceClient:
                 f"{self.base}/customers",
                 params={"search": email, "per_page": 10},
                 auth=self.auth,
-                timeout=20,
+                timeout=10,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC customer search error for {email}: {e}")
@@ -121,7 +121,7 @@ class WooCommerceClient:
           2. Without status filter — returns all subscriptions for the customer
              (slower, but guarantees we find active ones even if the status filter
              is unsupported or the filtered query timed out).
-        Timeout is 25s because the WooCommerce server is slow under load.
+        Timeout is 10s per attempt.
         """
         # Pass 1: status-filtered query (lighter server load)
         try:
@@ -133,7 +133,7 @@ class WooCommerceClient:
                     "status": "active,pending-cancel,on-hold,pending",
                 },
                 auth=self.auth,
-                timeout=25,
+                timeout=10,
             )
             if resp.ok:
                 data = resp.json()
@@ -161,7 +161,7 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"customer": customer_id, "per_page": 20},
                 auth=self.auth,
-                timeout=25,
+                timeout=10,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC subscriptions lookup error for customer {customer_id}: {e}")
@@ -198,7 +198,7 @@ class WooCommerceClient:
         (?customer= filter) — that path is reliable. This method is last-resort.
         """
         email_lower = email.lower().strip()
-        MAX_PAGES   = 5   # scan up to 5 × 50 = 250 subscriptions per filter
+        MAX_PAGES   = 2   # scan up to 2 × 50 = 100 subscriptions per filter
 
         # ── Pass 1: ?billing_email= with pagination ───────────────────── #
         for page in range(1, MAX_PAGES + 1):
@@ -286,7 +286,7 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"search": email, "per_page": 50},
                 auth=self.auth,
-                timeout=20,
+                timeout=10,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC ?search= lookup error for {email}: {e}")
