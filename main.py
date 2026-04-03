@@ -200,6 +200,15 @@ def _process(ticket_id: str) -> dict:
     })
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
+    # ── CHARGEBACK_THREAT → skip (human must handle) ──────────────────── #
+    # A customer threatening/filing a chargeback is a payment dispute, not a
+    # simple cancellation. Route to human review.
+    if intent == "CHARGEBACK_THREAT":
+        log.info(f"[{ticket_id}] CHARGEBACK_THREAT intent — skipping (not handled by bot)")
+        result["status"] = "skipped_refund_request"
+        log_result(result)
+        return result
+
     # ── REFUND + CANCEL COMBINED → skip silently ──────────────────────── #
     # If the customer asks for both cancellation AND a refund/repayment,
     # we don't touch the ticket — a human will handle it.
