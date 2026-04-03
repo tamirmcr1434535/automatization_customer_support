@@ -764,6 +764,23 @@ _REFUND_KEYWORDS = [
     "возврат",
     # Italian
     "rimborso",
+    # Norwegian
+    "tilbakebetaling",   # refund/repayment
+    "refusjon",          # refund
+    "penger tilbake",    # money back
+    "uautorisert",       # unauthorized
+    "ukjent trekk",      # unknown deduction
+    "ikke bestilt",      # didn't order
+    "ikke autorisert",   # not authorized
+    "feilbelastet",      # incorrectly charged
+    "belastet feil",     # charged incorrectly
+    # Swedish
+    "återbetalning",     # refund
+    "obehörig",          # unauthorized
+    "feldebiterad",      # incorrectly debited
+    # Danish
+    "tilbagebetaling",   # refund
+    "uautoriseret",      # unauthorized
 ]
 
 
