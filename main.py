@@ -200,6 +200,18 @@ def _process(ticket_id: str) -> dict:
     })
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
+    # ── REFUND + CANCEL COMBINED → skip silently ──────────────────────── #
+    # If the customer asks for both cancellation AND a refund/repayment,
+    # we don't touch the ticket — a human will handle it.
+    if intent in HANDLED_INTENTS and _contains_refund_request(body):
+        log.info(
+            f"[{ticket_id}] Refund request detected alongside {intent} — "
+            "skipping (not handled by bot)"
+        )
+        result["status"] = "skipped_refund_request"
+        log_result(result)
+        return result
+
     # ── CARD DIGITS FLOWS ─────────────────────────────────────────────── #
     # Timeout: Zendesk Automation added tag after AWAITING_CARD_DAYS days of no reply
     if "card_digits_timeout" in tags:
@@ -679,3 +691,36 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
         "cancelled": False,
         "source": "none",
     }
+
+
+# ── Refund detection ───────────────────────────────────────────────────── #
+
+# Keywords that indicate the customer wants a refund/repayment in addition
+# to cancellation. If these appear alongside a cancellation intent, we
+# escalate to a human instead of auto-cancelling — the refund decision
+# requires manual review.
+_REFUND_KEYWORDS = [
+    # Japanese
+    "返済", "返金", "払い戻し", "返還", "弁償",
+    # English
+    "refund", "repayment", "reimbursement", "money back", "chargeback",
+    "charge back", "get my money", "pay me back",
+    # Korean
+    "환불",
+    # German
+    "rückerstattung", "rückzahlung", "erstattet",
+    # French
+    "remboursement", "rembourser",
+    # Spanish / Portuguese
+    "reembolso",
+    # Russian
+    "возврат",
+    # Italian
+    "rimborso",
+]
+
+
+def _contains_refund_request(text: str) -> bool:
+    """Return True if the ticket body contains refund/repayment keywords."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _REFUND_KEYWORDS)
