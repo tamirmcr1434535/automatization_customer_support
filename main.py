@@ -200,11 +200,18 @@ def _process(ticket_id: str) -> dict:
     })
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
-    # ── CHARGEBACK_THREAT → skip (human must handle) ──────────────────── #
-    # A customer threatening/filing a chargeback is a payment dispute, not a
-    # simple cancellation. Route to human review.
-    if intent == "CHARGEBACK_THREAT":
-        log.info(f"[{ticket_id}] CHARGEBACK_THREAT intent — skipping (not handled by bot)")
+    # ── REFUND / PAYMENT DISPUTE intents → skip (human must handle) ──────── #
+    # These are payment disputes / refund requests — NOT simple cancellations.
+    # The bot must not touch these tickets; route to human review.
+    # All of these return skipped_refund_request so eval ground truth matches.
+    _REFUND_INTENTS = {
+        "CHARGEBACK_THREAT",   # customer threatening / filing chargeback
+        "REFUND_REQUEST",      # customer explicitly asking for a refund
+        "PAYPAL_DISPUTE",      # PayPal dispute opened
+        "SUB_RENEWAL_REFUND",  # refund on renewal charge
+    }
+    if intent in _REFUND_INTENTS:
+        log.info(f"[{ticket_id}] {intent} — skipping (payment dispute / refund, not handled by bot)")
         result["status"] = "skipped_refund_request"
         log_result(result)
         return result
@@ -212,7 +219,8 @@ def _process(ticket_id: str) -> dict:
     # ── REFUND + CANCEL COMBINED → skip silently ──────────────────────── #
     # If the customer asks for both cancellation AND a refund/repayment,
     # we don't touch the ticket — a human will handle it.
-    if intent in HANDLED_INTENTS and _contains_refund_request(body):
+    # Check subject + body together: the refund signal may appear in either field.
+    if intent in HANDLED_INTENTS and _contains_refund_request(subject + " " + body):
         log.info(
             f"[{ticket_id}] Refund request detected alongside {intent} — "
             "skipping (not handled by bot)"
@@ -718,13 +726,34 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
 # escalate to a human instead of auto-cancelling — the refund decision
 # requires manual review.
 _REFUND_KEYWORDS = [
-    # Japanese
+    # Japanese — explicit refund words
     "返済", "返金", "払い戻し", "返還", "弁償",
+    # Japanese — unauthorized / unexpected charge patterns
+    "身に覚えの",        # "I don't recognise this charge" (身に覚えのない引き落とし)
+    "身に覚えがない",    # variant
+    "勝手に引き落とし",  # "deducted without consent"
+    "不正請求",          # "fraudulent/unauthorized charge"
+    "無断で引き落とし",  # "deducted without permission"
+    "知らない間に",      # "without my knowledge" (charged)
+    "登録した覚えがない", # "I don't recall signing up"
     # English
     "refund", "repayment", "reimbursement", "money back", "chargeback",
     "charge back", "get my money", "pay me back",
+    "cancel payment",    # "cancel payment" = wanting a payment reversed
+    "cancel charge",     # variant
+    "unauthorized charge", "unknown charge", "unexpected charge",
+    "charged without",   # "charged without my consent/knowledge"
+    "didn't authorize",  # "I didn't authorize this charge"
+    "did not authorize",
     # Korean
     "환불",
+    "승인취소",    # "approval cancellation" = payment reversal (Korean payment term)
+    "승인 취소",   # spaced variant
+    "결제취소",    # "payment cancellation" (can mean refund)
+    "결제 취소",   # spaced variant
+    "모르게 결제", # "payment made without my knowledge"
+    "무단 결제",   # "unauthorized payment"
+    "무단결제",    # no-space variant
     # German
     "rückerstattung", "rückzahlung", "erstattet",
     # French
@@ -739,6 +768,12 @@ _REFUND_KEYWORDS = [
 
 
 def _contains_refund_request(text: str) -> bool:
-    """Return True if the ticket body contains refund/repayment keywords."""
+    """
+    Return True if *text* contains refund/repayment/unauthorized-charge keywords.
+
+    Should be called with subject + body concatenated so that a refund signal
+    in either field is caught (e.g. subject='Cancel payment', body='I want
+    to cancel' should still be flagged).
+    """
     text_lower = text.lower()
     return any(kw in text_lower for kw in _REFUND_KEYWORDS)
