@@ -110,19 +110,31 @@ class WooCommerceClient:
                 return customer
         return None
 
-    def get_subscriptions(self, customer_id: int) -> list[dict]:
+    def get_subscriptions(self, customer_id: int) -> list[dict] | None:
         """
-        Return active WooCommerce Subscriptions for a given customer ID.
+        Return WooCommerce Subscriptions for a given customer ID.
+
+        Return values:
+          list[dict]  — subscriptions found (may include non-active ones)
+          []          — confirmed empty: server responded OK with zero results
+                        on BOTH passes (status-filtered + unfiltered)
+          None        — uncertain: at least one pass timed out or errored.
+                        Caller should NOT assume "no subscription exists" and
+                        should skip to the next data source (Stripe) rather
+                        than wasting time on further WC fallbacks.
 
         Tries two passes:
-          1. With status filter (active,pending-cancel,on-hold,pending) — faster query.
+          1. With status filter (active,pending-cancel,on-hold,pending) — fast.
              Some WC Subscriptions plugin versions accept comma-separated statuses;
-             if the filter is ignored or the query times out, fall through to pass 2.
-          2. Without status filter — returns all subscriptions for the customer
-             (slower, but guarantees we find active ones even if the status filter
-             is unsupported or the filtered query timed out).
-        Timeout is 10s per attempt.
+             if the query returns empty (filter may be ignored), fall through to
+             pass 2. If the query TIMES OUT, return None immediately — no point
+             retrying an already-overloaded WC server.
+          2. Without status filter — catches all statuses when pass 1 returned
+             an unexpectedly empty OK response.
+             Returns None on timeout/error.
         """
+        pass1_timed_out = False
+
         # Pass 1: status-filtered query (lighter server load)
         try:
             resp = requests.get(
@@ -149,11 +161,21 @@ class WooCommerceClient:
                 log.warning(
                     f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
                 )
+        except requests.exceptions.Timeout:
+            # Server is overloaded — don't waste another 10s on pass 2
+            log.warning(
+                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1) "
+                "— skipping pass 2, caller should try Stripe"
+            )
+            pass1_timed_out = True
         except requests.exceptions.RequestException as e:
             log.warning(
-                f"WC subscriptions lookup error for customer {customer_id} (status-filtered): {e}"
+                f"WC subscriptions lookup error for customer {customer_id} (pass 1): {e}"
                 " — retrying without status filter"
             )
+
+        if pass1_timed_out:
+            return None  # signal: uncertain, skip further WC lookups
 
         # Pass 2: unfiltered query — returns all statuses, Python will filter
         try:
@@ -163,15 +185,20 @@ class WooCommerceClient:
                 auth=self.auth,
                 timeout=10,
             )
+        except requests.exceptions.Timeout:
+            log.warning(
+                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 2)"
+            )
+            return None  # uncertain — don't treat as confirmed empty
         except requests.exceptions.RequestException as e:
-            log.warning(f"WC subscriptions lookup error for customer {customer_id}: {e}")
-            return []
+            log.warning(f"WC subscriptions lookup error for customer {customer_id} (pass 2): {e}")
+            return None
 
         if not resp.ok:
             log.warning(
                 f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
             )
-            return []
+            return None
         return resp.json()
 
     def get_subscriptions_by_billing_email(self, email: str) -> list[dict]:
@@ -560,7 +587,10 @@ class WooCommerceClient:
 
         Return dict:
             status : "trial_cancelled" | "subscription_cancelled" |
-                     "dry_run" | "not_found" | "no_active_sub" | "error"
+                     "dry_run" | "not_found" | "no_active_sub" | "timeout" | "error"
+
+            "timeout" — WC subscription lookup timed out; caller should try Stripe
+                        directly without assuming the customer has no subscription.
         """
         base_result = {
             "email": email,
@@ -583,14 +613,24 @@ class WooCommerceClient:
         # 2. Subscriptions (always real)
         if customer:
             all_subs = self.get_subscriptions(customer["id"])
+
+            if all_subs is None:
+                # Subscription lookup timed out — WC server is overloaded.
+                # Return immediately; caller will try Stripe.  Do NOT run
+                # get_subscriptions_by_billing_email (would add another 20-30s
+                # of timeouts on an already-overloaded server).
+                log.warning(
+                    f"WC: subscription lookup timed out for customer #{customer['id']} "
+                    f"({email}) — returning timeout so caller can try Stripe"
+                )
+                return {**base_result, "status": "timeout"}
+
             if not all_subs:
-                # Subscription lookup returned empty — could be a real timeout/error
-                # (get_subscriptions uses 25s timeout, but the WC server can still fail).
-                # Fall back to billing-email search before giving up, so a WC timeout
-                # doesn't cause the caller to fall through to Stripe and misclassify as trial.
+                # Confirmed empty (server replied OK with zero results) —
+                # try billing-email search as a last resort before giving up.
                 log.info(
-                    f"WC: no subs found by customer_id={customer['id']} — "
-                    "also checking billing email (handles possible API timeout)"
+                    f"WC: 0 subs found by customer_id={customer['id']} — "
+                    "checking billing email as fallback"
                 )
                 billing_subs = self.get_subscriptions_by_billing_email(email)
                 if billing_subs:
