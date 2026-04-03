@@ -659,10 +659,19 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     woo_result = woo.cancel_subscription(email)
     woo_status = woo_result.get("status", "")
 
-    if woo_status not in ("not_found", "no_active_sub", "error"):
+    if woo_status not in ("not_found", "no_active_sub", "error", "timeout"):
         return {**woo_result, "source": "woocommerce"}
 
-    woo_customer_found = woo_status == "no_active_sub"  # customer exists but no active sub
+    if woo_status == "timeout":
+        # WC subscription lookup timed out — server overloaded.
+        # Try Stripe directly; do NOT count as "customer found" because we
+        # couldn't confirm subscription state. If Stripe also misses them,
+        # ask for card digits rather than triggering a Slack alert (we don't
+        # actually know their subscription is gone, just that WC was slow).
+        log.warning(f"[{ticket_id}] WooCommerce timed out → trying Stripe directly")
+        woo_customer_found = False
+    else:
+        woo_customer_found = woo_status == "no_active_sub"  # customer exists but no active sub
     log.info(f"[{ticket_id}] WooCommerce: {woo_status} → trying Stripe")
 
     stripe_result = stripe_cli.cancel_subscription(email)
