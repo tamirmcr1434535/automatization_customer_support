@@ -13,9 +13,9 @@ Scenarios:
   F. WooCommerce not_found → Stripe success → cancel_source=stripe
   G. WooCommerce no_active_sub → Stripe success → cancel_source=stripe
   H. Full SUB_CANCELLATION via WooCommerce paid sub → success
-  I. Not found in WooCommerce AND Stripe → Slack alert, status=manual_review_required
-  J. Not found anywhere → ticket NOT solved, tag needs_manual_review added
-  K. Slack notify called with correct ticket_id and email
+  I. Not found anywhere → ask for card digits, ticket set to pending
+  J. Not found anywhere → awaiting_card_digits tag added, ticket NOT solved
+  K. Card digits request called with correct ticket_id
 """
 
 import os
@@ -88,6 +88,21 @@ def _stripe_not_found(email="user@example.com"):
     return {"status": "not_found", "email": email, "cancelled": False}
 
 
+def _setup_zd(mock_zd, ticket=None, agent_replied=False):
+    """
+    Configure common ZendeskClient mock defaults.
+
+    last_public_comment_is_from_agent must be explicitly set to False for
+    most tests — a bare MagicMock() is truthy and would cause every ticket
+    to be skipped with status='skipped_agent_already_replied'.
+    """
+    if ticket is None:
+        ticket = make_zendesk_ticket()
+    mock_zd.get_ticket.return_value = ticket
+    mock_zd.last_public_comment_is_from_agent.return_value = agent_replied
+    mock_zd.get_all_customer_comments_text.return_value = ""
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────── #
 
 class TestProcess:
@@ -104,7 +119,7 @@ class TestProcess:
     @patch.object(main, "log_result")
     @patch.object(main, "zendesk")
     def test_test_mode_missing_tag(self, mock_zd, mock_log):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket(tags=[])
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(tags=[]))
         with patch.object(main, "TEST_MODE", True):
             result = main._process("1001")
         assert result["status"] == "skipped_no_test_tag"
@@ -114,19 +129,19 @@ class TestProcess:
     @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
     @patch.object(main, "zendesk")
     def test_unhandled_intent(self, mock_zd, mock_cls, mock_log):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         result = main._process("1002")
-        assert result["status"] == "skipped_not_handled"
+        assert result["status"] == "skipped_refund_request"
 
     # D. Low confidence → escalate
     @patch.object(main, "log_result")
     @patch.object(main, "classify_ticket", return_value=_classification(confidence=0.5))
     @patch.object(main, "zendesk")
     def test_low_confidence_escalated(self, mock_zd, mock_cls, mock_log):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         result = main._process("1003")
         assert result["status"] == "escalated_low_confidence"
-        mock_zd.add_tag.assert_called_with("1003", "bot_low_confidence")
+        mock_zd.add_tag.assert_any_call("1003", "bot_low_confidence")
         mock_zd.add_internal_note.assert_called_once()
 
     # E. WooCommerce handles trial
@@ -136,7 +151,7 @@ class TestProcess:
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
     def test_woo_trial_success(self, mock_zd, mock_cls, mock_woo, mock_reply, mock_log):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_trial()
         result = main._process("1004")
         assert result["status"] == "success"
@@ -152,7 +167,7 @@ class TestProcess:
     def test_woo_not_found_stripe_fallback(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_log
     ):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_not_found()
         mock_stripe.cancel_subscription.return_value = _stripe_cancelled()
         result = main._process("1005")
@@ -169,7 +184,7 @@ class TestProcess:
     def test_woo_no_active_sub_stripe_fallback(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_log
     ):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_no_active()
         mock_stripe.cancel_subscription.return_value = _stripe_cancelled()
         result = main._process("1006")
@@ -184,7 +199,7 @@ class TestProcess:
                   return_value=_classification(intent="SUB_CANCELLATION", language="JP"))
     @patch.object(main, "zendesk")
     def test_sub_cancellation_woo_paid(self, mock_zd, mock_cls, mock_woo, mock_reply, mock_log):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = {
             "status": "subscription_cancelled", "email": "user@example.com",
             "cancelled": True, "subscription_type": "subscription",
@@ -196,25 +211,27 @@ class TestProcess:
         mock_zd.post_reply.assert_called_once()
         mock_zd.solve_ticket.assert_called_once_with("1007")
 
-    # I. Not found anywhere → Slack alert, status=manual_review_required
+    # I. Not found anywhere → ask for card digits, ticket set to pending
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
-    def test_not_found_anywhere_slack_alert(
+    def test_not_found_anywhere_asks_card_digits(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
     ):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket(email="ghost@example.com")
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(email="ghost@example.com"))
         mock_woo.cancel_subscription.return_value = _woo_not_found("ghost@example.com")
         mock_stripe.cancel_subscription.return_value = _stripe_not_found("ghost@example.com")
         result = main._process("1008")
-        assert result["status"] == "manual_review_required"
-        assert result["action"] == "slack_alerted"
-        mock_slack.notify_manual_review.assert_called_once()
+        assert result["status"] == "awaiting_card_digits"
+        assert result["action"] == "asked_for_card_digits"
+        mock_zd.post_reply_and_set_pending.assert_called_once()
+        mock_zd.solve_ticket.assert_not_called()
+        mock_slack.notify_manual_review.assert_not_called()
 
-    # J. Not found anywhere → ticket NOT solved, needs_manual_review tag added
+    # J. Not found anywhere → awaiting_card_digits tag added, ticket NOT solved
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
@@ -224,31 +241,33 @@ class TestProcess:
     def test_not_found_ticket_stays_open(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
     ):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket()
+        _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_not_found()
         mock_stripe.cancel_subscription.return_value = _stripe_not_found()
         main._process("1009")
         mock_zd.solve_ticket.assert_not_called()
+        # post_reply (solve-path) must NOT be called; post_reply_and_set_pending (card digits) IS
         mock_zd.post_reply.assert_not_called()
+        mock_zd.post_reply_and_set_pending.assert_called_once()
         tags_added = [c.args[1] for c in mock_zd.add_tag.call_args_list]
-        assert "needs_manual_review" in tags_added
+        assert "awaiting_card_digits" in tags_added
 
-    # K. Slack called with correct ticket_id and email
+    # K. Card digits request called with correct ticket_id
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
-    def test_slack_called_with_correct_args(
+    def test_card_digits_request_called_with_correct_args(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
     ):
-        mock_zd.get_ticket.return_value = make_zendesk_ticket(
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
             ticket_id="5555", email="specific@example.com"
-        )
+        ))
         mock_woo.cancel_subscription.return_value = _woo_not_found("specific@example.com")
         mock_stripe.cancel_subscription.return_value = _stripe_not_found("specific@example.com")
-        main._process("5555")
-        call_kwargs = mock_slack.notify_manual_review.call_args
-        assert "5555" in str(call_kwargs)
-        assert "specific@example.com" in str(call_kwargs)
+        result = main._process("5555")
+        assert result["status"] == "awaiting_card_digits"
+        call_args = mock_zd.post_reply_and_set_pending.call_args
+        assert "5555" in str(call_args)
