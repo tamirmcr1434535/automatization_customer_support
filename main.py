@@ -341,10 +341,13 @@ def _process(ticket_id: str) -> dict:
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
 
         reply_text = generate_ask_card_digits_reply(language=language, customer_name=name)
+        # Tag BEFORE reply: Zendesk can fire the webhook twice in quick succession.
+        # If the tag is set first, any concurrent/duplicate call will be routed to
+        # _handle_card_digits instead of re-entering this path and sending a second message.
+        zendesk.add_tag(ticket_id, "awaiting_card_digits")
         # Set ticket to Pending so Zendesk trigger fires only on customer reply,
         # not on bot/agent updates. Pending → Open transition triggers the webhook.
         zendesk.post_reply_and_set_pending(ticket_id, reply_text)
-        zendesk.add_tag(ticket_id, "awaiting_card_digits")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: customer not found by email ({email}). "
@@ -448,10 +451,12 @@ def _digits_not_found(
         reply_text = generate_ask_card_digits_retry_reply(
             language=language, customer_name=name
         )
-        # Keep ticket Pending so trigger fires only on customer reply
-        zendesk.post_reply_and_set_pending(ticket_id, reply_text)
+        # Tags BEFORE reply — same race-condition fix as in the initial ask:
+        # swap state first so any duplicate webhook call routes to the retry handler.
         zendesk.remove_tag(ticket_id, "awaiting_card_digits")
         zendesk.add_tag(ticket_id, "awaiting_card_digits_retry")
+        # Keep ticket Pending so trigger fires only on customer reply
+        zendesk.post_reply_and_set_pending(ticket_id, reply_text)
         zendesk.add_internal_note(
             ticket_id,
             "🤖 Bot: card digits not found in Stripe. "
