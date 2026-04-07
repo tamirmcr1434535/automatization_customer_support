@@ -54,6 +54,8 @@ IMPORTANT RULES:
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
    "annuleren", "avboka", "annullere",
    "batalkan", "hentikan langganan", "berhenti berlangganan" (ID: Indonesian)
+   "opzeggen", "beëindigen", "stopzetten", "abonnement annuleren",
+   "account verwijderen", "opzegging", "uitschrijven" (NL: Dutch)
    → ALWAYS a cancellation intent (TRIAL_CANCELLATION or SUB_CANCELLATION). NEVER REFUND_REQUEST
    or SUB_RENEWAL_REFUND if ANY cancellation word is present — UNLESS Rule 0 fraud override applies.
 2. "I noticed recurring/unexpected charges + please cancel" → TRIAL_CANCELLATION.
@@ -96,6 +98,7 @@ Language detection rules:
 - RU  = Russian (Кириллица)
 - IT  = Italian
 - ID  = Indonesian (Bahasa Indonesia: "saya", "langganan", "tagihan", "batalkan", "hentikan")
+- NL  = Dutch (Nederlands: "abonnement", "opzeggen", "beëindigen", "annuleren", "verwijderen")
 - Use the primary language of the customer's message body.
 - If the message contains multiple languages, pick the dominant one."""
 
