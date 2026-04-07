@@ -139,7 +139,7 @@ Language detection rules:
 
 def classify_ticket(subject: str, body: str) -> dict:
     response = _client.messages.create(
-        model="claude-haiku-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=200,
         messages=[{
             "role": "user",
