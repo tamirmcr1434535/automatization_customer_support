@@ -134,35 +134,36 @@ def _process(ticket_id: str) -> dict:
         result["status"] = "not_found"
         return result
 
-    subject   = ticket.get("subject", "")
-    body      = ticket.get("description", "")
-    tags      = ticket.get("tags", [])
-    requester = ticket.get("requester", {})
-    email     = requester.get("email", "")
-    name      = requester.get("name", "")
+    subject    = ticket.get("subject", "")
+    body       = ticket.get("description", "")
+    tags       = ticket.get("tags", [])
+    ticket_status = ticket.get("status", "open")  # FIX: used for pending-check anti-spam
+    requester  = ticket.get("requester", {})
+    email      = requester.get("email", "")
+    name       = requester.get("name", "")
     result["email"] = email
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
     # 2. Idempotency check — skip if bot already handled this ticket.
-    #    Prevents duplicate replies from double Zendesk webhook triggers.
-    #    (Zendesk sometimes fires the same trigger twice in quick succession.)
+    # Prevents duplicate replies from double Zendesk webhook triggers.
+    # (Zendesk sometimes fires the same trigger twice in quick succession.)
     if "bot_handled" in tags:
         log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping duplicate webhook")
         result["status"] = "skipped_already_handled"
         return result
 
     # 2b. Skip merged-away tickets (Zendesk adds 'merge' tag to the donor ticket
-    #     when it is merged into another ticket). The donor has no actionable content —
-    #     all conversation was moved to the target ticket which will be processed separately.
+    # when it is merged into another ticket). The donor has no actionable content —
+    # all conversation was moved to the target ticket which will be processed separately.
     if "merge" in tags:
         log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: merge)")
         result["status"] = "skipped_merged"
         return result
 
     # 2c. Skip if a human agent already replied publicly.
-    #     If the last public comment is from our team, they are already handling it —
-    #     no need for the bot to classify, escalate, or interfere.
+    # If the last public comment is from our team, they are already handling it —
+    # no need for the bot to classify, escalate, or interfere.
     if zendesk.last_public_comment_is_from_agent(ticket_id):
         log.info(
             f"[{ticket_id}] Last public comment is from an agent — "
@@ -205,10 +206,10 @@ def _process(ticket_id: str) -> dict:
     # The bot must not touch these tickets; route to human review.
     # All of these return skipped_refund_request so eval ground truth matches.
     _REFUND_INTENTS = {
-        "CHARGEBACK_THREAT",   # customer threatening / filing chargeback
-        "REFUND_REQUEST",      # customer explicitly asking for a refund
-        "PAYPAL_DISPUTE",      # PayPal dispute opened
-        "SUB_RENEWAL_REFUND",  # refund on renewal charge
+        "CHARGEBACK_THREAT",  # customer threatening / filing chargeback
+        "REFUND_REQUEST",     # customer explicitly asking for a refund
+        "PAYPAL_DISPUTE",     # PayPal dispute opened
+        "SUB_RENEWAL_REFUND", # refund on renewal charge
     }
     if intent in _REFUND_INTENTS:
         log.info(f"[{ticket_id}] {intent} — skipping (payment dispute / refund, not handled by bot)")
@@ -234,14 +235,45 @@ def _process(ticket_id: str) -> dict:
     if "card_digits_timeout" in tags:
         return _handle_card_digits_timeout(ticket_id, name, language, result)
 
+    # FIX: Anti-spam / webhook-loop guard for card-digits flows.
+    #
+    # Root cause of the spam bug:
+    #   When the bot adds tag "awaiting_card_digits" or calls post_reply_and_set_pending,
+    #   Zendesk fires the webhook again. The new call sees "awaiting_card_digits" in tags
+    #   and routes to _handle_card_digits. But the ticket is still "pending" — no new
+    #   customer reply has arrived. get_last_customer_comment returns the ORIGINAL message
+    #   which has no 4-digit code, so _digits_not_found is called → sends ANOTHER reply.
+    #   This cascades: each reply triggers a new webhook → 4 identical messages.
+    #
+    # Fix: only enter card-digits handlers if ticket_status == "open".
+    #   "open"    = customer just replied → process it
+    #   "pending" = we asked, waiting for customer → skip (no action needed)
+    #
+    # When the customer replies, Zendesk auto-moves the ticket from pending → open,
+    # which fires the webhook with status="open" and we process their reply correctly.
+
     # Second attempt: customer replied after we asked again (retry)
     if "awaiting_card_digits_retry" in tags:
+        if ticket_status == "pending":
+            log.info(
+                f"[{ticket_id}] awaiting_card_digits_retry but ticket is pending "
+                "— no new customer reply yet, skipping (anti-spam)"
+            )
+            result["status"] = "skipped_pending_awaiting_reply"
+            return result
         return _handle_card_digits(
             ticket_id, email, name, language, result, is_retry=True
         )
 
     # First attempt: customer replied with digits after first ask
     if "awaiting_card_digits" in tags:
+        if ticket_status == "pending":
+            log.info(
+                f"[{ticket_id}] awaiting_card_digits but ticket is pending "
+                "— no new customer reply yet, skipping (anti-spam)"
+            )
+            result["status"] = "skipped_pending_awaiting_reply"
+            return result
         return _handle_card_digits(
             ticket_id, email, name, language, result, is_retry=False
         )
@@ -258,7 +290,7 @@ def _process(ticket_id: str) -> dict:
     # 5. Low confidence → escalate
     if confidence < 0.65:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent")
-        zendesk.add_tag(ticket_id, "bot_handled")        # first — blocks webhook re-fires
+        zendesk.add_tag(ticket_id, "bot_handled") # first — blocks webhook re-fires
         zendesk.add_tag(ticket_id, "bot_low_confidence")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
@@ -278,8 +310,8 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 6. Cancel by email (WooCommerce → Stripe)
-    cancel_result = _cancel_by_email(email, ticket_id)
-    cancel_status = cancel_result.get("status", "")
+    cancel_result  = _cancel_by_email(email, ticket_id)
+    cancel_status  = cancel_result.get("status", "")
     result["cancel_source"] = cancel_result.get("source", "unknown")
 
     log.info(
@@ -297,14 +329,14 @@ def _process(ticket_id: str) -> dict:
         # Search ALL customer comments (not just description) — the customer may have
         # mentioned a different email in a follow-up reply.
         all_comments = zendesk.get_all_customer_comments_text(ticket_id)
-        search_text = f"{body}\n{all_comments}"
+        search_text  = f"{body}\n{all_comments}"
         alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
         if alt_found:
             return alt_found
 
         # No working alt email → Slack alert for manual review
         log.info(f"[{ticket_id}] No alt email worked → Slack alert + escalate to agent")
-        zendesk.add_tag(ticket_id, "bot_handled")        # first — blocks webhook re-fires
+        zendesk.add_tag(ticket_id, "bot_handled") # first — blocks webhook re-fires
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
@@ -332,13 +364,30 @@ def _process(ticket_id: str) -> dict:
         # Fetch all customer comments to cover emails mentioned in follow-up replies,
         # not only the initial ticket description.
         all_comments = zendesk.get_all_customer_comments_text(ticket_id)
-        search_text = f"{body}\n{all_comments}"
+        search_text  = f"{body}\n{all_comments}"
         alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
         if alt_found:
             return alt_found
 
         # Still not found → ask for last 4 card digits (step 1)
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
+
+        # FIX: Race condition guard — re-fetch current tags just before sending the reply.
+        # Multiple concurrent webhook calls (Zendesk can fire several in quick succession)
+        # may all reach this point before any of them adds the tag.
+        # Re-fetching tags gives us a chance to detect if a parallel call already acted.
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if (
+            "awaiting_card_digits" in current_tags
+            or "awaiting_card_digits_retry" in current_tags
+            or "bot_handled" in current_tags
+        ):
+            log.info(
+                f"[{ticket_id}] Race condition: tag already set by a concurrent webhook call "
+                "— skipping duplicate reply"
+            )
+            result["status"] = "skipped_race_condition"
+            return result
 
         reply_text = generate_ask_card_digits_reply(language=language, customer_name=name)
         # Tag BEFORE reply: Zendesk can fire the webhook twice in quick succession.
@@ -360,18 +409,18 @@ def _process(ticket_id: str) -> dict:
             "reply_text": reply_text,
         })
         log_result(result)
-        return result  # ticket set to Pending — awaiting customer reply
+        return result # ticket set to Pending — awaiting customer reply
 
     # 8. Override intent from actual subscription data (trial vs active sub)
-    #    Text classifier gives a hint, but the source of truth is WooCommerce/Stripe.
+    # Text classifier gives a hint, but the source of truth is WooCommerce/Stripe.
     if cancel_status == "already_cancelled":
         log.info(
             f"[{ticket_id}] Subscription already cancelled in WC — "
             f"type={cancel_result.get('subscription_type')} → confirming to customer"
         )
-    intent = _resolve_intent(intent, cancel_result)
-    result["intent"] = intent
-    log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
+        intent = _resolve_intent(intent, cancel_result)
+        result["intent"] = intent
+        log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
 
     # 9. Found → generate reply, tag, solve
     return _finish_cancellation(ticket_id, name, language, intent, cancel_result, result)
@@ -390,7 +439,7 @@ def _handle_card_digits(
     """
     Process customer's reply that should contain last 4 card digits.
     is_retry=False → first attempt (came from awaiting_card_digits)
-    is_retry=True  → second attempt (came from awaiting_card_digits_retry)
+    is_retry=True → second attempt (came from awaiting_card_digits_retry)
     """
     step = "retry" if is_retry else "first"
     log.info(f"[{ticket_id}] Card lookup ({step}) — reading last customer comment")
@@ -469,7 +518,7 @@ def _digits_not_found(
             "reply_text": reply_text,
         })
         log_result(result)
-        return result  # ticket set to Pending — awaiting customer reply
+        return result # ticket set to Pending — awaiting customer reply
 
     else:
         # Second failure: close ticket
@@ -579,6 +628,8 @@ def _try_alt_emails(
             return _finish_cancellation(ticket_id, name, language, final_intent, alt_result, result)
         elif alt_status == "found_no_active_sub":
             log.info(f"[{ticket_id}] Alt email {alt_email} found but no active sub → try next")
+            return None
+
     return None
 
 
@@ -590,7 +641,7 @@ def _extract_emails(text: str, exclude: str = "") -> list[str]:
     """
     # Normalise full-width ＠ → @
     normalized = text.replace("＠", "@")
-    found = re.findall(r'[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', normalized)
+    found = re.findall(r'[a-zA-Z0-9._\%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}', normalized)
     seen = set()
     result = []
     exclude_lower = exclude.lower()
@@ -608,9 +659,9 @@ def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
     returned by WooCommerce / Stripe — not just the text classifier.
 
     Rules:
-    - subscription_type == "trial"        → TRIAL_CANCELLATION
+    - subscription_type == "trial" → TRIAL_CANCELLATION
     - subscription_type == "subscription" → SUB_CANCELLATION
-    - anything else                       → keep text_intent as fallback
+    - anything else → keep text_intent as fallback
     """
     sub_type = cancel_result.get("subscription_type", "")
     if sub_type == "trial":
@@ -638,12 +689,12 @@ def _finish_cancellation(
     )
 
     cancel_tag = {
-        "TRIAL_CANCELLATION":       "trial_cancellation",
-        "SUB_CANCELLATION":         "subscription_cancelled",
+        "TRIAL_CANCELLATION": "trial_cancellation",
+        "SUB_CANCELLATION": "subscription_cancelled",
         "SUB_RENEWAL_CANCELLATION": "renewal_cancellation",
     }.get(intent, "cancelled")
 
-    zendesk.add_tag(ticket_id, "bot_handled")   # first — blocks any re-entry from webhook re-fires
+    zendesk.add_tag(ticket_id, "bot_handled") # first — blocks any re-entry from webhook re-fires
     zendesk.post_reply(ticket_id, reply_text)
     zendesk.add_tag(ticket_id, cancel_tag)
     zendesk.add_tag(ticket_id, "ai_bot_success")
@@ -664,13 +715,13 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     WooCommerce → Stripe by email.
 
     Returns one of:
-      - cancel result dict           — found and cancelled
-      - status="not_found_anywhere"  — email unknown in BOTH systems → ask card digits
-      - status="found_no_active_sub" — email found somewhere but NO active subscription
-                                       (already cancelled or in different system) → Slack alert
+    - cancel result dict — found and cancelled
+    - status="not_found_anywhere" — email unknown in BOTH systems → ask card digits
+    - status="found_no_active_sub" — email found somewhere but NO active subscription
+      (already cancelled or in different system) → Slack alert
     """
-    woo_result = woo.cancel_subscription(email)
-    woo_status = woo_result.get("status", "")
+    woo_result  = woo.cancel_subscription(email)
+    woo_status  = woo_result.get("status", "")
 
     if woo_status not in ("not_found", "no_active_sub", "error", "timeout"):
         return {**woo_result, "source": "woocommerce"}
@@ -684,11 +735,11 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
         log.warning(f"[{ticket_id}] WooCommerce timed out → trying Stripe directly")
         woo_customer_found = False
     else:
-        woo_customer_found = woo_status == "no_active_sub"  # customer exists but no active sub
-    log.info(f"[{ticket_id}] WooCommerce: {woo_status} → trying Stripe")
+        woo_customer_found = woo_status == "no_active_sub" # customer exists but no active sub
+        log.info(f"[{ticket_id}] WooCommerce: {woo_status} → trying Stripe")
 
-    stripe_result = stripe_cli.cancel_subscription(email)
-    stripe_status = stripe_result.get("status", "")
+    stripe_result  = stripe_cli.cancel_subscription(email)
+    stripe_status  = stripe_result.get("status", "")
 
     if stripe_status not in ("not_found", "no_active_sub", "error"):
         return {
@@ -697,7 +748,7 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "subscription_type": "trial" if stripe_status == "trialing" else "subscription",
         }
 
-    stripe_customer_found = stripe_status == "no_active_sub"  # customer exists in Stripe
+    stripe_customer_found = stripe_status == "no_active_sub" # customer exists in Stripe
 
     # Customer found in at least one system but no active subscription
     if woo_customer_found or stripe_customer_found:
@@ -734,83 +785,83 @@ _REFUND_KEYWORDS = [
     # Japanese — explicit refund words
     "返済", "返金", "払い戻し", "返還", "弁償",
     # Japanese — cooling-off / legal right of withdrawal (= refund request)
-    "クーリングオフ",        # cooling-off period (legal refund right, common in JP)
-    "クーリング・オフ",      # variant with middle dot
-    "cooling off",          # English variant sometimes written by JP customers
+    "クーリングオフ", # cooling-off period (legal refund right, common in JP)
+    "クーリング・オフ", # variant with middle dot
+    "cooling off", # English variant sometimes written by JP customers
     # Japanese — implicit refund requests (asking about money already paid)
-    "お金を返して",          # return my money
-    "お金を返していただ",    # please return my money (polite)
-    "お金返して",            # colloquial variant without を particle
-    "料金を返して",          # return the fee
-    "代金を返して",          # return the price/payment
-    "先日の請求を",          # about the recent billing (implying dispute)
+    "お金を返して", # return my money
+    "お金を返していただ", # please return my money (polite)
+    "お金返して", # colloquial variant without を particle
+    "料金を返して", # return the fee
+    "代金を返して", # return the price/payment
+    "先日の請求を", # about the recent billing (implying dispute)
     # Japanese — "return/restore money" using 戻す (alternate verb for giving back)
-    "お金を戻して",          # return my money (戻す form)
-    "代金を戻して",          # return the payment
-    "料金を戻して",          # return the fee
-    "円を返して",            # return the N-yen amount (e.g. 1990円を返して)
-    "円を戻して",            # return the N-yen amount (戻す form)
+    "お金を戻して", # return my money (戻す form)
+    "代金を戻して", # return the payment
+    "料金を戻して", # return the fee
+    "円を返して", # return the N-yen amount (e.g. 1990円を返して)
+    "円を戻して", # return the N-yen amount (戻す form)
     # Japanese — asking if refund is possible
-    "返してもらえ",          # "can I get it back" / "could you return it"
-    "戻してもらえ",          # variant using 戻す
-    "返ってきますか",        # "will it come back?" (asking if refund possible)
-    "戻ってきますか",        # variant: "will it be returned?"
-    "お金が戻",              # "money comes back / money is returned"
-    "お金は戻",              # variant
-    "更新料",                # renewal fee (asking about renewal charge = refund context)
+    "返してもらえ", # "can I get it back" / "could you return it"
+    "戻してもらえ", # variant using 戻す
+    "返ってきますか", # "will it come back?" (asking if refund possible)
+    "戻ってきますか", # variant: "will it be returned?"
+    "お金が戻", # "money comes back / money is returned"
+    "お金は戻", # variant
+    "更新料", # renewal fee (asking about renewal charge = refund context)
     # Japanese — billing discrepancy / charge error (needs human investigation)
-    "意味不明な金額",        # "strange/unknown amount" — billing dispute signal
-    "報告金額",              # "report amount" — fee discrepancy (IQ Booster specific)
+    "意味不明な金額", # "strange/unknown amount" — billing dispute signal
+    "報告金額", # "report amount" — fee discrepancy (IQ Booster specific)
     # Japanese — payment cancellation / reversal = wanting a past payment undone (refund intent)
     # These are distinct from "subscription cancellation" — customer is asking to reverse a charge
-    "支払いをキャンセル",    # cancel the payment (refund this specific payment)
-    "支払いを取り消",         # reverse/cancel the payment
-    "支払いのキャンセル",     # payment cancellation (noun form)
-    "課金を取り消",           # cancel/reverse the charge
-    "課金のキャンセル",       # charge cancellation
-    "決済をキャンセル",       # cancel the transaction/settlement
-    "決済を取り消",           # reverse the transaction
-    "引き落としを取り消",     # reverse the bank deduction
-    "請求を取り消",           # reverse/cancel the billing
-    "請求のキャンセル",       # billing cancellation (noun form)
-    "添付の支払い",           # "the attached payment" — specific payment reference = refund intent
+    "支払いをキャンセル", # cancel the payment (refund this specific payment)
+    "支払いを取り消", # reverse/cancel the payment
+    "支払いのキャンセル", # payment cancellation (noun form)
+    "課金を取り消", # cancel/reverse the charge
+    "課金のキャンセル", # charge cancellation
+    "決済をキャンセル", # cancel the transaction/settlement
+    "決済を取り消", # reverse the transaction
+    "引き落としを取り消", # reverse the bank deduction
+    "請求を取り消", # reverse/cancel the billing
+    "請求のキャンセル", # billing cancellation (noun form)
+    "添付の支払い", # "the attached payment" — specific payment reference = refund intent
     # Japanese — unauthorized / unexpected charge patterns
-    "身に覚えの",        # "I don't recognise this charge" (身に覚えのない引き落とし)
-    "身に覚えがない",    # variant
-    "勝手に引き落とし",  # "deducted without consent"
-    "不正請求",          # "fraudulent/unauthorized charge"
-    "不法請求",          # "illegal billing/charge" — variant seen in real tickets
-    "詐欺",             # fraud / scam
-    "不正利用",         # unauthorized / fraudulent use
-    "無断で引き落とし",  # "deducted without consent"
-    "知らない間に",      # "without my knowledge" (charged)
+    "身に覚えの", # "I don't recognise this charge" (身に覚えのない引き落とし)
+    "身に覚えがない", # variant
+    "勝手に引き落とし", # "deducted without consent"
+    "不正請求", # "fraudulent/unauthorized charge"
+    "不法請求", # "illegal billing/charge" — variant seen in real tickets
+    "詐欺", # fraud / scam
+    "不正利用", # unauthorized / fraudulent use
+    "無断で引き落とし", # "deducted without consent"
+    "知らない間に", # "without my knowledge" (charged)
     "登録した覚えがない", # "I don't recall signing up"
-    "利用した覚えがない",   # "I don't recall using it"
-    "利用をした覚えがない",  # particle variant
-    "利用の覚えがない",     # another variant
-    "月額利用をした覚えがない",  # "I don't recall using the monthly service"
-    "心当たりがない",    # "have no recollection of this" — strong implicit refund signal
-    "心当たりがございません",  # polite variant
-    "心当たりがありません",    # another polite variant
-    "身に覚えがありません",    # polite variant of 身に覚えがない
-    "覚えがありません",  # polite "I don't recall"
+    "利用した覚えがない", # "I don't recall using it"
+    "利用をした覚えがない", # particle variant
+    "利用の覚えがない", # another variant
+    "月額利用をした覚えがない", # "I don't recall using the monthly service"
+    "心当たりがない", # "have no recollection of this" — strong implicit refund signal
+    "心当たりがございません", # polite variant
+    "心当たりがありません", # another polite variant
+    "身に覚えがありません", # polite variant of 身に覚えがない
+    "覚えがありません", # polite "I don't recall"
     "覚えがございません", # formal polite variant
-    "気づかなかった",    # "I didn't notice" (the charge)
-    "知りませんでした",  # "I didn't know about it"
-    "知らなかった",      # "I didn't know"
+    "気づかなかった", # "I didn't notice" (the charge)
+    "知りませんでした", # "I didn't know about it"
+    "知らなかった", # "I didn't know"
     "把握していなかった", # "I wasn't aware"
     "引き落とされている", # "is being deducted" — customer noticing unexpected ongoing charge
     "引き落とされていた", # past tense variant
-    "勝手に課金",        # "charged without consent"
-    "勝手に請求",        # "billed without consent"
+    "勝手に課金", # "charged without consent"
+    "勝手に請求", # "billed without consent"
     # English
     "refund", "repayment", "reimbursement", "money back", "chargeback",
     "charge back", "get my money", "pay me back",
-    "cancel payment",    # "cancel payment" = wanting a payment reversed
-    "cancel charge",     # variant
+    "cancel payment", # "cancel payment" = wanting a payment reversed
+    "cancel charge", # variant
     "unauthorized charge", "unknown charge", "unexpected charge",
-    "charged without",   # "charged without my consent/knowledge"
-    "didn't authorize",  # "I didn't authorize this charge"
+    "charged without", # "charged without my consent/knowledge"
+    "didn't authorize", # "I didn't authorize this charge"
     "did not authorize",
     "fraud", "fraudulent charge", "fraudulent payment",
     "illegal charge", "illegal billing",
@@ -821,56 +872,56 @@ _REFUND_KEYWORDS = [
     "unrecognized charge", "unrecognised charge",
     "unrecognized subscription", "unrecognised subscription",
     "unrecognized payment", "unrecognised payment",
-    "didn't know i was", "did not know i was",   # "I didn't know I was being charged"
+    "didn't know i was", "did not know i was", # "I didn't know I was being charged"
     "didn't realize i was", "did not realize i was",
     "wasn't aware", "was not aware",
-    "had no idea", "have no idea",               # "I had no idea I was being charged"
+    "had no idea", "have no idea", # "I had no idea I was being charged"
     "never intended to", "never wanted",
     # Korean
     "환불",
-    "승인취소",    # "approval cancellation" = payment reversal (Korean payment term)
-    "승인 취소",   # spaced variant
+    "승인취소", # "approval cancellation" = payment reversal (Korean payment term)
+    "승인 취소", # spaced variant
     # NOTE: "결제취소" / "결제 취소" removed — too ambiguous, causes false positives
     # on legitimate cancellation tickets (e.g. "결제 취소 관련" = about payment cancellation)
     "모르게 결제", # "payment made without my knowledge"
-    "무단 결제",   # "unauthorized payment"
-    "무단결제",    # no-space variant
+    "무단 결제", # "unauthorized payment"
+    "무단결제", # no-space variant
     # German — refund + fraud / unauthorized signals
     "rückerstattung", "rückzahlung", "erstattet",
-    "widerruf",              # legal right of withdrawal (= refund, very common in DE/AT/CH)
-    "widerrufen",            # to withdraw/revoke
-    "widerrufsrecht",        # right of withdrawal
-    "widerrufsfrist",        # withdrawal period
-    "geld zurück",           # money back
-    "geld zurückfordern",    # demand money back
-    "betrug",                   # fraud ("Achtung Betrug" = attention fraud)
-    "betrügerisch",             # fraudulent
-    "nicht autorisiert",        # not authorized
-    "nicht genehmigt",          # not approved
-    "unberechtigte abbuchung",  # unauthorized debit
-    "unberechtigte zahlung",    # unauthorized payment
-    "unberechtigt abgebucht",   # debited without authorization
-    "ohne mein wissen",         # without my knowledge
-    "ohne meine zustimmung",    # without my consent
-    "unbekannte abbuchung",     # unknown debit — "I don't know this charge"
-    "unbekannte zahlung",       # unknown payment
-    "unbekannte transaktion",   # unknown transaction
-    "unbekannter abbuchung",    # genitive variant
-    "unerwartete abbuchung",    # unexpected debit
-    "unerwartete zahlung",      # unexpected payment
-    "unerwartete belastung",    # unexpected charge
-    "nicht bestellt",           # didn't order
-    "nicht gewollt",            # didn't want
-    "nicht angemeldet",         # didn't sign up
-    "nicht registriert",        # didn't register
-    "keine kenntnis",           # had no knowledge (of the charge)
-    "nichts davon gewusst",     # knew nothing about it
-    "weiß nichts davon",        # know nothing about it
-    "kenne dieses abonnement nicht",  # don't know this subscription
-    "kenne diese abbuchung nicht",    # don't know this charge
-    "falsche abbuchung",        # wrong/erroneous debit
-    "fehlerhafte abbuchung",    # erroneous debit
-    "versehentlich abgebucht",  # accidentally charged
+    "widerruf", # legal right of withdrawal (= refund, very common in DE/AT/CH)
+    "widerrufen", # to withdraw/revoke
+    "widerrufsrecht", # right of withdrawal
+    "widerrufsfrist", # withdrawal period
+    "geld zurück", # money back
+    "geld zurückfordern", # demand money back
+    "betrug", # fraud ("Achtung Betrug" = attention fraud)
+    "betrügerisch", # fraudulent
+    "nicht autorisiert", # not authorized
+    "nicht genehmigt", # not approved
+    "unberechtigte abbuchung", # unauthorized debit
+    "unberechtigte zahlung", # unauthorized payment
+    "unberechtigt abgebucht", # debited without authorization
+    "ohne mein wissen", # without my knowledge
+    "ohne meine zustimmung", # without my consent
+    "unbekannte abbuchung", # unknown debit — "I don't know this charge"
+    "unbekannte zahlung", # unknown payment
+    "unbekannte transaktion", # unknown transaction
+    "unbekannter abbuchung", # genitive variant
+    "unerwartete abbuchung", # unexpected debit
+    "unerwartete zahlung", # unexpected payment
+    "unerwartete belastung", # unexpected charge
+    "nicht bestellt", # didn't order
+    "nicht gewollt", # didn't want
+    "nicht angemeldet", # didn't sign up
+    "nicht registriert", # didn't register
+    "keine kenntnis", # had no knowledge (of the charge)
+    "nichts davon gewusst", # knew nothing about it
+    "weiß nichts davon", # know nothing about it
+    "kenne dieses abonnement nicht", # don't know this subscription
+    "kenne diese abbuchung nicht", # don't know this charge
+    "falsche abbuchung", # wrong/erroneous debit
+    "fehlerhafte abbuchung", # erroneous debit
+    "versehentlich abgebucht", # accidentally charged
     # French
     "remboursement", "rembourser",
     # Spanish / Portuguese
@@ -880,22 +931,22 @@ _REFUND_KEYWORDS = [
     # Italian
     "rimborso",
     # Norwegian
-    "tilbakebetaling",   # refund/repayment
-    "refusjon",          # refund
-    "penger tilbake",    # money back
-    "uautorisert",       # unauthorized
-    "ukjent trekk",      # unknown deduction
-    "ikke bestilt",      # didn't order
-    "ikke autorisert",   # not authorized
-    "feilbelastet",      # incorrectly charged
-    "belastet feil",     # charged incorrectly
+    "tilbakebetaling", # refund/repayment
+    "refusjon", # refund
+    "penger tilbake", # money back
+    "uautorisert", # unauthorized
+    "ukjent trekk", # unknown deduction
+    "ikke bestilt", # didn't order
+    "ikke autorisert", # not authorized
+    "feilbelastet", # incorrectly charged
+    "belastet feil", # charged incorrectly
     # Swedish
-    "återbetalning",     # refund
-    "obehörig",          # unauthorized
-    "feldebiterad",      # incorrectly debited
+    "återbetalning", # refund
+    "obehörig", # unauthorized
+    "feldebiterad", # incorrectly debited
     # Danish
-    "tilbagebetaling",   # refund
-    "uautoriseret",      # unauthorized
+    "tilbagebetaling", # refund
+    "uautoriseret", # unauthorized
 ]
 
 
