@@ -741,13 +741,27 @@ _REFUND_KEYWORDS = [
     "不法請求",          # "illegal billing/charge" — variant seen in real tickets
     "詐欺",             # fraud / scam
     "不正利用",         # unauthorized / fraudulent use
-    "無断で引き落とし",  # "deducted without permission"
+    "無断で引き落とし",  # "deducted without consent"
     "知らない間に",      # "without my knowledge" (charged)
     "登録した覚えがない", # "I don't recall signing up"
     "利用した覚えがない",   # "I don't recall using it"
     "利用をした覚えがない",  # particle variant
     "利用の覚えがない",     # another variant
     "月額利用をした覚えがない",  # "I don't recall using the monthly service"
+    "心当たりがない",    # "have no recollection of this" — strong implicit refund signal
+    "心当たりがございません",  # polite variant
+    "心当たりがありません",    # another polite variant
+    "身に覚えがありません",    # polite variant of 身に覚えがない
+    "覚えがありません",  # polite "I don't recall"
+    "覚えがございません", # formal polite variant
+    "気づかなかった",    # "I didn't notice" (the charge)
+    "知りませんでした",  # "I didn't know about it"
+    "知らなかった",      # "I didn't know"
+    "把握していなかった", # "I wasn't aware"
+    "引き落とされている", # "is being deducted" — customer noticing unexpected ongoing charge
+    "引き落とされていた", # past tense variant
+    "勝手に課金",        # "charged without consent"
+    "勝手に請求",        # "billed without consent"
     # English
     "refund", "repayment", "reimbursement", "money back", "chargeback",
     "charge back", "get my money", "pay me back",
@@ -761,6 +775,16 @@ _REFUND_KEYWORDS = [
     "illegal charge", "illegal billing",
     "without my consent", "without my permission", "without my knowledge",
     "i never signed up", "never agreed to",
+    "didn't sign up", "did not sign up",
+    "don't recognize this", "do not recognize this",
+    "unrecognized charge", "unrecognised charge",
+    "unrecognized subscription", "unrecognised subscription",
+    "unrecognized payment", "unrecognised payment",
+    "didn't know i was", "did not know i was",   # "I didn't know I was being charged"
+    "didn't realize i was", "did not realize i was",
+    "wasn't aware", "was not aware",
+    "had no idea", "have no idea",               # "I had no idea I was being charged"
+    "never intended to", "never wanted",
     # Korean
     "환불",
     "승인취소",    # "approval cancellation" = payment reversal (Korean payment term)
@@ -781,6 +805,25 @@ _REFUND_KEYWORDS = [
     "unberechtigt abgebucht",   # debited without authorization
     "ohne mein wissen",         # without my knowledge
     "ohne meine zustimmung",    # without my consent
+    "unbekannte abbuchung",     # unknown debit — "I don't know this charge"
+    "unbekannte zahlung",       # unknown payment
+    "unbekannte transaktion",   # unknown transaction
+    "unbekannter abbuchung",    # genitive variant
+    "unerwartete abbuchung",    # unexpected debit
+    "unerwartete zahlung",      # unexpected payment
+    "unerwartete belastung",    # unexpected charge
+    "nicht bestellt",           # didn't order
+    "nicht gewollt",            # didn't want
+    "nicht angemeldet",         # didn't sign up
+    "nicht registriert",        # didn't register
+    "keine kenntnis",           # had no knowledge (of the charge)
+    "nichts davon gewusst",     # knew nothing about it
+    "weiß nichts davon",        # know nothing about it
+    "kenne dieses abonnement nicht",  # don't know this subscription
+    "kenne diese abbuchung nicht",    # don't know this charge
+    "falsche abbuchung",        # wrong/erroneous debit
+    "fehlerhafte abbuchung",    # erroneous debit
+    "versehentlich abgebucht",  # accidentally charged
     # French
     "remboursement", "rembourser",
     # Spanish / Portuguese
