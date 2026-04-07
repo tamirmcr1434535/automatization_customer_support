@@ -738,9 +738,16 @@ _REFUND_KEYWORDS = [
     "身に覚えがない",    # variant
     "勝手に引き落とし",  # "deducted without consent"
     "不正請求",          # "fraudulent/unauthorized charge"
+    "不法請求",          # "illegal billing/charge" — variant seen in real tickets
+    "詐欺",             # fraud / scam
+    "不正利用",         # unauthorized / fraudulent use
     "無断で引き落とし",  # "deducted without permission"
     "知らない間に",      # "without my knowledge" (charged)
     "登録した覚えがない", # "I don't recall signing up"
+    "利用した覚えがない",   # "I don't recall using it"
+    "利用をした覚えがない",  # particle variant
+    "利用の覚えがない",     # another variant
+    "月額利用をした覚えがない",  # "I don't recall using the monthly service"
     # English
     "refund", "repayment", "reimbursement", "money back", "chargeback",
     "charge back", "get my money", "pay me back",
@@ -750,6 +757,10 @@ _REFUND_KEYWORDS = [
     "charged without",   # "charged without my consent/knowledge"
     "didn't authorize",  # "I didn't authorize this charge"
     "did not authorize",
+    "fraud", "fraudulent charge", "fraudulent payment",
+    "illegal charge", "illegal billing",
+    "without my consent", "without my permission", "without my knowledge",
+    "i never signed up", "never agreed to",
     # Korean
     "환불",
     "승인취소",    # "approval cancellation" = payment reversal (Korean payment term)
@@ -759,8 +770,17 @@ _REFUND_KEYWORDS = [
     "모르게 결제", # "payment made without my knowledge"
     "무단 결제",   # "unauthorized payment"
     "무단결제",    # no-space variant
-    # German
+    # German — refund + fraud / unauthorized signals
     "rückerstattung", "rückzahlung", "erstattet",
+    "betrug",                   # fraud ("Achtung Betrug" = attention fraud)
+    "betrügerisch",             # fraudulent
+    "nicht autorisiert",        # not authorized
+    "nicht genehmigt",          # not approved
+    "unberechtigte abbuchung",  # unauthorized debit
+    "unberechtigte zahlung",    # unauthorized payment
+    "unberechtigt abgebucht",   # debited without authorization
+    "ohne mein wissen",         # without my knowledge
+    "ohne meine zustimmung",    # without my consent
     # French
     "remboursement", "rembourser",
     # Spanish / Portuguese
