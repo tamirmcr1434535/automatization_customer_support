@@ -29,6 +29,27 @@ class ZendeskClient:
                 ticket["requester"] = u.json()["user"]
         return ticket
 
+    def get_ticket_tags(self, ticket_id: str) -> list[str]:
+        """
+        Lightweight re-fetch of current ticket tags only.
+
+        Used as a race-condition guard: before sending a reply that sets a new
+        state tag (e.g. awaiting_card_digits), re-fetch to check whether a
+        concurrent webhook call already added the tag. Cheaper than a full
+        get_ticket() because it fetches only the ticket object (no user lookup).
+
+        Always real, even in dry_run.
+        """
+        resp = requests.get(
+            f"{self.base}/tickets/{ticket_id}.json",
+            auth=self.auth,
+            timeout=10,
+        )
+        if not resp.ok:
+            log.warning(f"get_ticket_tags: could not fetch #{ticket_id}: {resp.status_code}")
+            return []
+        return resp.json().get("ticket", {}).get("tags", [])
+
     def _fetch_comments_with_agent_ids(self, ticket_id: str) -> tuple[list, set]:
         """
         Fetch all comments for a ticket, returning (comments, agent_ids).
@@ -183,6 +204,45 @@ class ZendeskClient:
             json={"ticket": {"status": "solved"}},
             auth=self.auth, timeout=10,
         ).raise_for_status()
+
+    def was_recently_handled(
+        self, email: str, hours: int = 24, exclude_ticket_id: str = ""
+    ) -> bool:
+        """
+        Return True if another ticket from the same requester email was already
+        handled by the bot (has 'bot_handled' tag) in the last `hours` hours.
+
+        Used to prevent sending multiple replies when a customer submits the
+        same form several times in quick succession (e.g. 21 identical Help Form
+        submissions in one minute).
+
+        Always performs a real API call even in dry_run — read-only, safe.
+        """
+        from datetime import datetime, timezone, timedelta
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=hours)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        query = (
+            f"type:ticket requester:{email} "
+            f"tags:bot_handled created>{cutoff}"
+        )
+        resp = requests.get(
+            f"{self.base}/search.json",
+            params={"query": query, "per_page": 5},
+            auth=self.auth,
+            timeout=10,
+        )
+        if not resp.ok:
+            log.warning(
+                f"Email dedup search failed ({resp.status_code}) — "
+                "skipping dedup check (safe default: continue processing)"
+            )
+            return False
+
+        results = resp.json().get("results", [])
+        # Exclude the current ticket so we don't skip it on re-delivery
+        return any(str(r.get("id")) != str(exclude_ticket_id) for r in results)
 
     def add_internal_note(self, ticket_id: str, note: str):
         if self.dry_run:
