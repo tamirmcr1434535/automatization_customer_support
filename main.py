@@ -740,9 +740,23 @@ _REFUND_KEYWORDS = [
     # Japanese — implicit refund requests (asking about money already paid)
     "お金を返して",          # return my money
     "お金を返していただ",    # please return my money (polite)
+    "お金返して",            # colloquial variant without を particle
     "料金を返して",          # return the fee
     "代金を返して",          # return the price/payment
     "先日の請求を",          # about the recent billing (implying dispute)
+    # Japanese — "return/restore money" using 戻す (alternate verb for giving back)
+    "お金を戻して",          # return my money (戻す form)
+    "代金を戻して",          # return the payment
+    "料金を戻して",          # return the fee
+    "円を返して",            # return the N-yen amount (e.g. 1990円を返して)
+    "円を戻して",            # return the N-yen amount (戻す form)
+    # Japanese — asking if refund is possible
+    "返してもらえ",          # "can I get it back" / "could you return it"
+    "戻してもらえ",          # variant using 戻す
+    "返ってきますか",        # "will it come back?" (asking if refund possible)
+    "戻ってきますか",        # variant: "will it be returned?"
+    "お金が戻",              # "money comes back / money is returned"
+    "お金は戻",              # variant
     "更新料",                # renewal fee (asking about renewal charge = refund context)
     # Japanese — billing discrepancy / charge error (needs human investigation)
     "意味不明な金額",        # "strange/unknown amount" — billing dispute signal
