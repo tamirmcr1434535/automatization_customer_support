@@ -30,7 +30,10 @@ Classify into ONE intent:
 - PAYPAL_DISPUTE         — PayPal or bank dispute already opened
 - TECHNICAL_ISSUE        — STRICTLY: cannot log in, did not receive credentials, wrong email,
                            account access error. NEVER use for billing or cancellation requests.
-- GENERAL_QUESTION       — general question about the service or account, no action needed
+- GENERAL_QUESTION       — STRICTLY for questions about test results, IQ score interpretation,
+                           how the test works, or account features — with ABSOLUTELY ZERO mention
+                           of billing, charges, subscription, or payments. If the customer
+                           mentions ANY charge, billing, or subscription → NEVER GENERAL_QUESTION.
 - UNSUBSCRIBE_EMAIL      — only wants to be removed from mailing/marketing list
 - DUPLICATE              — repeat of an existing ticket
 - UNKNOWN                — genuinely unclear intent
@@ -47,9 +50,12 @@ IMPORTANT RULES:
      EN: "fraud", "fraudulent", "illegal charge", "illegal billing",
          "charged without my consent/permission/knowledge",
          "I never signed up", "I never authorized", "I didn't know about this charge"
-   Exception: if the message ALSO contains a clear forward-cancellation request
-   ("please cancel going forward", "解約したい", "止めたい") → TRIAL_CANCELLATION.
-   Pure fraud complaint with no forward-cancel request → REFUND_REQUEST.
+   Exception (Rule 0 does NOT apply — use TRIAL_CANCELLATION instead):
+   - Message contains ANY word from Rule 1 cancel list (cancel, 解約したい, opzeggen,
+     account verwijderen, uitschrijven, beëindigen, etc.)
+   - Dutch (NL) messages with "account verwijderen" or "opzeggen" → ALWAYS TRIAL_CANCELLATION
+     even if the customer also mentions not knowing about the subscription.
+   Pure fraud complaint with ZERO cancel words → REFUND_REQUEST.
 1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
    "annuleren", "avboka", "annullere",
@@ -71,11 +77,16 @@ IMPORTANT RULES:
    → Scan the entire transcript for cancellation/refund intent.
    → If the customer mentions subscription, charges, or cancellation ANYWHERE → TRIAL_CANCELLATION.
    → Never return GENERAL_QUESTION or UNKNOWN for chat transcripts that mention a subscription charge.
-9. If the body mentions seeing an unexpected charge, a subscription the customer doesn't recognise,
-   or asks how to stop payments — even without the word "cancel" — → TRIAL_CANCELLATION.
-   Use GENERAL_QUESTION ONLY if the message has NO billing or subscription concern at all.
-   EXCEPTION: if the unexpected-charge complaint is framed as FRAUD / ILLEGAL / WITHOUT CONSENT
-   (see Rule 0 signals above), classify as REFUND_REQUEST, not TRIAL_CANCELLATION.
+9. BILLING CONTACT RULE — any message where the customer mentions a charge, billing, subscription,
+   payment, or monthly deduction → TRIAL_CANCELLATION by default.
+   GENERAL_QUESTION is FORBIDDEN if billing is mentioned. Concrete examples:
+     JP: "請求について" (about billing) → TRIAL_CANCELLATION
+     JP: "料金について" (about the fee) → TRIAL_CANCELLATION
+     JP: "課金について" (about the charge) → TRIAL_CANCELLATION
+     JP: "引き落としについて" (about the deduction) → TRIAL_CANCELLATION
+     EN: "about my subscription" → TRIAL_CANCELLATION
+   EXCEPTION: if the complaint is pure fraud/unauthorized (see Rule 0) with ZERO cancel words
+   → REFUND_REQUEST.
 
 Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
