@@ -36,11 +36,26 @@ Classify into ONE intent:
 - UNKNOWN                — genuinely unclear intent
 
 IMPORTANT RULES:
+0. FRAUD / ILLEGAL BILLING OVERRIDE — evaluate this BEFORE rules 1-9:
+   If the customer's PRIMARY complaint is about unauthorized charges, fraud, or billing without
+   their consent — AND they are NOT explicitly asking to cancel a subscription going forward —
+   → REFUND_REQUEST (not TRIAL_CANCELLATION).
+   Signals that trigger this override:
+     DE: "Betrug", "betrügerisch", "nicht autorisiert", "nicht genehmigt", "ohne mein Wissen",
+         "ohne meine Zustimmung", "unberechtigte Abbuchung"
+     JP: "不法請求", "不正請求", "詐欺", "不正利用"
+     EN: "fraud", "fraudulent", "illegal charge", "illegal billing",
+         "charged without my consent/permission/knowledge",
+         "I never signed up", "I never authorized", "I didn't know about this charge"
+   Exception: if the message ALSO contains a clear forward-cancellation request
+   ("please cancel going forward", "解約したい", "止めたい") → TRIAL_CANCELLATION.
+   Pure fraud complaint with no forward-cancel request → REFUND_REQUEST.
 1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
-   "annuleren", "avboka", "annullere"
+   "annuleren", "avboka", "annullere",
+   "batalkan", "hentikan langganan", "berhenti berlangganan" (ID: Indonesian)
    → ALWAYS a cancellation intent (TRIAL_CANCELLATION or SUB_CANCELLATION). NEVER REFUND_REQUEST
-   or SUB_RENEWAL_REFUND if ANY cancellation word is present.
+   or SUB_RENEWAL_REFUND if ANY cancellation word is present — UNLESS Rule 0 fraud override applies.
 2. "I noticed recurring/unexpected charges + please cancel" → TRIAL_CANCELLATION.
    Mentioning past charges does NOT make it a refund intent if the customer asks to cancel.
 3. "I only wanted the IQ test / 知能テスト but got a subscription" → TRIAL_CANCELLATION.
@@ -57,6 +72,8 @@ IMPORTANT RULES:
 9. If the body mentions seeing an unexpected charge, a subscription the customer doesn't recognise,
    or asks how to stop payments — even without the word "cancel" — → TRIAL_CANCELLATION.
    Use GENERAL_QUESTION ONLY if the message has NO billing or subscription concern at all.
+   EXCEPTION: if the unexpected-charge complaint is framed as FRAUD / ILLEGAL / WITHOUT CONSENT
+   (see Rule 0 signals above), classify as REFUND_REQUEST, not TRIAL_CANCELLATION.
 
 Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
@@ -78,6 +95,7 @@ Language detection rules:
 - PT  = Portuguese
 - RU  = Russian (Кириллица)
 - IT  = Italian
+- ID  = Indonesian (Bahasa Indonesia: "saya", "langganan", "tagihan", "batalkan", "hentikan")
 - Use the primary language of the customer's message body.
 - If the message contains multiple languages, pick the dominant one."""
 
