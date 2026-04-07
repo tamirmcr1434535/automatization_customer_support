@@ -55,7 +55,11 @@ IMPORTANT RULES:
      account verwijderen, uitschrijven, beëindigen, etc.)
    - Dutch (NL) messages with "account verwijderen" or "opzeggen" → ALWAYS TRIAL_CANCELLATION
      even if the customer also mentions not knowing about the subscription.
-   Pure fraud complaint with ZERO cancel words → REFUND_REQUEST.
+   - German (DE) messages with "nichts bestellt", "kein Abonnement", "nicht abonniert"
+     WITHOUT explicit refund words (Rückerstattung, Geld zurück, erstattet, zurückzahlen)
+     → TRIAL_CANCELLATION (customer wants to cancel the unwanted subscription, NOT get a refund).
+   Pure fraud complaint with ZERO cancel words AND ZERO "nichts bestellt"/"kein Abonnement"
+   → REFUND_REQUEST.
 1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
    "annuleren", "avboka", "annullere",
@@ -85,8 +89,19 @@ IMPORTANT RULES:
      JP: "課金について" (about the charge) → TRIAL_CANCELLATION
      JP: "引き落としについて" (about the deduction) → TRIAL_CANCELLATION
      EN: "about my subscription" → TRIAL_CANCELLATION
-   EXCEPTION: if the complaint is pure fraud/unauthorized (see Rule 0) with ZERO cancel words
+   EXCEPTION 1: if the complaint is pure fraud/unauthorized (see Rule 0) with ZERO cancel words
    → REFUND_REQUEST.
+   EXCEPTION 2: if the message contains billing/charge mention AND ALSO explicit payment-reversal
+   or refund intent — i.e. the customer wants a SPECIFIC PAST PAYMENT cancelled/reversed/refunded
+   (not just subscription cancelled going forward) — → REFUND_REQUEST takes priority.
+   Key signals for Exception 2:
+     JP: "支払いをキャンセル" (cancel the payment), "支払いを取り消" (reverse the payment),
+         "課金を取り消" (reverse the charge), "決済をキャンセル" (cancel the transaction),
+         "返金", "払い戻し", "お金を返して" (return the money)
+     EN: "cancel this payment", "reverse this charge", "refund", "money back"
+     DE: "Rückerstattung", "Geld zurück", "erstattet"
+   DISTINCTION: "please cancel my subscription" → TRIAL_CANCELLATION (future charges).
+                "please cancel/reverse this payment" → REFUND_REQUEST (past charge reversal).
 
 Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
