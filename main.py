@@ -733,6 +733,19 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
 _REFUND_KEYWORDS = [
     # Japanese — explicit refund words
     "返済", "返金", "払い戻し", "返還", "弁償",
+    # Japanese — payment cancellation / reversal = wanting a past payment undone (refund intent)
+    # These are distinct from "subscription cancellation" — customer is asking to reverse a charge
+    "支払いをキャンセル",    # cancel the payment (refund this specific payment)
+    "支払いを取り消",         # reverse/cancel the payment
+    "支払いのキャンセル",     # payment cancellation (noun form)
+    "課金を取り消",           # cancel/reverse the charge
+    "課金のキャンセル",       # charge cancellation
+    "決済をキャンセル",       # cancel the transaction/settlement
+    "決済を取り消",           # reverse the transaction
+    "引き落としを取り消",     # reverse the bank deduction
+    "請求を取り消",           # reverse/cancel the billing
+    "請求のキャンセル",       # billing cancellation (noun form)
+    "添付の支払い",           # "the attached payment" — specific payment reference = refund intent
     # Japanese — unauthorized / unexpected charge patterns
     "身に覚えの",        # "I don't recognise this charge" (身に覚えのない引き落とし)
     "身に覚えがない",    # variant
