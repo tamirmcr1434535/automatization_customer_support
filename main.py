@@ -737,6 +737,13 @@ _REFUND_KEYWORDS = [
     "クーリングオフ",        # cooling-off period (legal refund right, common in JP)
     "クーリング・オフ",      # variant with middle dot
     "cooling off",          # English variant sometimes written by JP customers
+    # Japanese — implicit refund requests (asking about money already paid)
+    "お金を返して",          # return my money
+    "お金を返していただ",    # please return my money (polite)
+    "料金を返して",          # return the fee
+    "代金を返して",          # return the price/payment
+    "先日の請求を",          # about the recent billing (implying dispute)
+    "更新料",                # renewal fee (asking about renewal charge = refund context)
     # Japanese — billing discrepancy / charge error (needs human investigation)
     "意味不明な金額",        # "strange/unknown amount" — billing dispute signal
     "報告金額",              # "report amount" — fee discrepancy (IQ Booster specific)
@@ -816,6 +823,12 @@ _REFUND_KEYWORDS = [
     "무단결제",    # no-space variant
     # German — refund + fraud / unauthorized signals
     "rückerstattung", "rückzahlung", "erstattet",
+    "widerruf",              # legal right of withdrawal (= refund, very common in DE/AT/CH)
+    "widerrufen",            # to withdraw/revoke
+    "widerrufsrecht",        # right of withdrawal
+    "widerrufsfrist",        # withdrawal period
+    "geld zurück",           # money back
+    "geld zurückfordern",    # demand money back
     "betrug",                   # fraud ("Achtung Betrug" = attention fraud)
     "betrügerisch",             # fraudulent
     "nicht autorisiert",        # not authorized
