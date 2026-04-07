@@ -13,6 +13,7 @@ Logic:
 """
 
 import logging
+import time
 import requests
 from datetime import datetime, timezone
 
@@ -36,7 +37,7 @@ class WooCommerceClient:
             log.info("WooCommerceClient: DRY_RUN — no writes")
 
     # ------------------------------------------------------------------ #
-    # Read operations (always real, even in dry_run)                       #
+    # Read operations (always real, even in dry_run) #
     # ------------------------------------------------------------------ #
 
     def get_customer_by_email(self, email: str) -> dict | None:
@@ -44,10 +45,10 @@ class WooCommerceClient:
         Return the first WooCommerce customer matching *email* (exact), or None.
 
         Tries two passes:
-          1. ?role=all  — finds users of ANY WordPress role (subscriber, customer,
-             administrator, etc.).  PayPal subscribers often get the 'subscriber'
-             role rather than 'customer', so the default endpoint misses them.
-          2. Default (no role filter) — fallback for WC versions that reject role=all.
+        1. ?role=all — finds users of ANY WordPress role (subscriber, customer,
+           administrator, etc.). PayPal subscribers often get the 'subscriber'
+           role rather than 'customer', so the default endpoint misses them.
+        2. Default (no role filter) — fallback for WC versions that reject role=all.
         """
         for params in [
             {"email": email, "per_page": 1, "role": "all"},
@@ -99,6 +100,7 @@ class WooCommerceClient:
 
         if not resp.ok:
             return None
+
         data = resp.json()
         if not isinstance(data, list):
             return None
@@ -108,6 +110,7 @@ class WooCommerceClient:
             if customer.get("email", "").lower().strip() == email_lower:
                 log.info(f"WC: found customer via ?search= for {email} (id={customer['id']})")
                 return customer
+
         return None
 
     def get_subscriptions(self, customer_id: int) -> list[dict] | None:
@@ -115,64 +118,81 @@ class WooCommerceClient:
         Return WooCommerce Subscriptions for a given customer ID.
 
         Return values:
-          list[dict]  — subscriptions found (may include non-active ones)
-          []          — confirmed empty: server responded OK with zero results
-                        on BOTH passes (status-filtered + unfiltered)
-          None        — uncertain: at least one pass timed out or errored.
-                        Caller should NOT assume "no subscription exists" and
-                        should skip to the next data source (Stripe) rather
-                        than wasting time on further WC fallbacks.
+        list[dict] — subscriptions found (may include non-active ones)
+        [] — confirmed empty: server responded OK with zero results
+             on BOTH passes (status-filtered + unfiltered)
+        None — uncertain: at least one pass timed out or errored.
+               Caller should NOT assume "no subscription exists" and
+               should skip to the next data source (Stripe) rather
+               than wasting time on further WC fallbacks.
 
         Tries two passes:
-          1. With status filter (active,pending-cancel,on-hold,pending) — fast.
-             Some WC Subscriptions plugin versions accept comma-separated statuses;
-             if the query returns empty (filter may be ignored), fall through to
-             pass 2. If the query TIMES OUT, return None immediately — no point
-             retrying an already-overloaded WC server.
-          2. Without status filter — catches all statuses when pass 1 returned
-             an unexpectedly empty OK response.
-             Returns None on timeout/error.
+        1. With status filter (active,pending-cancel,on-hold,pending) — fast.
+           Some WC Subscriptions plugin versions accept comma-separated statuses;
+           if the query returns empty (filter may be ignored), fall through to
+           pass 2. If the query TIMES OUT, retry once after a short delay before
+           giving up and returning None.
+        2. Without status filter — catches all statuses when pass 1 returned
+           an unexpectedly empty OK response.
+           Returns None on timeout/error.
+
+        FIX: timeout increased 10s → 30s to accommodate slow WC server responses.
+        FIX: pass 1 retries once after 2s on timeout before returning None.
         """
         pass1_timed_out = False
 
         # Pass 1: status-filtered query (lighter server load)
-        try:
-            resp = requests.get(
-                f"{self.base}/subscriptions",
-                params={
-                    "customer": customer_id,
-                    "per_page": 10,
-                    "status": "active,pending-cancel,on-hold,pending",
-                },
-                auth=self.auth,
-                timeout=10,
-            )
-            if resp.ok:
-                data = resp.json()
-                if data:  # got results — use them
-                    return data
-                # Empty result could mean the status filter is unsupported/ignored
-                # and returned 0 results. Fall through to unfiltered pass.
-                log.info(
-                    f"WC: status-filtered query returned 0 subs for customer {customer_id} "
-                    "— retrying without status filter"
+        # Attempt up to 2 times before giving up.
+        for attempt in range(1, 3):
+            try:
+                resp = requests.get(
+                    f"{self.base}/subscriptions",
+                    params={
+                        "customer": customer_id,
+                        "per_page": 10,
+                        "status": "active,pending-cancel,on-hold,pending",
+                    },
+                    auth=self.auth,
+                    timeout=30,  # FIX: was 10s — WC server can be slow under load
                 )
-            else:
+                if resp.ok:
+                    data = resp.json()
+                    if data:
+                        return data
+                    # Empty result — may mean status filter unsupported. Fall through.
+                    log.info(
+                        f"WC: status-filtered query returned 0 subs for customer {customer_id} "
+                        "— retrying without status filter"
+                    )
+                else:
+                    log.warning(
+                        f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
+                    )
+                break  # got a response (even empty/error) — don't retry pass 1
+
+            except requests.exceptions.Timeout:
+                if attempt == 1:
+                    log.warning(
+                        f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1, attempt {attempt}) "
+                        f"— retrying in 2s"
+                    )
+                    time.sleep(2)
+                    continue  # retry
+                else:
+                    # Second timeout — give up on pass 1
+                    log.warning(
+                        f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1, attempt {attempt}) "
+                        "— skipping pass 2, caller should try Stripe"
+                    )
+                    pass1_timed_out = True
+                    break
+
+            except requests.exceptions.RequestException as e:
                 log.warning(
-                    f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
+                    f"WC subscriptions lookup error for customer {customer_id} (pass 1): {e}"
+                    " — retrying without status filter"
                 )
-        except requests.exceptions.Timeout:
-            # Server is overloaded — don't waste another 10s on pass 2
-            log.warning(
-                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1) "
-                "— skipping pass 2, caller should try Stripe"
-            )
-            pass1_timed_out = True
-        except requests.exceptions.RequestException as e:
-            log.warning(
-                f"WC subscriptions lookup error for customer {customer_id} (pass 1): {e}"
-                " — retrying without status filter"
-            )
+                break
 
         if pass1_timed_out:
             return None  # signal: uncertain, skip further WC lookups
@@ -183,7 +203,7 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"customer": customer_id, "per_page": 20},
                 auth=self.auth,
-                timeout=10,
+                timeout=30,  # FIX: was 10s
             )
         except requests.exceptions.Timeout:
             log.warning(
@@ -210,22 +230,25 @@ class WooCommerceClient:
         customer changed their account email after subscribing).
 
         Strategy:
-          1. ?billing_email= with pagination (up to MAX_PAGES × 50 results).
-             WooCommerce Subscriptions plugin should filter server-side.
-             We trust this filter partially: subscriptions whose billing.email
-             matches are kept (strict); subscriptions whose billing.email is
-             EMPTY are also kept — WC often stores the email in WordPress post
-             meta (_billing_email) which is NOT returned in list API responses,
-             so billing.email is blank even for matching subscriptions.
-             If we see any subscription with a *non-empty, non-matching* billing
-             email we know the server-side filter is broken → reject whole page.
-          2. ?search= as secondary fallback (strict email validation only).
+        1. ?billing_email= with pagination (up to MAX_PAGES × 50 results).
+           WooCommerce Subscriptions plugin should filter server-side.
+           We trust this filter partially: subscriptions whose billing.email
+           matches are kept (strict); subscriptions whose billing.email is
+           EMPTY are also kept — WC often stores the email in WordPress post
+           meta (_billing_email) which is NOT returned in list API responses,
+           so billing.email is blank even for matching subscriptions.
+           If we see any subscription with a *non-empty, non-matching* billing
+           email we know the server-side filter is broken → reject whole page.
+        2. ?search= as secondary fallback (strict email validation only).
 
         IMPORTANT: Always call cancel_subscription() via customer_id when possible
         (?customer= filter) — that path is reliable. This method is last-resort.
+
+        FIX: timeout increased 10s → 20s for billing_email pass,
+             10s → 20s for ?search= pass.
         """
         email_lower = email.lower().strip()
-        MAX_PAGES   = 2   # scan up to 2 × 50 = 100 subscriptions per filter
+        MAX_PAGES = 2  # scan up to 2 × 50 = 100 subscriptions per filter
 
         # ── Pass 1: ?billing_email= with pagination ───────────────────── #
         for page in range(1, MAX_PAGES + 1):
@@ -234,7 +257,7 @@ class WooCommerceClient:
                     f"{self.base}/subscriptions",
                     params={"billing_email": email, "per_page": 50, "page": page},
                     auth=self.auth,
-                    timeout=10,
+                    timeout=20,  # FIX: was 10s
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC billing_email lookup error for {email} page={page}: {e}")
@@ -248,13 +271,8 @@ class WooCommerceClient:
             if not isinstance(data, list) or not data:
                 break  # no more pages
 
-            # Classify results:
-            #  - exact_match  : billing.email == our email  (or meta_data._billing_email)
-            #  - empty_email  : billing.email is "" or missing  (server may have filtered correctly
-            #                   but doesn't serialize email in list responses — trust it)
-            #  - wrong_email  : billing.email is a *different* email  (filter is broken/ignored)
-            exact_match  = []
-            empty_email  = []
+            exact_match = []
+            empty_email = []
             filter_broken = False
 
             for s in data:
@@ -263,8 +281,6 @@ class WooCommerceClient:
                 else:
                     billing_email_in_response = s.get("billing", {}).get("email", "").strip()
                     if billing_email_in_response:
-                        # Server returned a sub with a DIFFERENT non-empty billing email
-                        # → server-side filter is broken/ignored for this WC version
                         filter_broken = True
                     else:
                         empty_email.append(s)
@@ -277,10 +293,6 @@ class WooCommerceClient:
                 return exact_match
 
             if empty_email and not filter_broken:
-                # billing.email is empty for ALL results — common for PayPal subs where
-                # email lives only in WP post meta _billing_email (not in REST list response).
-                # The server-side ?billing_email= filter appears to be working (no wrong emails
-                # in the results), so these subscriptions most likely belong to our customer.
                 log.info(
                     f"WC: ?billing_email= returned {len(empty_email)} subscription(s) with "
                     f"empty billing.email for {email} page={page} — trusting server filter "
@@ -294,26 +306,20 @@ class WooCommerceClient:
                     f"(page {page} returned subscriptions with different billing emails) — "
                     "not trusting results, skipping to ?search="
                 )
-                break  # server ignores the filter — pagination won't help
+                break
 
-            # All 50 had empty email AND filter looks broken? Shouldn't reach here,
-            # but break to be safe.
             log.info(
                 f"WC: ?billing_email= page {page} returned {len(data)} sub(s), "
                 f"none matched {email} — trying next page"
             )
 
         # ── Pass 2: ?search= with individual-fetch fallback ───────────── #
-        # WC REST list responses often omit billing.email (stored in WP post meta
-        # only). For subscriptions with empty billing.email in the list response,
-        # we fetch the individual subscription detail endpoint — which DOES include
-        # meta_data (_billing_email) — and re-check there.
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions",
                 params={"search": email, "per_page": 50},
                 auth=self.auth,
-                timeout=10,
+                timeout=20,  # FIX: was 10s
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC ?search= lookup error for {email}: {e}")
@@ -331,11 +337,10 @@ class WooCommerceClient:
             if self._subscription_matches_email(s, email_lower):
                 matched.append(s)
             elif not s.get("billing", {}).get("email", "").strip():
-                # billing.email is empty in list response — fetch individual detail
-                # to check meta_data._billing_email (not serialized in list responses)
                 sub_id = s.get("id")
                 if not sub_id:
                     continue
+
                 try:
                     detail_resp = requests.get(
                         f"{self.base}/subscriptions/{sub_id}",
@@ -364,8 +369,8 @@ class WooCommerceClient:
         Return the number of orders (initial + renewals) attached to a subscription.
 
         We only need to know whether count == 1 or > 1, so per_page=2 is enough:
-        - 1 result  → orders == 1  (customer signed up but no renewal charged yet)
-        - 2 results → orders >= 2  (at least one renewal → definitely a paid subscription)
+        - 1 result → orders == 1 (customer signed up but no renewal charged yet)
+        - 2 results → orders >= 2 (at least one renewal → definitely a paid subscription)
 
         Returns None on timeout or API error (caller falls back to date-only logic).
         """
@@ -390,7 +395,6 @@ class WooCommerceClient:
         if not isinstance(data, list):
             return None
 
-        # Prefer X-WP-Total header (actual total) when available
         total_header = resp.headers.get("X-WP-Total")
         if total_header is not None:
             try:
@@ -403,7 +407,6 @@ class WooCommerceClient:
             except ValueError:
                 pass
 
-        # Fallback: count from response body (capped at per_page=2)
         count = len(data)
         log.info(
             f"WC: sub #{subscription_id} has {count} order(s) "
@@ -422,18 +425,18 @@ class WooCommerceClient:
            sometimes differs from billing.email for PayPal subscriptions)
         3. meta_data.billing_email (alternate meta key used by some plugins)
         """
-        # 1. REST API billing object
         if sub.get("billing", {}).get("email", "").lower().strip() == email_lower:
             return True
-        # 2 & 3. WordPress post meta
+
         for meta in sub.get("meta_data", []):
             if meta.get("key") in ("_billing_email", "billing_email"):
                 if meta.get("value", "").lower().strip() == email_lower:
                     return True
+
         return False
 
     # ------------------------------------------------------------------ #
-    # Trial detection                                                       #
+    # Trial detection #
     # ------------------------------------------------------------------ #
 
     @staticmethod
@@ -442,35 +445,23 @@ class WooCommerceClient:
         Determine whether subscription is a "trial" or "subscription".
 
         Primary rules (order_count + days_since_start are the reliable signals):
-          0. order_count > 1 → "subscription"
-             Can't be a trial if more than one order has been charged.
-          1. order_count ≤ 1 AND days_since_start ≤ 8 → "trial"
-             Single order, signed up within 8 days → genuine free trial.
-             NOTE: trial_end_date is intentionally NOT checked here because WC
-             does not always populate it for Stripe Multi Sync subscriptions.
-          2. order_count ≤ 1 AND days_since_start > 8 → "subscription"
-             Been active too long to be a fresh trial.
+        0. order_count > 1 → "subscription"
+           Can't be a trial if more than one order has been charged.
+        1. order_count ≤ 1 AND days_since_start ≤ 8 → "trial"
+           Single order, signed up within 8 days → genuine free trial.
+           NOTE: trial_end_date is intentionally NOT checked here because WC
+           does not always populate it for Stripe Multi Sync subscriptions.
+        2. order_count ≤ 1 AND days_since_start > 8 → "subscription"
+           Been active too long to be a fresh trial.
 
         Fallback (no start_date available):
-          3. trial_end_date set AND order_count == 1 → "trial"
-          4. Everything else → "subscription" (safe default)
-
-        Examples:
-          - orders=2, trial_end="-"         → orders > 1       → "subscription"
-          - orders=1, started 3d ago        → days ≤ 8         → "trial"
-          - orders=1, started 3d ago, trial_end="-"  → days ≤ 8 → "trial"  ← fixed
-          - orders=1, started 15d ago       → days > 8         → "subscription"
-          - orders=None, started 3d ago     → days ≤ 8         → "trial"
-          - orders=None, started 20d ago    → days > 8         → "subscription"
-          - orders=1, no start_date, trial_end set → "trial"
-          - orders=1, no start_date, trial_end missing → "subscription"
+        3. trial_end_date set AND order_count == 1 → "trial"
+        4. Everything else → "subscription" (safe default)
         """
-        # ── Path 0: order_count > 1 → subscription ───────────────────── #
         if order_count is not None and order_count > 1:
             log.info(f"WC sub_type: order_count={order_count} > 1 → subscription")
             return "subscription"
 
-        # ── Paths 1-2: use days_since_start as primary trial signal ───── #
         start_raw = (
             subscription.get("start_date_gmt")
             or subscription.get("start_date")
@@ -500,13 +491,12 @@ class WooCommerceClient:
             )
             return "trial" if is_trial else "subscription"
 
-        # ── Fallback: no start_date — use trial_end_date + order_count ── #
-        # Only trust trial_end if it is still in the future (expired ≠ active trial)
         trial_end_raw = (
             subscription.get("trial_end_date_gmt")
             or subscription.get("trial_end_date")
             or ""
         )
+
         if trial_end_raw and not trial_end_raw.startswith("0000") and (order_count is None or order_count <= 1):
             try:
                 trial_end_dt = _parse(trial_end_raw)
@@ -528,7 +518,7 @@ class WooCommerceClient:
         return "subscription"
 
     # ------------------------------------------------------------------ #
-    # Write operation                                                       #
+    # Write operation #
     # ------------------------------------------------------------------ #
 
     def _cancel_sub_by_id(self, subscription_id: int) -> dict:
@@ -540,6 +530,7 @@ class WooCommerceClient:
                 "subscription_id": subscription_id,
                 "cancelled": True,
             }
+
         try:
             resp = requests.put(
                 f"{self.base}/subscriptions/{subscription_id}",
@@ -566,6 +557,7 @@ class WooCommerceClient:
                 "cancelled": False,
                 "error": resp.text[:300],
             }
+
         log.info(f"WC: cancelled subscription #{subscription_id}")
         return {
             "status": "cancelled",
@@ -574,7 +566,7 @@ class WooCommerceClient:
         }
 
     # ------------------------------------------------------------------ #
-    # Main public method                                                    #
+    # Main public method #
     # ------------------------------------------------------------------ #
 
     def cancel_subscription(self, email: str) -> dict:
@@ -586,11 +578,11 @@ class WooCommerceClient:
         actual cancel write. This way we always know the true subscription state.
 
         Return dict:
-            status : "trial_cancelled" | "subscription_cancelled" |
-                     "dry_run" | "not_found" | "no_active_sub" | "timeout" | "error"
+        status : "trial_cancelled" | "subscription_cancelled" |
+                 "dry_run" | "not_found" | "no_active_sub" | "timeout" | "error"
 
-            "timeout" — WC subscription lookup timed out; caller should try Stripe
-                        directly without assuming the customer has no subscription.
+        "timeout" — WC subscription lookup timed out; caller should try Stripe
+        directly without assuming the customer has no subscription.
         """
         base_result = {
             "email": email,
@@ -601,24 +593,16 @@ class WooCommerceClient:
             "plan": "",
         }
 
-        # 1. Customer lookup (always real, even in dry_run)
         log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
         customer = self.get_customer_by_email(email)
 
         if not customer:
-            # Exact email lookup failed — try broader ?search= before giving up on
-            # the customer-ID path (covers slight email variations, WP account quirks).
             customer = self.search_customer_by_email(email)
 
-        # 2. Subscriptions (always real)
         if customer:
             all_subs = self.get_subscriptions(customer["id"])
 
             if all_subs is None:
-                # Subscription lookup timed out — WC server is overloaded.
-                # Return immediately; caller will try Stripe.  Do NOT run
-                # get_subscriptions_by_billing_email (would add another 20-30s
-                # of timeouts on an already-overloaded server).
                 log.warning(
                     f"WC: subscription lookup timed out for customer #{customer['id']} "
                     f"({email}) — returning timeout so caller can try Stripe"
@@ -626,8 +610,6 @@ class WooCommerceClient:
                 return {**base_result, "status": "timeout"}
 
             if not all_subs:
-                # Confirmed empty (server replied OK with zero results) —
-                # try billing-email search as a last resort before giving up.
                 log.info(
                     f"WC: 0 subs found by customer_id={customer['id']} — "
                     "checking billing email as fallback"
@@ -640,27 +622,21 @@ class WooCommerceClient:
                     )
                     all_subs = billing_subs
         else:
-            # No WP customer account found at all — fall back to searching
-            # subscriptions directly by billing email.
-            # Covers: guest checkouts, PayPal-only accounts, account email ≠ billing email.
             log.info(
                 f"WC: no customer account for {email} — "
                 "falling back to billing-email subscription search"
             )
             all_subs = self.get_subscriptions_by_billing_email(email)
-            if not all_subs:
-                log.info(f"WC: no subscriptions found by billing email for {email}")
-                return {**base_result, "status": "not_found"}
+
+        if not all_subs:
+            log.info(f"WC: no subscriptions found by billing email for {email}")
+            return {**base_result, "status": "not_found"}
+
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
 
         if not active_subs:
-            # No active subscription — check if one was already cancelled.
-            # This covers: manual cancellations by human agents, DRY_RUN test tickets,
-            # or customers who submitted duplicate cancellation requests.
-            # In all these cases we should confirm cancellation rather than escalate.
             cancelled_subs = [s for s in all_subs if s.get("status") == "cancelled"]
             if cancelled_subs:
-                # Pick the most recently started cancelled sub
                 cancelled_subs.sort(
                     key=lambda s: s.get("start_date_gmt") or s.get("start_date") or "",
                     reverse=True,
@@ -672,6 +648,7 @@ class WooCommerceClient:
                 line_items = target.get("line_items") or []
                 if line_items:
                     plan = line_items[0].get("name", "")
+
                 log.info(
                     f"WC: no active subs for {email} — "
                     f"found already-cancelled sub #{target['id']} "
@@ -689,16 +666,6 @@ class WooCommerceClient:
             log.info(f"WC: no active subscriptions for {email}")
             return {**base_result, "status": "no_active_sub"}
 
-        # 3. Determine type for each active sub and select by priority:
-        #    pending-cancel (paid) → active (paid) → pending-cancel (trial) → active (trial)
-        #
-        # Rationale: a customer asking to cancel almost certainly means their CURRENT
-        # paid subscription. If they also have a fresh trial (e.g. signed up again
-        # on the same email), we should NOT cancel the trial instead of the paid sub.
-        #
-        # Order count is the primary trial/sub signal — always fetch it.
-        # (trial_end_date is NOT a reliable discriminator: WC sometimes omits it
-        # for Stripe Multi Sync subscriptions even for genuine trials.)
         typed_subs = []
         for s in active_subs:
             order_count = self.get_order_count(s["id"])
@@ -707,17 +674,16 @@ class WooCommerceClient:
         def _select_priority(entry: tuple) -> tuple:
             sub, sub_type = entry
             status = sub.get("status", "")
-            # Lower tuple = higher priority (sort ascending)
             if status == "pending-cancel" and sub_type == "subscription":
-                return (0,)   # highest: already-requested paid cancellation
+                return (0,)
             elif status == "active" and sub_type == "subscription":
-                return (1,)   # active paid subscription
+                return (1,)
             elif status == "pending-cancel" and sub_type == "trial":
-                return (2,)   # pending-cancel trial
+                return (2,)
             elif sub_type == "subscription":
-                return (3,)   # other status, paid
+                return (3,)
             elif sub_type == "trial":
-                return (4,)   # trial — lowest priority
+                return (4,)
             else:
                 return (5,)
 
@@ -729,7 +695,6 @@ class WooCommerceClient:
         if line_items:
             plan = line_items[0].get("name", "")
 
-        # 4. Cancel (skipped in dry_run, but we still return real sub info)
         cancel = self._cancel_sub_by_id(target["id"])
 
         if self.dry_run:
