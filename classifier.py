@@ -53,12 +53,15 @@ IMPORTANT RULES:
    Exception (Rule 0 does NOT apply — use TRIAL_CANCELLATION instead):
    - Message contains ANY word from Rule 1 cancel list (cancel, 解約したい, opzeggen,
      account verwijderen, uitschrijven, beëindigen, etc.)
+   - EN account deletion: "delete my account", "remove my account", "close my account",
+     "deactivate my account" → ALWAYS TRIAL_CANCELLATION (account deletion = cancel request,
+     even if the customer also mentions not knowing about the subscription).
    - Dutch (NL) messages with "account verwijderen" or "opzeggen" → ALWAYS TRIAL_CANCELLATION
      even if the customer also mentions not knowing about the subscription.
    - German (DE) messages with "nichts bestellt", "kein Abonnement", "nicht abonniert"
      WITHOUT explicit refund words (Rückerstattung, Geld zurück, erstattet, zurückzahlen)
      → TRIAL_CANCELLATION (customer wants to cancel the unwanted subscription, NOT get a refund).
-   Pure fraud complaint with ZERO cancel words AND ZERO "nichts bestellt"/"kein Abonnement"
+   Pure fraud complaint with ZERO cancel words AND ZERO account-deletion phrases
    → REFUND_REQUEST.
 1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
@@ -66,6 +69,8 @@ IMPORTANT RULES:
    "batalkan", "hentikan langganan", "berhenti berlangganan" (ID: Indonesian)
    "opzeggen", "beëindigen", "stopzetten", "abonnement annuleren",
    "account verwijderen", "opzegging", "uitschrijven" (NL: Dutch)
+   EN account deletion: "delete my account", "delete account", "remove my account",
+   "remove account", "close my account", "close account", "deactivate my account"
    → ALWAYS a cancellation intent (TRIAL_CANCELLATION or SUB_CANCELLATION). NEVER REFUND_REQUEST
    or SUB_RENEWAL_REFUND if ANY cancellation word is present — UNLESS Rule 0 fraud override applies.
 2. "I noticed recurring/unexpected charges + please cancel" → TRIAL_CANCELLATION.
@@ -78,9 +83,12 @@ IMPORTANT RULES:
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
 8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT transcript.
    The customer's messages are embedded in the conversation body.
-   → Scan the entire transcript for cancellation/refund intent.
-   → If the customer mentions subscription, charges, or cancellation ANYWHERE → TRIAL_CANCELLATION.
-   → Never return GENERAL_QUESTION or UNKNOWN for chat transcripts that mention a subscription charge.
+   → ALWAYS classify as TRIAL_CANCELLATION by default — customers reach this chat through
+     the cancellation/support flow.
+   → Scan the entire transcript for refund signals (returns, fraud, money-back requests).
+   → Only override to REFUND_REQUEST if the body contains ONLY refund/fraud signals with
+     absolutely ZERO cancel intent.
+   → NEVER return GENERAL_QUESTION, UNKNOWN, or TECHNICAL_ISSUE for chat transcripts.
 9. BILLING CONTACT RULE — any message where the customer mentions a charge, billing, subscription,
    payment, or monthly deduction → TRIAL_CANCELLATION by default.
    GENERAL_QUESTION is FORBIDDEN if billing is mentioned. Concrete examples:
