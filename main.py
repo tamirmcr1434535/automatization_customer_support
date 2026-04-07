@@ -733,6 +733,13 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
 _REFUND_KEYWORDS = [
     # Japanese — explicit refund words
     "返済", "返金", "払い戻し", "返還", "弁償",
+    # Japanese — cooling-off / legal right of withdrawal (= refund request)
+    "クーリングオフ",        # cooling-off period (legal refund right, common in JP)
+    "クーリング・オフ",      # variant with middle dot
+    "cooling off",          # English variant sometimes written by JP customers
+    # Japanese — billing discrepancy / charge error (needs human investigation)
+    "意味不明な金額",        # "strange/unknown amount" — billing dispute signal
+    "報告金額",              # "report amount" — fee discrepancy (IQ Booster specific)
     # Japanese — payment cancellation / reversal = wanting a past payment undone (refund intent)
     # These are distinct from "subscription cancellation" — customer is asking to reverse a charge
     "支払いをキャンセル",    # cancel the payment (refund this specific payment)
@@ -802,8 +809,8 @@ _REFUND_KEYWORDS = [
     "환불",
     "승인취소",    # "approval cancellation" = payment reversal (Korean payment term)
     "승인 취소",   # spaced variant
-    "결제취소",    # "payment cancellation" (can mean refund)
-    "결제 취소",   # spaced variant
+    # NOTE: "결제취소" / "결제 취소" removed — too ambiguous, causes false positives
+    # on legitimate cancellation tickets (e.g. "결제 취소 관련" = about payment cancellation)
     "모르게 결제", # "payment made without my knowledge"
     "무단 결제",   # "unauthorized payment"
     "무단결제",    # no-space variant
