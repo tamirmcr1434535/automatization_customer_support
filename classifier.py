@@ -66,15 +66,25 @@ IMPORTANT RULES:
    - German (DE) messages with "nichts bestellt", "kein Abonnement", "nicht abonniert"
      WITHOUT explicit refund words (Rückerstattung, Geld zurück, erstattet, zurückzahlen)
      → TRIAL_CANCELLATION (customer wants to cancel the unwanted subscription, NOT get a refund).
+   - JP: "支払いには応じていない", "支払いを拒否", "この請求に応じていない", "支払いを認めない"
+     (refusing/rejecting a charge) WITHOUT explicit 返金/払い戻し/お金を返して
+     → TRIAL_CANCELLATION (customer rejecting an unwanted charge, not requesting a refund).
    Pure fraud complaint with ZERO cancel words AND ZERO account-deletion phrases
    → REFUND_REQUEST.
 1a. CANCEL + REFUND COMBINATION (check this FIRST, before Rule 1):
    If the customer message contains BOTH a cancellation request AND explicit refund/money-back
    intent → REFUND_REQUEST. The bot cannot auto-cancel when a refund decision is also needed.
+   Refund signals include BOTH explicit words AND implicit "give back" phrases:
+   Explicit: 返金, 払い戻し, クーリングオフ, Widerruf, Rückerstattung, refund, money back
+   Implicit JP: 返してほしい, 返してもらいたい, 返してもらえますか, 戻してほしい,
+                お金を戻して, 円を返して, 円を戻して, 返ってきますか, 戻ってきますか
    Examples:
      JP: "解約したい + 返金してほしい" → REFUND_REQUEST
      JP: "キャンセル + クーリングオフ" → REFUND_REQUEST
      JP: "解約 + お金を返して" → REFUND_REQUEST
+     JP: "キャンセル + 1990円を返してほしい" → REFUND_REQUEST
+     JP: "解約 + お金が戻ってきますか" → REFUND_REQUEST
+     JP: "キャンセル + 返してもらえますか" → REFUND_REQUEST
      DE: "kündigen + Widerruf" → REFUND_REQUEST
      DE: "kündigen + Rückerstattung" → REFUND_REQUEST
      EN: "cancel + refund" → REFUND_REQUEST
@@ -102,6 +112,9 @@ IMPORTANT RULES:
    The customer's messages are embedded in the conversation body.
    → Default to TRIAL_CANCELLATION — customers reach this chat through the cancellation flow.
    → Apply Rule 1a first: if the transcript contains BOTH cancel AND refund signals → REFUND_REQUEST.
+     Refund signals in chat include both explicit (返金, 払い戻し, refund) AND implicit:
+     "返してほしい", "返してもらえますか", "戻してほしい", "お金は戻りますか",
+     "お金が戻ってきますか", "返ってきますか", "円を返して", "返金してもらえますか"
    → If transcript contains ONLY refund/fraud signals (no cancel) → REFUND_REQUEST.
    → If transcript contains cancel signals (even vague) → TRIAL_CANCELLATION.
    → NEVER return GENERAL_QUESTION, UNKNOWN, or TECHNICAL_ISSUE for chat transcripts.
@@ -174,7 +187,16 @@ def classify_ticket(subject: str, body: str) -> dict:
             return json.loads(clean_json_str)
         except json.JSONDecodeError as e:
             print(f"JSON Decode Error on cleaned string: {clean_json_str}")
-            raise e
+            # Fall through to fallback
     else:
         print(f"Claude returned invalid response without JSON brackets: {raw_text}")
-        raise ValueError("No JSON found in Claude's response")
+        # Fall through to fallback
+
+    # Fallback: could not parse valid JSON — treat as UNKNOWN so bot skips safely
+    return {
+        "intent": "UNKNOWN",
+        "confidence": 0.0,
+        "language": "EN",
+        "chargeback_risk": False,
+        "reasoning": "parse error — classifier fallback",
+    }
