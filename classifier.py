@@ -21,8 +21,13 @@ Classify into ONE intent:
                            and wants them stopped.
                            NOTE: if uncertain between TRIAL and SUB → always pick TRIAL_CANCELLATION.
 - SUB_RENEWAL_CANCELLATION — wants to stop auto-renewal before next billing date (no refund request)
-- REFUND_REQUEST         — ONLY if cancellation is NOT mentioned and customer asks ONLY for money
-                           back for a specific past charge. Must NOT contain cancel/解約/退会.
+- REFUND_REQUEST         — Use when:
+                           (a) customer asks ONLY for money back (no cancel request), OR
+                           (b) customer asks BOTH to cancel AND to refund/reverse a past charge.
+                           If the customer wants BOTH cancellation AND money back → REFUND_REQUEST
+                           (human must handle the refund assessment; bot cannot auto-cancel these).
+                           Key refund signals: 返金, 払い戻し, クーリングオフ, Widerruf, refund,
+                           お金を返して, 先日の請求を返して, Rückerstattung.
 - SUB_RENEWAL_REFUND     — ONLY if customer was charged for a renewal AND asks ONLY to refund
                            THAT SPECIFIC charge, with NO request to cancel the subscription.
                            DO NOT use if the message contains any form of "cancel" / "解約" / "退会".
@@ -63,7 +68,19 @@ IMPORTANT RULES:
      → TRIAL_CANCELLATION (customer wants to cancel the unwanted subscription, NOT get a refund).
    Pure fraud complaint with ZERO cancel words AND ZERO account-deletion phrases
    → REFUND_REQUEST.
-1. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
+1a. CANCEL + REFUND COMBINATION (check this FIRST, before Rule 1):
+   If the customer message contains BOTH a cancellation request AND explicit refund/money-back
+   intent → REFUND_REQUEST. The bot cannot auto-cancel when a refund decision is also needed.
+   Examples:
+     JP: "解約したい + 返金してほしい" → REFUND_REQUEST
+     JP: "キャンセル + クーリングオフ" → REFUND_REQUEST
+     JP: "解約 + お金を返して" → REFUND_REQUEST
+     DE: "kündigen + Widerruf" → REFUND_REQUEST
+     DE: "kündigen + Rückerstattung" → REFUND_REQUEST
+     EN: "cancel + refund" → REFUND_REQUEST
+     EN: "cancel + money back" → REFUND_REQUEST
+   Only if the cancel request has ZERO refund component → TRIAL/SUB_CANCELLATION (Rule 1b below).
+1b. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
    "annuleren", "avboka", "annullere",
    "batalkan", "hentikan langganan", "berhenti berlangganan" (ID: Indonesian)
@@ -83,11 +100,10 @@ IMPORTANT RULES:
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
 8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT transcript.
    The customer's messages are embedded in the conversation body.
-   → ALWAYS classify as TRIAL_CANCELLATION by default — customers reach this chat through
-     the cancellation/support flow.
-   → Scan the entire transcript for refund signals (returns, fraud, money-back requests).
-   → Only override to REFUND_REQUEST if the body contains ONLY refund/fraud signals with
-     absolutely ZERO cancel intent.
+   → Default to TRIAL_CANCELLATION — customers reach this chat through the cancellation flow.
+   → Apply Rule 1a first: if the transcript contains BOTH cancel AND refund signals → REFUND_REQUEST.
+   → If transcript contains ONLY refund/fraud signals (no cancel) → REFUND_REQUEST.
+   → If transcript contains cancel signals (even vague) → TRIAL_CANCELLATION.
    → NEVER return GENERAL_QUESTION, UNKNOWN, or TECHNICAL_ISSUE for chat transcripts.
 9. BILLING CONTACT RULE — any message where the customer mentions a charge, billing, subscription,
    payment, or monthly deduction → TRIAL_CANCELLATION by default.
