@@ -886,6 +886,23 @@ _REFUND_KEYWORDS = [
     "모르게 결제", # "payment made without my knowledge"
     "무단 결제", # "unauthorized payment"
     "무단결제", # no-space variant
+    # Korean — "I never subscribed / didn't sign up / don't recognize this charge"
+    # These phrases signal the customer disputes the charge entirely, not just cancels.
+    # Example: "전 구독한게 없고 구매한것도 없는데" = "I have no subscription and made no purchase"
+    "구독한게 없",    # "I have no subscription" (no-space variant)
+    "구독한 게 없",   # space variant
+    "구독한적 없",    # "never subscribed" (no-space)
+    "구독한 적 없",   # "never subscribed" (spaced)
+    "구독하지 않았",  # "did not subscribe"
+    "구매한것도 없",  # "made no purchase either" (no-space)
+    "구매한 것도 없", # space variant
+    "결제한 적 없",   # "never made this payment"
+    "결제한적 없",    # no-space variant
+    "가입한 적 없",   # "never signed up / registered"
+    "가입한적 없",    # no-space variant
+    "가입하지 않았",  # "did not sign up"
+    "신청한 적 없",   # "never applied / registered for this"
+    "신청한적 없",    # no-space variant
     # German — refund + fraud / unauthorized signals
     "rückerstattung", "rückzahlung", "erstattet",
     "widerruf", # legal right of withdrawal (= refund, very common in DE/AT/CH)
