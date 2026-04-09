@@ -62,6 +62,29 @@ class SlackClient:
             self._user_id_cache = _get_user_id(self.bot_token, self.target_email)
         return self._user_id_cache
 
+    def _open_dm_channel(self, user_id: str) -> str | None:
+        """Open a DM channel with the user. Required for bot tokens to send DMs."""
+        try:
+            resp = requests.post(
+                f"{_SLACK_API}/conversations.open",
+                headers={
+                    "Authorization": f"Bearer {self.bot_token}",
+                    "Content-Type": "application/json",
+                },
+                json={"users": user_id},
+                timeout=10,
+            )
+            data = resp.json()
+            if data.get("ok"):
+                channel_id = data["channel"]["id"]
+                log.info(f"Slack: opened DM channel {channel_id} for user {user_id}")
+                return channel_id
+            log.error(f"Slack: conversations.open failed — {data.get('error')}")
+            return None
+        except Exception as e:
+            log.error(f"Slack: conversations.open request failed — {e}")
+            return None
+
     def _post(self, text: str, blocks: list | None = None) -> bool:
         """Core DM send method. Returns True on success."""
         if self.dry_run:
@@ -69,15 +92,21 @@ class SlackClient:
             return True
 
         if not self.bot_token:
-            log.warning("Slack: bot token missing — skipping alert")
+            log.error("Slack: bot token missing — cannot send alert")
             return False
 
-        channel = self._resolve_channel()
-        if not channel:
-            log.warning(f"Slack: could not resolve user ID for {self.target_email}")
+        user_id = self._resolve_channel()
+        if not user_id:
+            log.error(f"Slack: could not resolve user ID for {self.target_email} — alert NOT sent")
             return False
 
-        payload: dict = {"channel": channel, "text": text}
+        # Open DM channel first — required for bot tokens to send DMs
+        dm_channel = self._open_dm_channel(user_id)
+        if not dm_channel:
+            log.error(f"Slack: could not open DM channel for {self.target_email} — alert NOT sent")
+            return False
+
+        payload: dict = {"channel": dm_channel, "text": text}
         if blocks:
             payload["blocks"] = blocks
 
@@ -93,12 +122,15 @@ class SlackClient:
             )
             data = resp.json()
             if data.get("ok"):
-                log.info(f"Slack: DM sent to {self.target_email}")
+                log.info(f"Slack: ✅ DM successfully delivered to {self.target_email}")
                 return True
-            log.error(f"Slack: API error — {data.get('error')}")
+            log.error(
+                f"Slack: ❌ chat.postMessage failed — error={data.get('error')}, "
+                f"channel={dm_channel}, user={self.target_email}"
+            )
             return False
         except Exception as e:
-            log.error(f"Slack: request failed — {e}")
+            log.error(f"Slack: ❌ request failed — {e}")
             return False
 
     # ── public API ────────────────────────────────────────────────────────
@@ -144,8 +176,12 @@ class SlackClient:
             },
             {"type": "divider"},
         ]
-        log.info(f"Slack: sending manual_review alert for ticket #{ticket_id}")
-        return self._post(text, blocks)
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: manual_review alert SENT for ticket #{ticket_id}")
+        else:
+            log.error(f"Slack: manual_review alert FAILED for ticket #{ticket_id}")
+        return sent
 
     def notify_not_found(
         self,
@@ -185,5 +221,9 @@ class SlackClient:
             },
             {"type": "divider"},
         ]
-        log.info(f"Slack: sending not_found alert for ticket #{ticket_id}")
-        return self._post(text, blocks)
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: not_found alert SENT for ticket #{ticket_id}")
+        else:
+            log.error(f"Slack: not_found alert FAILED for ticket #{ticket_id}")
+        return sent
