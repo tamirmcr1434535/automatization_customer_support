@@ -545,6 +545,41 @@ class WooCommerceClient:
         }
 
     # ------------------------------------------------------------------ #
+    # Fast-path helpers #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _sub_id_from_customer_meta(customer: dict) -> int | None:
+        """
+        Many WC customers have 'subscription_id' stored in their meta_data
+        (set at signup time). Extracting it lets us do a direct
+        /subscriptions/{id} lookup (~0.3s) instead of slow search queries.
+        """
+        for meta in customer.get("meta_data", []):
+            if meta.get("key") == "subscription_id":
+                try:
+                    return int(meta["value"])
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    def _get_subscription_by_id(self, subscription_id: int) -> dict | None:
+        """Direct single-subscription lookup by ID. Very fast (~0.3s)."""
+        try:
+            resp = requests.get(
+                f"{self.base}/subscriptions/{subscription_id}",
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC: direct sub lookup error for #{subscription_id}: {e}")
+            return None
+        if not resp.ok:
+            log.warning(f"WC: direct sub lookup failed for #{subscription_id}: {resp.status_code}")
+            return None
+        return resp.json()
+
+    # ------------------------------------------------------------------ #
     # Main public method #
     # ------------------------------------------------------------------ #
 
@@ -574,51 +609,73 @@ class WooCommerceClient:
 
         log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
 
-        # ── Step 1: get customer account (fast, 0.3s) ─────────────────── #
+        # ── Step 1: get customer account (fast, ~0.3s) ────────────────── #
         customer = self.get_customer_by_email(email)
         if not customer:
             customer = self.search_customer_by_email(email)
-
         customer_id = customer["id"] if customer else None
 
-        # ── Step 2: subscription lookup ────────────────────────────────── #
+        # ── Step 2: subscription lookup — 3-tier, fastest-first ───────── #
         #
-        # ORDER MATTERS — tested on production data:
-        #   /subscriptions?customer=ID      → up to 21s, often returns 0 (WC
-        #                                     stores subs by billing email, not
-        #                                     customer account)
-        #   /subscriptions?billing_email=X  → ~1s, returns correct results
+        # Tier A  (~0.3s): subscription_id stored in customer meta_data
+        #   → direct GET /subscriptions/{id}  — single-row lookup, always fast
+        #   → covers most customers (set at signup)
         #
-        # Strategy (fastest-first):
-        # 2a. billing_email query   — fast & reliable for this WC setup
-        # 2b. customer_id query     — fallback only if billing_email returned empty
-        #     (covers edge case where sub is attached to account, not billing email)
-        # 2c. If customer_id query times out → return "timeout"
+        # Tier B  (~1s):   GET /subscriptions?billing_email=EMAIL
+        #   → WC stores billing email on the subscription post, not on the
+        #     customer account — this query is indexed and fast
+        #   → catches guests / customers whose meta_data sub ID is missing
+        #
+        # Tier C  (~15s):  GET /subscriptions?customer=ID
+        #   → last resort; often returns 0 results and is slow (no index on
+        #     customer_id in WC Subscriptions). Only used if A+B both empty.
+        #   → returns None on timeout → caller asks for card digits
+        #
+        all_subs: list[dict] | None = None
 
-        all_subs = self.get_subscriptions_by_billing_email(email)
+        # ── Tier A: meta_data fast path ───────────────────────────────── #
+        if customer:
+            meta_sub_id = self._sub_id_from_customer_meta(customer)
+            if meta_sub_id:
+                sub = self._get_subscription_by_id(meta_sub_id)
+                if sub:
+                    log.info(
+                        f"WC: Tier-A hit — direct sub #{meta_sub_id} "
+                        f"from customer meta_data for {email}"
+                    )
+                    all_subs = [sub]
 
+        # ── Tier B: billing_email query ───────────────────────────────── #
+        if not all_subs:
+            billing_subs = self.get_subscriptions_by_billing_email(email)
+            if billing_subs:
+                log.info(
+                    f"WC: Tier-B hit — {len(billing_subs)} sub(s) via "
+                    f"billing_email for {email}"
+                )
+                all_subs = billing_subs
+
+        # ── Tier C: customer_id query (last resort) ───────────────────── #
         if not all_subs and customer_id is not None:
             log.info(
-                f"WC: billing_email returned 0 subs for {email} — "
-                f"trying customer_id={customer_id} as fallback"
+                f"WC: Tiers A+B empty for {email} — "
+                f"falling back to customer_id={customer_id} (slow)"
             )
             id_subs = self.get_subscriptions(customer_id)
-
             if id_subs is None:
                 log.warning(
-                    f"WC: subscription lookup timed out for customer #{customer_id} ({email})"
+                    f"WC: Tier-C timed out for customer #{customer_id} ({email})"
                 )
                 return {**base_result, "status": "timeout"}
-
             if id_subs:
                 log.info(
-                    f"WC: found {len(id_subs)} subscription(s) via customer_id fallback "
-                    f"for {email}"
+                    f"WC: Tier-C hit — {len(id_subs)} sub(s) via "
+                    f"customer_id for {email}"
                 )
                 all_subs = id_subs
 
         if not all_subs:
-            log.info(f"WC: no subscriptions found for {email}")
+            log.info(f"WC: no subscriptions found for {email} (all 3 tiers exhausted)")
             return {**base_result, "status": "not_found"}
 
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
