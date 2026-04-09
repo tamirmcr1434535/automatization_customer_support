@@ -61,7 +61,7 @@ HANDLED_INTENTS = {
 
 # Max order count for bot to handle. Subscriptions with >= this many orders
 # are renewals that require manual review (refund assessment, etc.).
-MAX_BOT_ORDERS = 2
+MAX_BOT_ORDERS = 3
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
