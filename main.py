@@ -205,34 +205,54 @@ def _process(ticket_id: str) -> dict:
     })
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
-    # ── REFUND / PAYMENT DISPUTE intents → skip (human must handle) ──────── #
-    # These are payment disputes / refund requests — NOT simple cancellations.
-    # The bot must not touch these tickets; route to human review.
-    # All of these return skipped_refund_request so eval ground truth matches.
-    _REFUND_INTENTS = {
+    # ── REFUND / PAYMENT DISPUTE intents ─────────────────────────────────── #
+    #
+    # Policy: CANCELLATION IS ALWAYS THE PRIORITY.
+    #
+    # If the customer asks to cancel AND mentions refund → cancel first.
+    # The refund part can be handled by a human afterwards.
+    # Only skip if the ticket is a PURE payment dispute with zero cancel intent.
+    #
+    _PURE_DISPUTE_INTENTS = {
         "CHARGEBACK_THREAT",  # customer threatening / filing chargeback
-        "REFUND_REQUEST",     # customer explicitly asking for a refund
-        "PAYPAL_DISPUTE",     # PayPal dispute opened
-        "SUB_RENEWAL_REFUND", # refund on renewal charge
+        "PAYPAL_DISPUTE",     # PayPal dispute already opened
     }
-    if intent in _REFUND_INTENTS:
-        log.info(f"[{ticket_id}] {intent} — skipping (payment dispute / refund, not handled by bot)")
+    if intent in _PURE_DISPUTE_INTENTS:
+        log.info(f"[{ticket_id}] {intent} — skipping (active payment dispute, human must handle)")
         result["status"] = "skipped_refund_request"
         log_result(result)
         return result
 
-    # ── REFUND + CANCEL COMBINED → skip silently ──────────────────────── #
-    # If the customer asks for both cancellation AND a refund/repayment,
-    # we don't touch the ticket — a human will handle it.
-    # Check subject + body together: the refund signal may appear in either field.
-    if intent in HANDLED_INTENTS and _contains_refund_request(subject + " " + body):
-        log.info(
-            f"[{ticket_id}] Refund request detected alongside {intent} — "
-            "skipping (not handled by bot)"
-        )
-        result["status"] = "skipped_refund_request"
-        log_result(result)
-        return result
+    # REFUND_REQUEST / SUB_RENEWAL_REFUND — check if there's also a cancel intent.
+    # Many customers say "cancel and refund" but the priority is to cancel the
+    # subscription immediately so they stop being charged. The bot cancels,
+    # and adds an internal note about the refund request for the human team.
+    if intent in ("REFUND_REQUEST", "SUB_RENEWAL_REFUND"):
+        full_text = (subject + " " + body).lower()
+        _CANCEL_SIGNALS = [
+            "cancel", "キャンセル", "解約", "解除", "退会", "取り消", "止めたい",
+            "やめたい", "취소", "해지", "탈퇴", "kündigen", "stornieren",
+            "annuleren", "opzeggen", "annuler", "cancelar", "отменить",
+            "отписаться", "delete my account", "close my account",
+            "remove my account", "stop my subscription", "unsubscribe",
+        ]
+        has_cancel = any(sig in full_text for sig in _CANCEL_SIGNALS)
+
+        if has_cancel:
+            # Override intent: customer wants cancellation + refund → cancel first
+            log.info(
+                f"[{ticket_id}] {intent} but cancel signal found in text — "
+                "overriding to TRIAL_CANCELLATION (cancel first, refund later)"
+            )
+            intent = "TRIAL_CANCELLATION"
+            result["intent"] = intent
+            result["refund_also_requested"] = True
+        else:
+            # Pure refund request with no cancellation intent → human handles
+            log.info(f"[{ticket_id}] {intent} — pure refund, no cancel signal → skipping")
+            result["status"] = "skipped_refund_request"
+            log_result(result)
+            return result
 
     # ── CARD DIGITS FLOWS ─────────────────────────────────────────────── #
     # Timeout: Zendesk Automation added tag after AWAITING_CARD_DAYS days of no reply
