@@ -119,6 +119,14 @@ def zendesk_webhook(request):
     except Exception as e:
         log.exception(f"[{ticket_id}] Unhandled error: {e}")
         result = {"ticket_id": ticket_id, "status": "error", "error": str(e)}
+        try:
+            slack.notify_error(
+                ticket_id=ticket_id,
+                error_msg=str(e),
+                zendesk_subdomain=ZENDESK_SUBDOMAIN,
+            )
+        except Exception:
+            log.exception(f"[{ticket_id}] Failed to send Slack error alert")
 
     return json.dumps(result), 200, {"Content-Type": "application/json"}
 
@@ -186,6 +194,24 @@ def _process(ticket_id: str) -> dict:
             "skipping (human already replied)"
         )
         result["status"] = "skipped_agent_already_replied"
+        return result
+
+    # 2d. Spam detection — if bot already replied 2+ times, stop and alert.
+    bot_reply_count = zendesk.count_bot_replies(ticket_id)
+    if bot_reply_count >= 2:
+        log.warning(
+            f"[{ticket_id}] Bot already replied {bot_reply_count} times — "
+            "possible spam loop, skipping and alerting"
+        )
+        result["status"] = "skipped_spam_detected"
+        slack_sent = slack.notify_spam_detected(
+            ticket_id=ticket_id,
+            email=email,
+            reply_count=bot_reply_count,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
+        log_result(result)
         return result
 
     # 3. TEST_MODE gate
@@ -272,6 +298,13 @@ def _process(ticket_id: str) -> dict:
         intent = "REFUND_REQUEST"
         result["intent"] = intent
         result["status"] = "skipped_refund_request"
+        slack_sent = slack.notify_refund_skip(
+            ticket_id=ticket_id,
+            email=email,
+            intent=intent,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
         log_result(result)
         return result
 
@@ -290,6 +323,11 @@ def _process(ticket_id: str) -> dict:
     if intent in _PURE_DISPUTE_INTENTS:
         log.info(f"[{ticket_id}] {intent} — skipping (active payment dispute, human must handle)")
         result["status"] = "skipped_refund_request"
+        slack_sent = slack.notify_refund_skip(
+            ticket_id=ticket_id, email=email,
+            intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
         log_result(result)
         return result
 
@@ -321,6 +359,11 @@ def _process(ticket_id: str) -> dict:
             # Pure refund request with no cancellation intent → human handles
             log.info(f"[{ticket_id}] {intent} — pure refund, no cancel signal → skipping")
             result["status"] = "skipped_refund_request"
+            slack_sent = slack.notify_refund_skip(
+                ticket_id=ticket_id, email=email,
+                intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
+            )
+            result["slack_sent"] = slack_sent
             log_result(result)
             return result
 
