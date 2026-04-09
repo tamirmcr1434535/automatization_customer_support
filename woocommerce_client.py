@@ -10,7 +10,7 @@ IMPORTANT — performance notes for iqbooster.org:
     GET /subscriptions/{id}           — direct single-row lookup
     GET /subscriptions?billing_email= — server-side billing email filter
 
-  SLOW endpoints (8–30s):
+  SLOW endpoints (8–30s, NOT USED — always timeout):
     GET /subscriptions?search=        — full-text search, not indexed
     GET /customers?search=            — full-text search, not indexed
     GET /subscriptions?customer=      — customer_id filter, not indexed
@@ -18,7 +18,7 @@ IMPORTANT — performance notes for iqbooster.org:
   Lookup strategy (ordered by speed):
     1. /customers?email=         → meta_data subscription_id → /subscriptions/{id}
     2. /subscriptions?billing_email=
-    3. /subscriptions?search=    (last resort, 20s timeout — better than asking card digits)
+    3. (Stripe fallback in main.py if WC fast lookups fail)
 """
 
 import logging
@@ -190,71 +190,6 @@ class WooCommerceClient:
             )
 
         return []
-
-    def _find_subs_by_search(self, email: str) -> list[dict]:
-        """
-        Last-resort subscription search using ?search= (full-text).
-
-        This endpoint is SLOW (8-30s) because WC does a full database scan.
-        We use it only when faster lookups (?email=, ?billing_email=) failed.
-
-        To reduce false positives, we verify that each returned subscription
-        actually matches the target email (via billing.email or meta_data).
-        If billing.email is empty (common with post-meta-only storage),
-        we fetch the individual subscription detail to check _billing_email.
-        """
-        email_lower = email.lower().strip()
-        # Use email username part for search to increase match chances
-        # (WC search matches against multiple fields including name, email, etc.)
-        try:
-            resp = requests.get(
-                f"{self.base}/subscriptions",
-                params={"search": email, "per_page": 10},
-                auth=self.auth,
-                timeout=20,  # generous timeout — this endpoint is slow
-            )
-        except requests.exceptions.Timeout:
-            log.warning(f"WC: ?search= timed out for {email} (expected on this server)")
-            return []
-        except requests.exceptions.RequestException as e:
-            log.warning(f"WC: ?search= error for {email}: {e}")
-            return []
-
-        if not resp.ok:
-            log.warning(f"WC: ?search= failed for {email}: {resp.status_code}")
-            return []
-
-        data = resp.json()
-        if not isinstance(data, list) or not data:
-            return []
-
-        log.info(f"WC: ?search= returned {len(data)} result(s) for {email}")
-
-        # Verify email match — ?search= can return false positives
-        matched = []
-        for s in data:
-            if self._subscription_matches_email(s, email_lower):
-                matched.append(s)
-                continue
-
-            # billing.email might be empty — check detail endpoint for _billing_email
-            be = s.get("billing", {}).get("email", "").strip()
-            if not be:
-                detail = self._get_subscription_by_id(s["id"])
-                if detail and self._subscription_matches_email(detail, email_lower):
-                    matched.append(detail)
-                    continue
-
-        if matched:
-            log.info(
-                f"WC: ?search= found {len(matched)} verified match(es) for {email}"
-            )
-        else:
-            log.info(
-                f"WC: ?search= returned results but none matched {email} — discarding"
-            )
-
-        return matched
 
     @staticmethod
     def _subscription_matches_email(sub: dict, email_lower: str) -> bool:
@@ -462,20 +397,9 @@ class WooCommerceClient:
                 )
                 all_subs = billing_subs
 
-        # ── Step 2c: ?search= last resort (slow, 8–30s) ────────────── #
-        # WC admin finds subscriptions via full-text ?search= which checks
-        # billing name, email stored in _billing_email post meta, order
-        # notes, etc. — fields that ?billing_email= and ?email= miss.
-        # This endpoint is slow (8-30s on this server), so we only try it
-        # as a last resort with a generous timeout. Better than asking the
-        # customer for card digits and adding days of delay.
-        if not all_subs:
-            search_subs = self._find_subs_by_search(email)
-            if search_subs:
-                log.info(
-                    f"WC: found {len(search_subs)} sub(s) via ?search= fallback"
-                )
-                all_subs = search_subs
+        # NOTE: ?search= endpoint intentionally NOT used — it times out (30s+)
+        # on this server. Stripe email-based fallback in main.py covers
+        # the cases where WC fast lookups fail.
 
         if not all_subs:
             if customer:
