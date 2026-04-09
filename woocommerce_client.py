@@ -4,12 +4,18 @@ WooCommerce Subscriptions Client
 Handles trial and subscription cancellations via WooCommerce REST API v3.
 Requires the "WooCommerce Subscriptions" plugin to be active on the site.
 
-Logic:
- 1. Find customer by email
- 2. Fetch their subscriptions
- 3. If any subscription has an active trial period → cancel trial
- 4. Otherwise → cancel active subscription
- 5. Falls back gracefully if customer or subscription not found
+IMPORTANT — performance notes for iqbooster.org:
+  FAST endpoints (< 1s):
+    GET /customers?email=             — exact email lookup, indexed
+    GET /subscriptions/{id}           — direct single-row lookup
+    GET /subscriptions?billing_email= — server-side billing email filter
+
+  SLOW endpoints (10–30s, often timeout):
+    GET /customers?search=            — full-text search, not indexed
+    GET /subscriptions?search=        — full-text search, not indexed
+    GET /subscriptions?customer=      — customer_id filter, not indexed
+
+  This client ONLY uses the fast endpoints. Slow endpoints are not called.
 """
 
 import logging
@@ -35,19 +41,20 @@ class WooCommerceClient:
         if dry_run:
             log.info("WooCommerceClient: DRY_RUN — no writes")
 
-    # ------------------------------------------------------------------ #
-    # Read operations (always real, even in dry_run) #
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    #  READ — customer lookup                                            #
+    # ================================================================== #
 
     def get_customer_by_email(self, email: str) -> dict | None:
         """
         Return the first WooCommerce customer matching *email* (exact), or None.
 
-        Tries two passes:
+        Uses only ?email= (fast, indexed). Two passes for role compatibility:
         1. ?role=all — finds users of ANY WordPress role (subscriber, customer,
-           administrator, etc.). PayPal subscribers often get the 'subscriber'
-           role rather than 'customer', so the default endpoint misses them.
+           administrator, etc.).
         2. Default (no role filter) — fallback for WC versions that reject role=all.
+
+        Does NOT use ?search= — it's a full-text scan that times out on this server.
         """
         for params in [
             {"email": email, "per_page": 1, "role": "all"},
@@ -65,293 +72,144 @@ class WooCommerceClient:
                 continue
 
             if resp.status_code == 401:
-                log.error("WooCommerce 401 Unauthorized — check WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET in Secret Manager")
+                log.error("WooCommerce 401 Unauthorized — check consumer key/secret")
                 return None
             if resp.status_code == 404:
                 continue
             if not resp.ok:
-                log.warning(f"WC customer lookup failed for {email} (params={params}): {resp.status_code}")
+                log.warning(f"WC customer lookup {resp.status_code} for {email}")
                 continue
 
             data = resp.json()
             if data:
-                log.info(f"WC: found customer for {email} via params={list(params.keys())} (id={data[0]['id']})")
+                log.info(f"WC: found customer for {email} (id={data[0]['id']})")
                 return data[0]
 
         return None
 
-    def search_customer_by_email(self, email: str) -> dict | None:
+    # ================================================================== #
+    #  READ — subscription lookup (fast paths only)                      #
+    # ================================================================== #
+
+    @staticmethod
+    def _sub_id_from_customer_meta(customer: dict) -> int | None:
         """
-        Broader customer search via ?search= — handles edge cases where
-        ?email= fails (different casing, partial WP account, etc.).
-        Validates the returned customer's email matches.
+        Extract subscription_id from customer meta_data if present.
+        Most customers have this set at signup time.
         """
+        for meta in customer.get("meta_data", []):
+            if meta.get("key") == "subscription_id":
+                try:
+                    return int(meta["value"])
+                except (ValueError, TypeError):
+                    pass
+        return None
+
+    def _get_subscription_by_id(self, subscription_id: int) -> dict | None:
+        """Direct single-subscription lookup by ID. Always fast (~0.3s)."""
         try:
             resp = requests.get(
-                f"{self.base}/customers",
-                params={"search": email, "per_page": 10},
+                f"{self.base}/subscriptions/{subscription_id}",
                 auth=self.auth,
                 timeout=10,
             )
         except requests.exceptions.RequestException as e:
-            log.warning(f"WC customer search error for {email}: {e}")
+            log.warning(f"WC: direct sub lookup error for #{subscription_id}: {e}")
             return None
-
         if not resp.ok:
-            return None
-
-        data = resp.json()
-        if not isinstance(data, list):
-            return None
-
-        email_lower = email.lower().strip()
-        for customer in data:
-            if customer.get("email", "").lower().strip() == email_lower:
-                log.info(f"WC: found customer via ?search= for {email} (id={customer['id']})")
-                return customer
-
-        return None
-
-    def get_subscriptions(self, customer_id: int) -> list[dict] | None:
-        """
-        Return WooCommerce Subscriptions for a given customer ID.
-
-        Return values:
-        list[dict] — subscriptions found (may include non-active ones)
-        [] — confirmed empty: server responded OK with zero results
-             on BOTH passes (status-filtered + unfiltered)
-        None — uncertain: at least one pass timed out or errored.
-               Caller will ask for card digits rather than assuming no subscription exists.
-
-        Tries two passes:
-        1. With status filter (active,pending-cancel,on-hold,pending) — fast path.
-           If the server returns empty (filter may be ignored), falls through to pass 2.
-           On timeout → returns None immediately (no retry — fail fast to card digits).
-        2. Without status filter — catches all statuses when pass 1 returned empty OK.
-           On timeout → returns None.
-
-        TIMEOUT POLICY: 15 seconds, no retry.
-        The WC server is slow; waiting 30s × 2 = 60s per ticket before falling back
-        to card digits makes the bot unacceptably slow and creates timeouts in tests.
-        15s is generous enough for a healthy WC server; if it times out, we ask for
-        card digits immediately rather than waiting further.
-        """
-        # Pass 1: status-filtered query (lighter server load)
-        try:
-            resp = requests.get(
-                f"{self.base}/subscriptions",
-                params={
-                    "customer": customer_id,
-                    "per_page": 10,
-                    "status": "active,pending-cancel,on-hold,pending",
-                },
-                auth=self.auth,
-                timeout=15,
-            )
-            if resp.ok:
-                data = resp.json()
-                if data:
-                    return data
-                # Empty result — status filter may be unsupported. Fall through to pass 2.
-                log.info(
-                    f"WC: status-filtered query returned 0 subs for customer {customer_id} "
-                    "— retrying without status filter"
-                )
-            else:
-                log.warning(
-                    f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
-                )
-                # Fall through to pass 2 anyway — different params might succeed
-
-        except requests.exceptions.Timeout:
-            log.warning(
-                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1, 15s) "
-                "— returning timeout so caller can ask for card digits"
-            )
-            return None  # signal: uncertain — ask card digits
-
-        except requests.exceptions.RequestException as e:
-            log.warning(
-                f"WC subscriptions lookup error for customer {customer_id} (pass 1): {e}"
-                " — retrying without status filter"
-            )
-            # Fall through to pass 2
-
-        # Pass 2: unfiltered query — returns all statuses, Python will filter
-        try:
-            resp = requests.get(
-                f"{self.base}/subscriptions",
-                params={"customer": customer_id, "per_page": 20},
-                auth=self.auth,
-                timeout=15,
-            )
-        except requests.exceptions.Timeout:
-            log.warning(
-                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 2, 15s)"
-            )
-            return None  # uncertain — don't treat as confirmed empty
-        except requests.exceptions.RequestException as e:
-            log.warning(f"WC subscriptions lookup error for customer {customer_id} (pass 2): {e}")
-            return None
-
-        if not resp.ok:
-            log.warning(
-                f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
-            )
+            log.warning(f"WC: direct sub lookup failed #{subscription_id}: {resp.status_code}")
             return None
         return resp.json()
 
-    def get_subscriptions_by_billing_email(self, email: str) -> list[dict]:
+    def _find_subs_by_billing_email(self, email: str) -> list[dict]:
         """
-        Search subscriptions directly by billing email.
+        Search subscriptions by ?billing_email= ONLY (no ?search= fallback).
 
-        Fallback for cases where the customer's WooCommerce account email differs
-        from the billing email on the subscription (e.g. guest checkout, or the
-        customer changed their account email after subscribing).
+        ?billing_email= is fast (~1s) because WC Subscriptions plugin filters
+        server-side. ?search= is a full-text scan that times out — not used.
 
-        Strategy:
-        1. ?billing_email= with pagination (up to MAX_PAGES × 50 results).
-           WooCommerce Subscriptions plugin should filter server-side.
-           We trust this filter partially: subscriptions whose billing.email
-           matches are kept (strict); subscriptions whose billing.email is
-           EMPTY are also kept — WC often stores the email in WordPress post
-           meta (_billing_email) which is NOT returned in list API responses,
-           so billing.email is blank even for matching subscriptions.
-           If we see any subscription with a *non-empty, non-matching* billing
-           email we know the server-side filter is broken → reject whole page.
-        2. ?search= as secondary fallback (strict email validation only).
-
-        IMPORTANT: Always call cancel_subscription() via customer_id when possible
-        (?customer= filter) — that path is reliable. This method is last-resort.
-
-        Timeouts: billing_email pass = 15s, ?search= pass = 8s (fast-fail fallback).
+        Accepts:
+        - Subscriptions with exact billing.email match
+        - Subscriptions with empty billing.email (WC stores email in _billing_email
+          post meta which isn't in the REST response — trust server filter)
         """
         email_lower = email.lower().strip()
-        MAX_PAGES = 2  # scan up to 2 × 50 = 100 subscriptions per filter
-
-        # ── Pass 1: ?billing_email= with pagination ───────────────────── #
-        for page in range(1, MAX_PAGES + 1):
-            try:
-                resp = requests.get(
-                    f"{self.base}/subscriptions",
-                    params={"billing_email": email, "per_page": 50, "page": page},
-                    auth=self.auth,
-                    timeout=15,
-                )
-            except requests.exceptions.RequestException as e:
-                log.warning(f"WC billing_email lookup error for {email} page={page}: {e}")
-                break
-
-            if not resp.ok:
-                log.warning(f"WC billing_email lookup failed for {email}: {resp.status_code}")
-                break
-
-            data = resp.json()
-            if not isinstance(data, list) or not data:
-                break  # no more pages
-
-            exact_match = []
-            empty_email = []
-            filter_broken = False
-
-            for s in data:
-                if self._subscription_matches_email(s, email_lower):
-                    exact_match.append(s)
-                else:
-                    billing_email_in_response = s.get("billing", {}).get("email", "").strip()
-                    if billing_email_in_response:
-                        filter_broken = True
-                    else:
-                        empty_email.append(s)
-
-            if exact_match:
-                log.info(
-                    f"WC: found {len(exact_match)} subscription(s) with exact billing email "
-                    f"match for {email} (page {page}, total returned {len(data)})"
-                )
-                return exact_match
-
-            if empty_email and not filter_broken:
-                log.info(
-                    f"WC: ?billing_email= returned {len(empty_email)} subscription(s) with "
-                    f"empty billing.email for {email} page={page} — trusting server filter "
-                    f"(PayPal/post-meta-only billing email pattern)"
-                )
-                return empty_email
-
-            if filter_broken:
-                log.info(
-                    f"WC: ?billing_email= filter appears broken for {email} "
-                    f"(page {page} returned subscriptions with different billing emails) — "
-                    "not trusting results, skipping to ?search="
-                )
-                break
-
-            log.info(
-                f"WC: ?billing_email= page {page} returned {len(data)} sub(s), "
-                f"none matched {email} — trying next page"
-            )
-
-        # ── Pass 2: ?search= with individual-fetch fallback ───────────── #
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions",
-                params={"search": email, "per_page": 50},
+                params={"billing_email": email, "per_page": 50},
                 auth=self.auth,
-                timeout=8,  # fast-fail: ?search= is last-resort fallback
+                timeout=15,
             )
         except requests.exceptions.RequestException as e:
-            log.warning(f"WC ?search= lookup error for {email}: {e}")
+            log.warning(f"WC: billing_email lookup error for {email}: {e}")
             return []
 
         if not resp.ok:
+            log.warning(f"WC: billing_email lookup failed for {email}: {resp.status_code}")
             return []
 
         data = resp.json()
-        if not isinstance(data, list):
+        if not isinstance(data, list) or not data:
             return []
 
-        matched = []
+        exact = []
+        trusted_empty = []
+        has_wrong_email = False
+
         for s in data:
             if self._subscription_matches_email(s, email_lower):
-                matched.append(s)
-            elif not s.get("billing", {}).get("email", "").strip():
-                sub_id = s.get("id")
-                if not sub_id:
-                    continue
+                exact.append(s)
+            else:
+                be = s.get("billing", {}).get("email", "").strip()
+                if be:
+                    has_wrong_email = True
+                else:
+                    trusted_empty.append(s)
 
-                try:
-                    detail_resp = requests.get(
-                        f"{self.base}/subscriptions/{sub_id}",
-                        auth=self.auth,
-                        timeout=10,
-                    )
-                    if detail_resp.ok:
-                        detail = detail_resp.json()
-                        if self._subscription_matches_email(detail, email_lower):
-                            log.info(
-                                f"WC: ?search= sub #{sub_id} matched {email} "
-                                f"via individual detail fetch (meta_data._billing_email)"
-                            )
-                            matched.append(detail)
-                except requests.exceptions.RequestException as e:
-                    log.warning(f"WC: detail fetch error for sub #{sub_id}: {e}")
+        if exact:
+            log.info(
+                f"WC: billing_email found {len(exact)} exact match(es) for {email}"
+            )
+            return exact
 
-        if matched:
-            log.info(f"WC: found {len(matched)} subscription(s) via ?search= for {email}")
-        else:
-            log.info(f"WC: ?search= returned {len(data)} sub(s) for {email}, none matched after detail-fetch check")
-        return matched
+        if trusted_empty and not has_wrong_email:
+            log.info(
+                f"WC: billing_email returned {len(trusted_empty)} sub(s) with empty "
+                f"billing.email for {email} — trusting server filter"
+            )
+            return trusted_empty
+
+        if has_wrong_email:
+            log.info(
+                f"WC: billing_email returned subs with wrong emails for {email} "
+                "— server filter broken, discarding results"
+            )
+
+        return []
+
+    @staticmethod
+    def _subscription_matches_email(sub: dict, email_lower: str) -> bool:
+        """
+        Check if a subscription is associated with the given email.
+        Checks billing.email, meta_data._billing_email, meta_data.billing_email.
+        """
+        if sub.get("billing", {}).get("email", "").lower().strip() == email_lower:
+            return True
+        for meta in sub.get("meta_data", []):
+            if meta.get("key") in ("_billing_email", "billing_email"):
+                if meta.get("value", "").lower().strip() == email_lower:
+                    return True
+        return False
+
+    # ================================================================== #
+    #  READ — order count (for trial vs subscription detection)          #
+    # ================================================================== #
 
     def get_order_count(self, subscription_id: int) -> int | None:
         """
-        Return the number of orders (initial + renewals) attached to a subscription.
-
-        We only need to know whether count == 1 or > 1, so per_page=2 is enough:
-        - 1 result → orders == 1 (customer signed up but no renewal charged yet)
-        - 2 results → orders >= 2 (at least one renewal → definitely a paid subscription)
-
-        Returns None on timeout or API error (caller falls back to date-only logic).
+        Return number of orders for a subscription.
+        1 order = trial, 2+ orders = paid subscription (at least one renewal).
         """
         try:
             resp = requests.get(
@@ -361,13 +219,10 @@ class WooCommerceClient:
                 timeout=10,
             )
         except requests.exceptions.RequestException as e:
-            log.warning(f"WC: order count lookup error for sub #{subscription_id}: {e}")
+            log.warning(f"WC: order count error for sub #{subscription_id}: {e}")
             return None
 
         if not resp.ok:
-            log.warning(
-                f"WC: order count lookup failed for sub #{subscription_id}: {resp.status_code}"
-            )
             return None
 
         data = resp.json()
@@ -377,68 +232,29 @@ class WooCommerceClient:
         total_header = resp.headers.get("X-WP-Total")
         if total_header is not None:
             try:
-                count = int(total_header)
-                log.info(
-                    f"WC: sub #{subscription_id} has {count} order(s) "
-                    f"(via X-WP-Total header)"
-                )
-                return count
+                return int(total_header)
             except ValueError:
                 pass
 
-        count = len(data)
-        log.info(
-            f"WC: sub #{subscription_id} has {count} order(s) "
-            f"(fetched up to 2, no X-WP-Total header)"
-        )
-        return count
+        return len(data)
 
-    @staticmethod
-    def _subscription_matches_email(sub: dict, email_lower: str) -> bool:
-        """
-        Check if a subscription is associated with the given email (lowercased).
-
-        Checks in order:
-        1. billing.email (REST API billing address field)
-        2. meta_data._billing_email (WordPress post meta — the canonical store,
-           sometimes differs from billing.email for PayPal subscriptions)
-        3. meta_data.billing_email (alternate meta key used by some plugins)
-        """
-        if sub.get("billing", {}).get("email", "").lower().strip() == email_lower:
-            return True
-
-        for meta in sub.get("meta_data", []):
-            if meta.get("key") in ("_billing_email", "billing_email"):
-                if meta.get("value", "").lower().strip() == email_lower:
-                    return True
-
-        return False
-
-    # ------------------------------------------------------------------ #
-    # Trial detection #
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    #  Trial detection                                                   #
+    # ================================================================== #
 
     @staticmethod
     def _get_sub_type(subscription: dict, order_count: int | None = None) -> str:
         """
         Determine whether subscription is a "trial" or "subscription".
 
-        Primary rules (order_count + days_since_start are the reliable signals):
-        0. order_count > 1 → "subscription"
-           Can't be a trial if more than one order has been charged.
+        Rules:
+        0. order_count > 1 → "subscription" (renewal happened)
         1. order_count ≤ 1 AND days_since_start ≤ 8 → "trial"
-           Single order, signed up within 8 days → genuine free trial.
-           NOTE: trial_end_date is intentionally NOT checked here because WC
-           does not always populate it for Stripe Multi Sync subscriptions.
         2. order_count ≤ 1 AND days_since_start > 8 → "subscription"
-           Been active too long to be a fresh trial.
-
-        Fallback (no start_date available):
-        3. trial_end_date set AND order_count == 1 → "trial"
-        4. Everything else → "subscription" (safe default)
+        3. Fallback: trial_end in future + order_count ≤ 1 → "trial"
+        4. Default → "subscription"
         """
         if order_count is not None and order_count > 1:
-            log.info(f"WC sub_type: order_count={order_count} > 1 → subscription")
             return "subscription"
 
         start_raw = (
@@ -452,22 +268,16 @@ class WooCommerceClient:
             return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
         now = datetime.now(timezone.utc)
-
         start_dt = None
         if start_raw and not start_raw.startswith("0000"):
             try:
                 start_dt = _parse(start_raw)
-            except (ValueError, AttributeError) as e:
-                log.warning(f"WC: could not parse start_date {start_raw!r}: {e}")
+            except (ValueError, AttributeError):
+                pass
 
         if start_dt is not None:
             days_since_start = (now - start_dt).days
             is_trial = (order_count is None or order_count <= 1) and days_since_start <= 8
-            log.info(
-                f"WC sub_type: order_count={order_count}, "
-                f"days_since_start={days_since_start} "
-                f"→ {'trial' if is_trial else 'subscription'}"
-            )
             return "trial" if is_trial else "subscription"
 
         trial_end_raw = (
@@ -475,30 +285,19 @@ class WooCommerceClient:
             or subscription.get("trial_end_date")
             or ""
         )
-
         if trial_end_raw and not trial_end_raw.startswith("0000") and (order_count is None or order_count <= 1):
             try:
                 trial_end_dt = _parse(trial_end_raw)
                 if trial_end_dt > now:
-                    log.info(
-                        f"WC sub_type: no start_date, trial_end in future "
-                        f"({trial_end_raw}), order_count≤1 → trial"
-                    )
                     return "trial"
-                else:
-                    log.info(
-                        f"WC sub_type: no start_date, trial_end already past "
-                        f"({trial_end_raw}) → subscription"
-                    )
-            except (ValueError, AttributeError) as e:
-                log.warning(f"WC: could not parse trial_end in fallback {trial_end_raw!r}: {e}")
+            except (ValueError, AttributeError):
+                pass
 
-        log.info("WC sub_type: no usable start_date → subscription (safe default)")
         return "subscription"
 
-    # ------------------------------------------------------------------ #
-    # Write operation #
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    #  WRITE — cancel subscription                                       #
+    # ================================================================== #
 
     def _cancel_sub_by_id(self, subscription_id: int) -> dict:
         """PUT status=cancelled for a single subscription."""
@@ -519,84 +318,38 @@ class WooCommerceClient:
             )
         except requests.exceptions.RequestException as e:
             log.error(f"WC cancel network error for #{subscription_id}: {e}")
-            return {
-                "status": "error",
-                "subscription_id": subscription_id,
-                "cancelled": False,
-                "error": str(e),
-            }
+            return {"status": "error", "subscription_id": subscription_id,
+                    "cancelled": False, "error": str(e)}
 
         if not resp.ok:
-            log.error(
-                f"WC cancel failed for #{subscription_id}: {resp.status_code} {resp.text[:200]}"
-            )
-            return {
-                "status": "error",
-                "subscription_id": subscription_id,
-                "cancelled": False,
-                "error": resp.text[:300],
-            }
+            log.error(f"WC cancel failed #{subscription_id}: {resp.status_code}")
+            return {"status": "error", "subscription_id": subscription_id,
+                    "cancelled": False, "error": resp.text[:300]}
 
         log.info(f"WC: cancelled subscription #{subscription_id}")
-        return {
-            "status": "cancelled",
-            "subscription_id": subscription_id,
-            "cancelled": True,
-        }
+        return {"status": "cancelled", "subscription_id": subscription_id,
+                "cancelled": True}
 
-    # ------------------------------------------------------------------ #
-    # Fast-path helpers #
-    # ------------------------------------------------------------------ #
-
-    @staticmethod
-    def _sub_id_from_customer_meta(customer: dict) -> int | None:
-        """
-        Many WC customers have 'subscription_id' stored in their meta_data
-        (set at signup time). Extracting it lets us do a direct
-        /subscriptions/{id} lookup (~0.3s) instead of slow search queries.
-        """
-        for meta in customer.get("meta_data", []):
-            if meta.get("key") == "subscription_id":
-                try:
-                    return int(meta["value"])
-                except (ValueError, TypeError):
-                    pass
-        return None
-
-    def _get_subscription_by_id(self, subscription_id: int) -> dict | None:
-        """Direct single-subscription lookup by ID. Very fast (~0.3s)."""
-        try:
-            resp = requests.get(
-                f"{self.base}/subscriptions/{subscription_id}",
-                auth=self.auth,
-                timeout=10,
-            )
-        except requests.exceptions.RequestException as e:
-            log.warning(f"WC: direct sub lookup error for #{subscription_id}: {e}")
-            return None
-        if not resp.ok:
-            log.warning(f"WC: direct sub lookup failed for #{subscription_id}: {resp.status_code}")
-            return None
-        return resp.json()
-
-    # ------------------------------------------------------------------ #
-    # Main public method #
-    # ------------------------------------------------------------------ #
+    # ================================================================== #
+    #  MAIN PUBLIC METHOD                                                #
+    # ================================================================== #
 
     def cancel_subscription(self, email: str) -> dict:
         """
-        Find the customer by email, determine trial vs. paid subscription,
-        and cancel appropriately.
+        Find customer → find subscription → cancel.
 
-        DRY_RUN: still performs real READ operations (lookup), but skips the
-        actual cancel write. This way we always know the true subscription state.
+        Uses ONLY fast WC API endpoints:
+          1. /customers?email=         (~0.3s)
+          2. /subscriptions/{id}       (~0.3s) — via meta_data subscription_id
+          3. /subscriptions?billing_email= (~1s)
 
-        Return dict:
-        status : "trial_cancelled" | "subscription_cancelled" |
-                 "dry_run" | "not_found" | "no_active_sub" | "timeout" | "error"
+        Does NOT use slow endpoints that timeout on this server:
+          ✗ /customers?search=         (10s+ timeout)
+          ✗ /subscriptions?search=     (8s+ timeout)
+          ✗ /subscriptions?customer=   (15s+ timeout)
 
-        "timeout" — WC subscription lookup timed out; caller should try Stripe
-        directly without assuming the customer has no subscription.
+        If subscription not found → returns "not_found" → bot asks customer
+        for last 4 card digits → Stripe finds email → we try again.
         """
         base_result = {
             "email": email,
@@ -607,97 +360,75 @@ class WooCommerceClient:
             "plan": "",
         }
 
-        log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
+        log.info(f"{'[DRY] ' if self.dry_run else ''}WC cancel for {email}")
 
-        # ── Step 1: get customer account (fast, ~0.3s) ────────────────── #
+        # ── Step 1: customer lookup (fast, ~0.3s) ─────────────────────── #
         customer = self.get_customer_by_email(email)
-        if not customer:
-            customer = self.search_customer_by_email(email)
-        customer_id = customer["id"] if customer else None
-
-        # ── Step 2: subscription lookup — 3-tier, fastest-first ───────── #
-        #
-        # Tier A  (~0.3s): subscription_id stored in customer meta_data
-        #   → direct GET /subscriptions/{id}  — single-row lookup, always fast
-        #   → covers most customers (set at signup)
-        #
-        # Tier B  (~1s):   GET /subscriptions?billing_email=EMAIL
-        #   → WC stores billing email on the subscription post, not on the
-        #     customer account — this query is indexed and fast
-        #   → catches guests / customers whose meta_data sub ID is missing
-        #
-        # Tier C  (~15s):  GET /subscriptions?customer=ID
-        #   → last resort; often returns 0 results and is slow (no index on
-        #     customer_id in WC Subscriptions). Only used if A+B both empty.
-        #   → returns None on timeout → caller asks for card digits
-        #
         all_subs: list[dict] | None = None
 
-        # ── Tier A: meta_data fast path ───────────────────────────────── #
+        # ── Step 2a: direct subscription from meta_data (~0.3s) ───────── #
         if customer:
             meta_sub_id = self._sub_id_from_customer_meta(customer)
             if meta_sub_id:
                 sub = self._get_subscription_by_id(meta_sub_id)
                 if sub:
                     log.info(
-                        f"WC: Tier-A hit — direct sub #{meta_sub_id} "
-                        f"from customer meta_data for {email}"
+                        f"WC: found sub #{meta_sub_id} via customer meta_data "
+                        f"(status={sub.get('status')})"
                     )
                     all_subs = [sub]
+                else:
+                    log.info(
+                        f"WC: meta_data had subscription_id={meta_sub_id} "
+                        f"but direct lookup failed"
+                    )
+            else:
+                log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Tier B: billing_email query ───────────────────────────────── #
+        # ── Step 2b: billing_email query (~1s) ────────────────────────── #
         if not all_subs:
-            billing_subs = self.get_subscriptions_by_billing_email(email)
+            billing_subs = self._find_subs_by_billing_email(email)
             if billing_subs:
                 log.info(
-                    f"WC: Tier-B hit — {len(billing_subs)} sub(s) via "
-                    f"billing_email for {email}"
+                    f"WC: found {len(billing_subs)} sub(s) via billing_email"
                 )
                 all_subs = billing_subs
 
-        # ── Tier C: customer_id query (last resort) ───────────────────── #
-        if not all_subs and customer_id is not None:
-            log.info(
-                f"WC: Tiers A+B empty for {email} — "
-                f"falling back to customer_id={customer_id} (slow)"
-            )
-            id_subs = self.get_subscriptions(customer_id)
-            if id_subs is None:
-                log.warning(
-                    f"WC: Tier-C timed out for customer #{customer_id} ({email})"
-                )
-                return {**base_result, "status": "timeout"}
-            if id_subs:
-                log.info(
-                    f"WC: Tier-C hit — {len(id_subs)} sub(s) via "
-                    f"customer_id for {email}"
-                )
-                all_subs = id_subs
+        # ── No more fallbacks. Slow queries (?search=, ?customer=) are   #
+        #    not used — they always timeout on this server.               #
+        #    If not found → bot asks for card digits → Stripe → WC retry  #
 
         if not all_subs:
-            log.info(f"WC: no subscriptions found for {email} (all 3 tiers exhausted)")
-            return {**base_result, "status": "not_found"}
+            if customer:
+                log.info(f"WC: customer found for {email} but no subscription")
+                return {**base_result, "status": "no_active_sub"}
+            else:
+                log.info(f"WC: no customer and no subscription for {email}")
+                return {**base_result, "status": "not_found"}
 
+        # ── Step 3: filter active subscriptions ───────────────────────── #
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
 
         if not active_subs:
-            cancelled_subs = [s for s in all_subs if s.get("status") == "cancelled"]
+            # Check for already-cancelled subscriptions
+            cancelled_subs = [
+                s for s in all_subs if s.get("status") == "cancelled"
+            ]
             if cancelled_subs:
                 cancelled_subs.sort(
-                    key=lambda s: s.get("start_date_gmt") or s.get("start_date") or "",
+                    key=lambda s: s.get("start_date_gmt") or "",
                     reverse=True,
                 )
                 target = cancelled_subs[0]
                 order_count = self.get_order_count(target["id"])
                 sub_type = self._get_sub_type(target, order_count=order_count)
                 plan = ""
-                line_items = target.get("line_items") or []
-                if line_items:
-                    plan = line_items[0].get("name", "")
+                li = target.get("line_items") or []
+                if li:
+                    plan = li[0].get("name", "")
 
                 log.info(
-                    f"WC: no active subs for {email} — "
-                    f"found already-cancelled sub #{target['id']} "
+                    f"WC: already-cancelled sub #{target['id']} "
                     f"(type={sub_type}, orders={order_count})"
                 )
                 return {
@@ -709,44 +440,48 @@ class WooCommerceClient:
                     "plan": plan or "IQ Test Subscription",
                 }
 
-            log.info(f"WC: no active subscriptions for {email}")
+            log.info(f"WC: subscriptions found but none active for {email}")
             return {**base_result, "status": "no_active_sub"}
 
+        # ── Step 4: pick best subscription to cancel ──────────────────── #
         typed_subs = []
         for s in active_subs:
             order_count = self.get_order_count(s["id"])
             typed_subs.append((s, self._get_sub_type(s, order_count=order_count)))
 
-        def _select_priority(entry: tuple) -> tuple:
-            sub, sub_type = entry
-            status = sub.get("status", "")
-            if status == "pending-cancel" and sub_type == "subscription":
-                return (0,)
-            elif status == "active" and sub_type == "subscription":
-                return (1,)
-            elif status == "pending-cancel" and sub_type == "trial":
-                return (2,)
-            elif sub_type == "subscription":
-                return (3,)
-            elif sub_type == "trial":
-                return (4,)
-            else:
-                return (5,)
+        def _priority(entry: tuple) -> int:
+            sub, stype = entry
+            st = sub.get("status", "")
+            if st == "pending-cancel" and stype == "subscription":
+                return 0
+            if st == "active" and stype == "subscription":
+                return 1
+            if st == "pending-cancel" and stype == "trial":
+                return 2
+            if stype == "subscription":
+                return 3
+            if stype == "trial":
+                return 4
+            return 5
 
-        typed_subs.sort(key=_select_priority)
+        typed_subs.sort(key=_priority)
         target, sub_type = typed_subs[0]
 
         plan = ""
-        line_items = target.get("line_items") or []
-        if line_items:
-            plan = line_items[0].get("name", "")
+        li = target.get("line_items") or []
+        if li:
+            plan = li[0].get("name", "")
 
+        # ── Step 5: cancel ────────────────────────────────────────────── #
         cancel = self._cancel_sub_by_id(target["id"])
 
         if self.dry_run:
             status_label = "dry_run"
         elif cancel["cancelled"]:
-            status_label = "trial_cancelled" if sub_type == "trial" else "subscription_cancelled"
+            status_label = (
+                "trial_cancelled" if sub_type == "trial"
+                else "subscription_cancelled"
+            )
         else:
             status_label = cancel.get("status", "error")
 
