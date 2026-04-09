@@ -1082,11 +1082,12 @@ _REFUND_KEYWORDS = [
     "心当たりがございません", # polite variant
     "心当たりがありません", # another polite variant
     "身に覚えがありません", # polite variant of 身に覚えがない
-    "覚えがありません", # polite "I don't recall"
-    "覚えがございません", # formal polite variant
+    # NOTE: removed generic "覚えがありません" / "覚えがございません" — too broad,
+    # matches innocent "入会した覚えがありません" (don't recall signing up = trial cancel).
+    # Specific variants like 身に覚えがありません, 利用した覚えがない are kept.
     "気づかなかった", # "I didn't notice" (the charge)
-    "知りませんでした", # "I didn't know about it"
-    "知らなかった", # "I didn't know"
+    # NOTE: removed generic "知りませんでした" / "知らなかった" — too broad,
+    # customer may say "I didn't know how to cancel" which is not a refund signal.
     "把握していなかった", # "I wasn't aware"
     "引き落とされている", # "is being deducted" — customer noticing unexpected ongoing charge
     "引き落とされていた", # past tense variant
