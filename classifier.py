@@ -176,21 +176,42 @@ _FALLBACK = {
 
 
 def classify_ticket(subject: str, body: str) -> dict:
-    import logging
+    import logging, time
     log = logging.getLogger("classifier")
 
-    try:
-        response = _client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=200,
-            messages=[{
-                "role": "user",
-                "content": f"{PROMPT}\n\nSubject: {subject}\n\nBody:\n{body[:1500]}"
-            }]
-        )
-    except Exception as e:
-        log.error(f"classify_ticket API error: {e}")
-        return {**_FALLBACK, "reasoning": f"API error: {e}"}
+    # Retry up to 3 times on 529 overloaded; immediate fail on other errors.
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = _client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=200,
+                messages=[{
+                    "role": "user",
+                    "content": f"{PROMPT}\n\nSubject: {subject}\n\nBody:\n{body[:1500]}"
+                }]
+            )
+            last_err = None
+            break  # success
+        except Exception as e:
+            last_err = e
+            # 529 = Anthropic overloaded — worth retrying after a short pause
+            status = getattr(e, "status_code", None)
+            if status == 529 and attempt < 2:
+                wait = 3 * (attempt + 1)  # 3s, 6s
+                log.warning(
+                    f"classify_ticket: Anthropic overloaded (529), "
+                    f"retry {attempt + 1}/2 in {wait}s…"
+                )
+                time.sleep(wait)
+                continue
+            # Any other error (auth, network, etc.) — fail immediately
+            log.error(f"classify_ticket API error: {e}")
+            return {**_FALLBACK, "reasoning": f"API error: {e}"}
+
+    if last_err is not None:
+        log.error(f"classify_ticket: all retries exhausted — {last_err}")
+        return {**_FALLBACK, "reasoning": f"overloaded after retries: {last_err}"}
 
     raw_text = response.content[0].text
 
