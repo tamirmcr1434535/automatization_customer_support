@@ -157,12 +157,18 @@ def _process(ticket_id: str) -> dict:
         result["status"] = "skipped_already_handled"
         return result
 
-    # 2b. Skip merged-away tickets (Zendesk adds 'merge' tag to the donor ticket
-    # when it is merged into another ticket). The donor has no actionable content —
-    # all conversation was moved to the target ticket which will be processed separately.
+    # 2b. Skip merged-away tickets.
+    # Detection 1: Zendesk adds 'merge' tag to the donor ticket.
     if "merge" in tags:
         log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: merge)")
         result["status"] = "skipped_merged"
+        return result
+
+    # Detection 2: Merged donor tickets are set to "closed" by Zendesk.
+    # This catches merges where the webhook fires before the tag is applied.
+    if ticket_status == "closed":
+        log.info(f"[{ticket_id}] Skipping — ticket status is 'closed' (likely merged)")
+        result["status"] = "skipped_closed"
         return result
 
     # 2c. Skip if a human agent already replied publicly.
@@ -195,6 +201,48 @@ def _process(ticket_id: str) -> dict:
     intent     = classification["intent"]
     language   = classification["language"]
     confidence = classification["confidence"]
+
+    # 3b. Safety net: if classifier returned UNKNOWN but body contains clear cancel/refund
+    # signals, override to prevent valid tickets from being silently skipped.
+    # This catches edge cases where Claude misclassifies (e.g. image attachment noise,
+    # short body with strong signals like "解約したのに...返金してほしい").
+    if intent == "UNKNOWN":
+        full_text_lower = (subject + " " + body).lower()
+        _CANCEL_KEYWORD_FALLBACK = [
+            "cancel", "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい",
+            "취소", "해지", "탈퇴", "kündigen", "stornieren", "annuleren", "opzeggen",
+            "annuler", "cancelar", "отменить", "delete my account", "close my account",
+        ]
+        _REFUND_KEYWORD_FALLBACK = [
+            "refund", "返金", "払い戻し", "クーリングオフ", "お金を返して", "geld zurück",
+            "rückerstattung", "widerruf", "remboursement", "환불", "reembolso", "возврат",
+            "rimborso", "money back", "chargeback",
+        ]
+        has_cancel = any(kw in full_text_lower for kw in _CANCEL_KEYWORD_FALLBACK)
+        has_refund = any(kw in full_text_lower for kw in _REFUND_KEYWORD_FALLBACK)
+
+        if has_cancel:
+            log.info(
+                f"[{ticket_id}] Classifier returned UNKNOWN but cancel signal found "
+                "→ overriding to TRIAL_CANCELLATION (safety net)"
+            )
+            intent = "TRIAL_CANCELLATION"
+            classification["intent"] = intent
+            classification["reasoning"] = (
+                f"classifier fallback: UNKNOWN overridden — "
+                f"cancel keyword detected in body"
+            )
+        elif has_refund:
+            log.info(
+                f"[{ticket_id}] Classifier returned UNKNOWN but refund signal found "
+                "→ overriding to REFUND_REQUEST (safety net)"
+            )
+            intent = "REFUND_REQUEST"
+            classification["intent"] = intent
+            classification["reasoning"] = (
+                f"classifier fallback: UNKNOWN overridden — "
+                f"refund keyword detected in body"
+            )
 
     result.update({
         "intent": intent,
@@ -314,6 +362,15 @@ def _process(ticket_id: str) -> dict:
     # 5. Low confidence → escalate
     if confidence < 0.65:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent")
+
+        # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
+        # when Zendesk fires multiple webhooks in rapid succession.
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skipping duplicate")
+            result["status"] = "skipped_race_condition"
+            return result
+
         zendesk.add_tag(ticket_id, "bot_handled") # first — blocks webhook re-fires
         zendesk.add_tag(ticket_id, "bot_low_confidence")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
@@ -323,13 +380,14 @@ def _process(ticket_id: str) -> dict:
             "Please review and handle manually.",
         )
         zendesk.set_open(ticket_id)
-        slack.notify_manual_review(
+        slack_sent = slack.notify_manual_review(
             ticket_id=ticket_id,
             email=email,
             intent=intent,
             zendesk_subdomain=ZENDESK_SUBDOMAIN,
         )
         result["status"] = "escalated_low_confidence"
+        result["slack_sent"] = slack_sent
         log_result(result)
         return result
 
@@ -360,6 +418,15 @@ def _process(ticket_id: str) -> dict:
 
         # No working alt email → Slack alert for manual review
         log.info(f"[{ticket_id}] No alt email worked → Slack alert + escalate to agent")
+
+        # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
+        # when Zendesk fires multiple webhooks in rapid succession (same fix as card-digits).
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skipping duplicate")
+            result["status"] = "skipped_race_condition"
+            return result
+
         zendesk.add_tag(ticket_id, "bot_handled") # first — blocks webhook re-fires
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
@@ -370,7 +437,7 @@ def _process(ticket_id: str) -> dict:
             "Please review and handle manually.",
         )
         zendesk.set_open(ticket_id)
-        slack.notify_manual_review(
+        slack_sent = slack.notify_manual_review(
             ticket_id=ticket_id,
             email=email,
             intent=intent,
@@ -379,6 +446,7 @@ def _process(ticket_id: str) -> dict:
         result.update({
             "status": "manual_review_required",
             "action": "slack_alerted_no_active_sub",
+            "slack_sent": slack_sent,
         })
         log_result(result)
         return result
