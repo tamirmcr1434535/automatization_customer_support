@@ -13,7 +13,6 @@ Logic:
 """
 
 import logging
-import time
 import requests
 from datetime import datetime, timezone
 
@@ -122,80 +121,61 @@ class WooCommerceClient:
         [] — confirmed empty: server responded OK with zero results
              on BOTH passes (status-filtered + unfiltered)
         None — uncertain: at least one pass timed out or errored.
-               Caller should NOT assume "no subscription exists" and
-               should skip to the next data source (Stripe) rather
-               than wasting time on further WC fallbacks.
+               Caller will ask for card digits rather than assuming no subscription exists.
 
         Tries two passes:
-        1. With status filter (active,pending-cancel,on-hold,pending) — fast.
-           Some WC Subscriptions plugin versions accept comma-separated statuses;
-           if the query returns empty (filter may be ignored), fall through to
-           pass 2. If the query TIMES OUT, retry once after a short delay before
-           giving up and returning None.
-        2. Without status filter — catches all statuses when pass 1 returned
-           an unexpectedly empty OK response.
-           Returns None on timeout/error.
+        1. With status filter (active,pending-cancel,on-hold,pending) — fast path.
+           If the server returns empty (filter may be ignored), falls through to pass 2.
+           On timeout → returns None immediately (no retry — fail fast to card digits).
+        2. Without status filter — catches all statuses when pass 1 returned empty OK.
+           On timeout → returns None.
 
-        FIX: timeout increased 10s → 30s to accommodate slow WC server responses.
-        FIX: pass 1 retries once after 2s on timeout before returning None.
+        TIMEOUT POLICY: 15 seconds, no retry.
+        The WC server is slow; waiting 30s × 2 = 60s per ticket before falling back
+        to card digits makes the bot unacceptably slow and creates timeouts in tests.
+        15s is generous enough for a healthy WC server; if it times out, we ask for
+        card digits immediately rather than waiting further.
         """
-        pass1_timed_out = False
-
         # Pass 1: status-filtered query (lighter server load)
-        # Attempt up to 2 times before giving up.
-        for attempt in range(1, 3):
-            try:
-                resp = requests.get(
-                    f"{self.base}/subscriptions",
-                    params={
-                        "customer": customer_id,
-                        "per_page": 10,
-                        "status": "active,pending-cancel,on-hold,pending",
-                    },
-                    auth=self.auth,
-                    timeout=30,  # FIX: was 10s — WC server can be slow under load
+        try:
+            resp = requests.get(
+                f"{self.base}/subscriptions",
+                params={
+                    "customer": customer_id,
+                    "per_page": 10,
+                    "status": "active,pending-cancel,on-hold,pending",
+                },
+                auth=self.auth,
+                timeout=15,
+            )
+            if resp.ok:
+                data = resp.json()
+                if data:
+                    return data
+                # Empty result — status filter may be unsupported. Fall through to pass 2.
+                log.info(
+                    f"WC: status-filtered query returned 0 subs for customer {customer_id} "
+                    "— retrying without status filter"
                 )
-                if resp.ok:
-                    data = resp.json()
-                    if data:
-                        return data
-                    # Empty result — may mean status filter unsupported. Fall through.
-                    log.info(
-                        f"WC: status-filtered query returned 0 subs for customer {customer_id} "
-                        "— retrying without status filter"
-                    )
-                else:
-                    log.warning(
-                        f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
-                    )
-                break  # got a response (even empty/error) — don't retry pass 1
-
-            except requests.exceptions.Timeout:
-                if attempt == 1:
-                    log.warning(
-                        f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1, attempt {attempt}) "
-                        f"— retrying in 2s"
-                    )
-                    time.sleep(2)
-                    continue  # retry
-                else:
-                    # Second timeout — give up on pass 1
-                    log.warning(
-                        f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1, attempt {attempt}) "
-                        "— skipping pass 2, caller should try Stripe"
-                    )
-                    pass1_timed_out = True
-                    break
-
-            except requests.exceptions.RequestException as e:
+            else:
                 log.warning(
-                    f"WC subscriptions lookup error for customer {customer_id} (pass 1): {e}"
-                    " — retrying without status filter"
+                    f"WC subscriptions lookup failed for customer {customer_id}: {resp.status_code}"
                 )
-                break
+                # Fall through to pass 2 anyway — different params might succeed
 
-        if pass1_timed_out:
-            return None  # signal: uncertain, skip further WC lookups
+        except requests.exceptions.Timeout:
+            log.warning(
+                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 1, 15s) "
+                "— returning timeout so caller can ask for card digits"
+            )
+            return None  # signal: uncertain — ask card digits
+
+        except requests.exceptions.RequestException as e:
+            log.warning(
+                f"WC subscriptions lookup error for customer {customer_id} (pass 1): {e}"
+                " — retrying without status filter"
+            )
+            # Fall through to pass 2
 
         # Pass 2: unfiltered query — returns all statuses, Python will filter
         try:
@@ -203,11 +183,11 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"customer": customer_id, "per_page": 20},
                 auth=self.auth,
-                timeout=30,  # FIX: was 10s
+                timeout=15,
             )
         except requests.exceptions.Timeout:
             log.warning(
-                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 2)"
+                f"WC subscriptions lookup TIMED OUT for customer {customer_id} (pass 2, 15s)"
             )
             return None  # uncertain — don't treat as confirmed empty
         except requests.exceptions.RequestException as e:
