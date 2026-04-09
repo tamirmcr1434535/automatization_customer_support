@@ -227,3 +227,139 @@ class SlackClient:
         else:
             log.error(f"Slack: not_found alert FAILED for ticket #{ticket_id}")
         return sent
+
+    def notify_refund_skip(
+        self,
+        ticket_id: str,
+        email: str,
+        intent: str,
+        zendesk_subdomain: str,
+    ) -> bool:
+        """Alert: ticket skipped because refund keywords detected — human must review."""
+        ticket_url = (
+            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
+        )
+        text = (
+            f"💰 *Refund Request — Skipped* | Ticket <{ticket_url}|#{ticket_id}> "
+            f"| `{email}` | {intent.replace('_', ' ').title()}"
+        )
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "💰 Refund Request — Needs Human Review"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
+                    {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
+                    {"type": "mrkdwn", "text": f"*Detected Intent:*\n{intent.replace('_', ' ').title()}"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Customer message contains refund/payment-related keywords. "
+                        "Bot skipped this ticket — please handle manually."
+                    ),
+                },
+            },
+            {"type": "divider"},
+        ]
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: refund_skip alert SENT for ticket #{ticket_id}")
+        else:
+            log.error(f"Slack: refund_skip alert FAILED for ticket #{ticket_id}")
+        return sent
+
+    def notify_error(
+        self,
+        ticket_id: str,
+        error_msg: str,
+        zendesk_subdomain: str,
+    ) -> bool:
+        """Alert: bot crashed while processing a ticket."""
+        ticket_url = (
+            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
+        )
+        text = (
+            f"🔴 *Bot Error* | Ticket <{ticket_url}|#{ticket_id}> "
+            f"| `{error_msg[:200]}`"
+        )
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": "🔴 Bot Error — Processing Failed"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
+                    {"type": "mrkdwn", "text": f"*Error:*\n```{error_msg[:300]}```"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": "Bot encountered an unhandled error. Ticket may need manual review.",
+                },
+            },
+            {"type": "divider"},
+        ]
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: error alert SENT for ticket #{ticket_id}")
+        else:
+            log.error(f"Slack: error alert FAILED for ticket #{ticket_id}")
+        return sent
+
+    def notify_spam_detected(
+        self,
+        ticket_id: str,
+        email: str,
+        reply_count: int,
+        zendesk_subdomain: str,
+    ) -> bool:
+        """Alert: bot has already replied 2+ times to this ticket — possible spam loop."""
+        ticket_url = (
+            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
+        )
+        text = (
+            f"🔁 *Spam Alert — {reply_count} Bot Replies* | "
+            f"Ticket <{ticket_url}|#{ticket_id}> | `{email}`"
+        )
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"🔁 Spam Alert — Bot Replied {reply_count}x"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
+                    {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
+                    {"type": "mrkdwn", "text": f"*Bot Replies:*\n{reply_count}"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Bot has sent multiple replies to this ticket. "
+                        "Possible webhook loop or re-trigger. Please investigate."
+                    ),
+                },
+            },
+            {"type": "divider"},
+        ]
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: spam alert SENT for ticket #{ticket_id} ({reply_count} replies)")
+        else:
+            log.error(f"Slack: spam alert FAILED for ticket #{ticket_id}")
+        return sent
