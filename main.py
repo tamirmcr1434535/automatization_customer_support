@@ -7,7 +7,9 @@ Cancellation flow:
  2. WC: not found / timeout / error
     → extract any emails mentioned in ticket body → try each one in WC
     └─ Found by alt email → cancel in WC → done ✅
- 3. Still not found → ask for last 4 card digits (tag: awaiting_card_digits)
+ 3. Still not found in WC → Stripe fallback by email
+    └─ Stripe found and cancelled → done ✅
+ 4. Still not found → ask for last 4 card digits (tag: awaiting_card_digits)
     └─ 7 days no reply → Zendesk Automation closes ticket
     └─ Customer replied with last4:
        ├─ Stripe: find email by last4 → WC: cancel with that email → done ✅
@@ -17,8 +19,9 @@ Cancellation flow:
              ├─ Stripe: find email by last4 → WC: cancel with that email → done ✅
              └─ Not found → close ticket
 
-NOTE: Stripe is used ONLY as an email-lookup tool via card last4 digits.
-      All subscription cancellations happen in WooCommerce.
+NOTE: WooCommerce is the primary cancellation target. Stripe is used as:
+      (a) email-based fallback when WC lookup fails (step 3)
+      (b) email-lookup tool via card last4 digits (step 4)
 """
 
 import os
@@ -54,8 +57,11 @@ AWAITING_CARD_DAYS = int(os.getenv("AWAITING_CARD_DAYS", "7"))
 HANDLED_INTENTS = {
     "TRIAL_CANCELLATION",
     "SUB_CANCELLATION",
-    "SUB_RENEWAL_CANCELLATION",
 }
+
+# Max order count for bot to handle. Subscriptions with >= this many orders
+# are renewals that require manual review (refund assessment, etc.).
+MAX_BOT_ORDERS = 2
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
@@ -416,8 +422,34 @@ def _process(ticket_id: str) -> dict:
         if alt_found:
             return alt_found
 
-        # No working alt email → Slack alert for manual review
-        log.info(f"[{ticket_id}] No alt email worked → Slack alert + escalate to agent")
+        # ── Stripe fallback for no_active_sub ─────────────────────────── #
+        # WC found the customer but no active subscription. Try Stripe —
+        # the sub might be managed in Stripe but not reflected in WC.
+        log.info(f"[{ticket_id}] No alt email worked → trying Stripe by email")
+        stripe_result = stripe_cli.cancel_subscription(email)
+        stripe_status = stripe_result.get("status", "")
+
+        if stripe_status not in ("not_found", "no_active_sub", "error"):
+            log.info(
+                f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
+                f"sub {stripe_result.get('subscription_id')} for {email}"
+            )
+            cancel_result = {**stripe_result, "source": "stripe"}
+            result["cancel_source"] = "stripe"
+            final_intent = _resolve_intent(intent, cancel_result)
+            result["intent"] = final_intent
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: found in WooCommerce but no active sub. "
+                f"Cancelled in Stripe directly "
+                f"(sub={stripe_result.get('subscription_id')}).",
+            )
+            return _finish_cancellation(
+                ticket_id, name, language, final_intent, cancel_result, result
+            )
+
+        # No working alt email and Stripe didn't help → Slack alert for manual review
+        log.info(f"[{ticket_id}] No alt email / Stripe worked → Slack alert + escalate to agent")
 
         # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
         # when Zendesk fires multiple webhooks in rapid succession (same fix as card-digits).
@@ -460,6 +492,38 @@ def _process(ticket_id: str) -> dict:
         alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
         if alt_found:
             return alt_found
+
+        # ── Stripe email-based fallback ──────────────────────────────── #
+        # Before asking for card digits, try Stripe directly by email.
+        # Stripe Customer.list(email=) is fast and reliable, and may find
+        # the subscription even when WooCommerce billing_email lookup fails
+        # (common when WC stores the email only in _billing_email post meta).
+        log.info(f"[{ticket_id}] WC not found → trying Stripe by email as fallback")
+        stripe_result = stripe_cli.cancel_subscription(email)
+        stripe_status = stripe_result.get("status", "")
+
+        if stripe_status not in ("not_found", "no_active_sub", "error"):
+            # ✅ Stripe found and cancelled the subscription
+            log.info(
+                f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
+                f"sub {stripe_result.get('subscription_id')} for {email}"
+            )
+            cancel_result = {**stripe_result, "source": "stripe"}
+            result["cancel_source"] = "stripe"
+            final_intent = _resolve_intent(intent, cancel_result)
+            result["intent"] = final_intent
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: not found in WooCommerce by email ({email}). "
+                f"Found and cancelled in Stripe directly "
+                f"(sub={stripe_result.get('subscription_id')}).",
+            )
+            return _finish_cancellation(
+                ticket_id, name, language, final_intent, cancel_result, result
+            )
+
+        if stripe_status == "no_active_sub":
+            log.info(f"[{ticket_id}] Stripe: customer found but no active sub")
 
         # Still not found → ask for last 4 card digits (step 1)
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
@@ -515,6 +579,7 @@ def _process(ticket_id: str) -> dict:
         log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
 
     # 9. Found → generate reply, tag, solve
+    # (order count gate is inside _finish_cancellation — covers all paths)
     return _finish_cancellation(ticket_id, name, language, intent, cancel_result, result)
 
 
@@ -800,7 +865,51 @@ def _finish_cancellation(
     cancel_result: dict,
     result: dict,
 ) -> dict:
-    """Generate reply, tag, and solve the ticket after a successful cancellation."""
+    """Generate reply, tag, and solve the ticket after a successful cancellation.
+
+    Includes an order-count gate: subscriptions with >= MAX_BOT_ORDERS orders
+    are renewals that need manual review. The bot does NOT auto-cancel these.
+    """
+    # ── Order count gate ─────────────────────────────────────────────── #
+    order_count = cancel_result.get("order_count")
+    if order_count is not None and order_count >= MAX_BOT_ORDERS:
+        email = result.get("email", "unknown")
+        log.info(
+            f"[{ticket_id}] Renewal: {order_count} orders (>= {MAX_BOT_ORDERS}) "
+            "→ escalate to agent (not auto-cancelling)"
+        )
+
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+            result["status"] = "skipped_race_condition"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: subscription found (#{cancel_result.get('subscription_id')}, "
+            f"type={cancel_result.get('subscription_type')}, orders={order_count}). "
+            f"Renewal subscription (>= {MAX_BOT_ORDERS} orders) — requires manual review.",
+        )
+        zendesk.set_open(ticket_id)
+        slack_sent = slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=email,
+            intent=intent,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result.update({
+            "status": "manual_review_required",
+            "action": "skipped_renewal_too_many_orders",
+            "order_count": order_count,
+            "slack_sent": slack_sent,
+        })
+        log_result(result)
+        return result
+
     reply_text = generate_reply(
         intent=intent,
         language=language,
@@ -811,7 +920,6 @@ def _finish_cancellation(
     cancel_tag = {
         "TRIAL_CANCELLATION": "trial_cancellation",
         "SUB_CANCELLATION": "subscription_cancelled",
-        "SUB_RENEWAL_CANCELLATION": "renewal_cancellation",
     }.get(intent, "cancelled")
 
     zendesk.add_tag(ticket_id, "bot_handled") # first — blocks any re-entry from webhook re-fires
