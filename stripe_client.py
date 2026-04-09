@@ -31,6 +31,55 @@ class StripeClient:
         customer = customers.data[0]
         return self._cancel_customer_sub(customer.id, email)
 
+    def find_email_by_last4(self, last4: str) -> str | None:
+        """
+        Look up the customer email associated with a card ending in last4.
+
+        Used when WooCommerce lookup by email failed/timed out — the customer
+        provides their last 4 card digits so we can find their email in Stripe,
+        then cancel in WooCommerce using that email.
+
+        Returns the email string, or None if not found.
+        Does NOT cancel anything in Stripe.
+        """
+        log.info(f"Stripe: looking up email for card last4={last4}")
+
+        try:
+            charges = stripe_lib.Charge.search(
+                query=f'payment_method_details.card.last4:"{last4}"',
+                limit=5,
+            )
+        except stripe_lib.error.InvalidRequestError:
+            log.warning("Stripe Search API not available, falling back to list")
+            charges = self._list_charges_fallback(last4)
+        except stripe_lib.error.StripeError as e:
+            log.error(f"Stripe search by last4 error: {e}")
+            return None
+
+        if not charges.data:
+            log.info(f"Stripe: no charges found for last4={last4}")
+            return None
+
+        seen = set()
+        for charge in charges.data:
+            customer_id = charge.customer
+            if not customer_id or customer_id in seen:
+                continue
+            seen.add(customer_id)
+
+            try:
+                customer = stripe_lib.Customer.retrieve(customer_id)
+                email = customer.get("email") or ""
+                if email:
+                    log.info(f"Stripe: found email {email!r} for card last4={last4}")
+                    return email
+            except stripe_lib.error.StripeError as e:
+                log.warning(f"Stripe: error retrieving customer {customer_id}: {e}")
+                continue
+
+        log.info(f"Stripe: no customer email found for last4={last4}")
+        return None
+
     def find_and_cancel_by_last4(self, last4: str) -> dict:
         """
         Search Stripe for a subscription tied to a card ending in last4.
