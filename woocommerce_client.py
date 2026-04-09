@@ -525,11 +525,11 @@ class WooCommerceClient:
         # ── Step 4: pick best subscription to cancel ──────────────────── #
         typed_subs = []
         for s in active_subs:
-            order_count = self.get_order_count(s["id"])
-            typed_subs.append((s, self._get_sub_type(s, order_count=order_count)))
+            oc = self.get_order_count(s["id"])
+            typed_subs.append((s, self._get_sub_type(s, order_count=oc), oc))
 
         def _priority(entry: tuple) -> int:
-            sub, stype = entry
+            sub, stype, _oc = entry
             st = sub.get("status", "")
             if st == "pending-cancel" and stype == "subscription":
                 return 0
@@ -544,7 +544,7 @@ class WooCommerceClient:
             return 5
 
         typed_subs.sort(key=_priority)
-        target, sub_type = typed_subs[0]
+        target, sub_type, order_count = typed_subs[0]
 
         plan = ""
         li = target.get("line_items") or []
@@ -571,5 +571,6 @@ class WooCommerceClient:
             "subscription_type": sub_type,
             "subscription_id": target["id"],
             "plan": plan or "IQ Test Subscription",
+            "order_count": order_count,
             "error": cancel.get("error"),
         }
