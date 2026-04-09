@@ -1,7 +1,12 @@
 import logging
+import time
 import requests
 
 log = logging.getLogger("zendesk")
+
+# Retry config for 429 rate-limit responses
+_MAX_RETRIES = 3
+_DEFAULT_RETRY_AFTER = 1  # seconds, if Retry-After header is missing
 
 
 class ZendeskClient:
@@ -12,19 +17,56 @@ class ZendeskClient:
         if dry_run:
             log.info("ZendeskClient: DRY_RUN — no writes")
 
+    def _request_with_retry(
+        self, method: str, url: str, accept_statuses: set[int] | None = None, **kwargs
+    ) -> requests.Response:
+        """
+        Send an HTTP request with automatic retry on 429 (Too Many Requests).
+
+        Zendesk returns Retry-After header with the number of seconds to wait.
+        Retries up to _MAX_RETRIES times with exponential backoff fallback.
+
+        accept_statuses: additional HTTP codes that should NOT raise (e.g. {404}).
+        """
+        if accept_statuses is None:
+            accept_statuses = set()
+
+        for attempt in range(_MAX_RETRIES + 1):
+            resp = requests.request(method, url, auth=self.auth, timeout=10, **kwargs)
+
+            if resp.status_code != 429:
+                if resp.status_code not in accept_statuses:
+                    resp.raise_for_status()
+                return resp
+
+            if attempt == _MAX_RETRIES:
+                log.error(
+                    f"Zendesk 429: exhausted {_MAX_RETRIES} retries for {method} {url}"
+                )
+                resp.raise_for_status()  # will raise HTTPError
+
+            retry_after = int(resp.headers.get("Retry-After", _DEFAULT_RETRY_AFTER * (attempt + 1)))
+            log.warning(
+                f"Zendesk 429: rate limited on {method} {url} — "
+                f"retry {attempt + 1}/{_MAX_RETRIES} in {retry_after}s"
+            )
+            time.sleep(retry_after)
+
+        return resp  # unreachable, but keeps type checker happy
+
     def get_ticket(self, ticket_id: str) -> dict | None:
         """Read-only — always real even in dry_run."""
-        resp = requests.get(
-            f"{self.base}/tickets/{ticket_id}.json", auth=self.auth, timeout=10
+        resp = self._request_with_retry(
+            "GET", f"{self.base}/tickets/{ticket_id}.json",
+            accept_statuses={404},
         )
         if resp.status_code == 404:
             return None
-        resp.raise_for_status()
         ticket = resp.json()["ticket"]
 
         rid = ticket.get("requester_id")
         if rid:
-            u = requests.get(f"{self.base}/users/{rid}.json", auth=self.auth, timeout=10)
+            u = self._request_with_retry("GET", f"{self.base}/users/{rid}.json")
             if u.ok:
                 ticket["requester"] = u.json()["user"]
         return ticket
@@ -40,13 +82,12 @@ class ZendeskClient:
 
         Always real, even in dry_run.
         """
-        resp = requests.get(
-            f"{self.base}/tickets/{ticket_id}.json",
-            auth=self.auth,
-            timeout=10,
-        )
-        if not resp.ok:
-            log.warning(f"get_ticket_tags: could not fetch #{ticket_id}: {resp.status_code}")
+        try:
+            resp = self._request_with_retry(
+                "GET", f"{self.base}/tickets/{ticket_id}.json",
+            )
+        except requests.exceptions.HTTPError as e:
+            log.warning(f"get_ticket_tags: could not fetch #{ticket_id}: {e}")
             return []
         return resp.json().get("ticket", {}).get("tags", [])
 
@@ -61,14 +102,13 @@ class ZendeskClient:
         agent_ids: set of user IDs whose role is "agent" or "admin".
         Always real, even in dry_run.
         """
-        resp = requests.get(
-            f"{self.base}/tickets/{ticket_id}/comments.json",
-            params={"include": "users"},
-            auth=self.auth,
-            timeout=10,
-        )
-        if not resp.ok:
-            log.warning(f"Could not fetch comments for #{ticket_id}: {resp.status_code}")
+        try:
+            resp = self._request_with_retry(
+                "GET", f"{self.base}/tickets/{ticket_id}/comments.json",
+                params={"include": "users"},
+            )
+        except requests.exceptions.HTTPError as e:
+            log.warning(f"Could not fetch comments for #{ticket_id}: {e}")
             return [], set()
 
         data = resp.json()
@@ -135,15 +175,26 @@ class ZendeskClient:
                 return comment.get("plain_body") or comment.get("body", "")
         return None
 
+    def count_bot_replies(self, ticket_id: str) -> int:
+        """
+        Count how many public comments were posted by agents (bot) on this ticket.
+        Used for spam detection — if >= 2, the bot might be looping.
+        Always real, even in dry_run.
+        """
+        comments, agent_ids = self._fetch_comments_with_agent_ids(ticket_id)
+        return sum(
+            1 for c in comments
+            if c.get("public") and c.get("author_id") in agent_ids
+        )
+
     def post_reply(self, ticket_id: str, body: str):
         if self.dry_run:
             log.info(f"[DRY] reply → #{ticket_id}: {body[:120]}...")
             return
-        requests.put(
-            f"{self.base}/tickets/{ticket_id}.json",
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {"comment": {"body": body, "public": True}}},
-            auth=self.auth, timeout=10,
-        ).raise_for_status()
+        )
 
     def post_reply_and_set_pending(self, ticket_id: str, body: str):
         """
@@ -157,53 +208,50 @@ class ZendeskClient:
         if self.dry_run:
             log.info(f"[DRY] reply+pending → #{ticket_id}: {body[:120]}...")
             return
-        requests.put(
-            f"{self.base}/tickets/{ticket_id}.json",
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {
                 "status": "pending",
                 "comment": {"body": body, "public": True},
             }},
-            auth=self.auth, timeout=10,
-        ).raise_for_status()
+        )
 
     def add_tag(self, ticket_id: str, tag: str):
         if self.dry_run:
             log.info(f"[DRY] tag '{tag}' → #{ticket_id}")
             return
-        requests.post(
-            f"{self.base}/tickets/{ticket_id}/tags.json",
-            json={"tags": [tag]}, auth=self.auth, timeout=10,
-        ).raise_for_status()
+        self._request_with_retry(
+            "POST", f"{self.base}/tickets/{ticket_id}/tags.json",
+            json={"tags": [tag]},
+        )
 
     def remove_tag(self, ticket_id: str, tag: str):
         if self.dry_run:
             log.info(f"[DRY] remove tag '{tag}' from #{ticket_id}")
             return
-        requests.delete(
-            f"{self.base}/tickets/{ticket_id}/tags.json",
-            json={"tags": [tag]}, auth=self.auth, timeout=10,
-        ).raise_for_status()
+        self._request_with_retry(
+            "DELETE", f"{self.base}/tickets/{ticket_id}/tags.json",
+            json={"tags": [tag]},
+        )
 
     def set_open(self, ticket_id: str):
         """Set ticket status to Open so it appears in agent queues for manual handling."""
         if self.dry_run:
             log.info(f"[DRY] set open → #{ticket_id}")
             return
-        requests.put(
-            f"{self.base}/tickets/{ticket_id}.json",
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {"status": "open"}},
-            auth=self.auth, timeout=10,
-        ).raise_for_status()
+        )
 
     def solve_ticket(self, ticket_id: str):
         if self.dry_run:
             log.info(f"[DRY] solve → #{ticket_id}")
             return
-        requests.put(
-            f"{self.base}/tickets/{ticket_id}.json",
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {"status": "solved"}},
-            auth=self.auth, timeout=10,
-        ).raise_for_status()
+        )
 
     def was_recently_handled(
         self, email: str, hours: int = 24, exclude_ticket_id: str = ""
@@ -248,8 +296,7 @@ class ZendeskClient:
         if self.dry_run:
             log.info(f"[DRY] note → #{ticket_id}: {note[:80]}")
             return
-        requests.put(
-            f"{self.base}/tickets/{ticket_id}.json",
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {"comment": {"body": note, "public": False}}},
-            auth=self.auth, timeout=10,
-        ).raise_for_status()
+        )
