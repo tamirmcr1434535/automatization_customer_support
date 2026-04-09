@@ -870,13 +870,18 @@ def _finish_cancellation(
     Includes an order-count gate: subscriptions with >= MAX_BOT_ORDERS orders
     are renewals that need manual review. The bot does NOT auto-cancel these.
     """
+    # ── Resolve intent from actual subscription data ─────────────────── #
+    # Text classifier guesses trial vs sub, but WC order count is the source of truth.
+    intent = _resolve_intent(intent, cancel_result)
+    result["intent"] = intent
+
     # ── Order count gate ─────────────────────────────────────────────── #
     order_count = cancel_result.get("order_count")
     if order_count is not None and order_count >= MAX_BOT_ORDERS:
         email = result.get("email", "unknown")
         log.info(
-            f"[{ticket_id}] Renewal: {order_count} orders (>= {MAX_BOT_ORDERS}) "
-            "→ escalate to agent (not auto-cancelling)"
+            f"[{ticket_id}] Renewal: intent={intent}, {order_count} orders "
+            f"(>= {MAX_BOT_ORDERS}) → escalate to agent (not auto-cancelling)"
         )
 
         current_tags = zendesk.get_ticket_tags(ticket_id)
@@ -886,12 +891,13 @@ def _finish_cancellation(
             return result
 
         zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: subscription found (#{cancel_result.get('subscription_id')}, "
-            f"type={cancel_result.get('subscription_type')}, orders={order_count}). "
+            f"intent={intent}, orders={order_count}). "
             f"Renewal subscription (>= {MAX_BOT_ORDERS} orders) — requires manual review.",
         )
         zendesk.set_open(ticket_id)
