@@ -2,19 +2,23 @@
 Zendesk Cancellation Bot — Google Cloud Function (Gen 2)
 =========================================================
 Cancellation flow:
- 1. Check by Zendesk email (WooCommerce → Stripe)
- 2. Found → cancel → done
- 3. Not found → extract any emails mentioned in ticket body → try each one
-    └─ Found by alt email → cancel → done
- 4. Still not found → ask for last 4 card digits (tag: awaiting_card_digits)
+ 1. Check by Zendesk email → WooCommerce cancel
+    └─ Found → cancel in WC → done ✅
+ 2. WC: not found / timeout / error
+    → extract any emails mentioned in ticket body → try each one in WC
+    └─ Found by alt email → cancel in WC → done ✅
+ 3. Still not found → ask for last 4 card digits (tag: awaiting_card_digits)
     └─ 7 days no reply → Zendesk Automation closes ticket
-    └─ Customer replied:
-       ├─ Found → cancel → done
+    └─ Customer replied with last4:
+       ├─ Stripe: find email by last4 → WC: cancel with that email → done ✅
        └─ Not found → ask for correct digits (tag: awaiting_card_digits_retry)
           └─ 2 days no reply → Zendesk Automation closes ticket
           └─ Customer replied:
-             ├─ Found → cancel → done
+             ├─ Stripe: find email by last4 → WC: cancel with that email → done ✅
              └─ Not found → close ticket
+
+NOTE: Stripe is used ONLY as an email-lookup tool via card last4 digits.
+      All subscription cancellations happen in WooCommerce.
 """
 
 import os
@@ -458,29 +462,57 @@ def _handle_card_digits(
         return _digits_not_found(ticket_id, name, language, result, is_retry)
 
     last4 = match.group(1)
-    log.info(f"[{ticket_id}] Extracted last4={last4} — searching Stripe")
+    log.info(f"[{ticket_id}] Extracted last4={last4} — looking up email in Stripe")
 
-    stripe_result = stripe_cli.find_and_cancel_by_last4(last4)
+    # Step 1: Use Stripe only to find the customer's email by card last4.
+    # Stripe is NOT used for cancellation — WooCommerce is always the cancel target.
+    email_from_stripe = stripe_cli.find_email_by_last4(last4)
 
-    if stripe_result.get("found"):
-        # ✅ Found by card — cancel and close
-        cancel_result = {**stripe_result, "source": "stripe_by_card"}
-        result["cancel_source"] = "stripe_by_card"
-
-        # Clean up card-lookup tags
-        zendesk.remove_tag(ticket_id, "awaiting_card_digits")
-        zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
-
-        # Determine trial vs sub from actual Stripe data
-        final_intent = _resolve_intent(result.get("intent", "SUB_CANCELLATION"), cancel_result)
-        result["intent"] = final_intent
-
-        log.info(f"[{ticket_id}] ✅ Found by card last4={last4} — intent={final_intent} — cancelling")
-        return _finish_cancellation(
-            ticket_id, name, language, final_intent, cancel_result, result
+    if email_from_stripe:
+        log.info(
+            f"[{ticket_id}] Stripe found email {email_from_stripe!r} for card last4={last4} "
+            "— cancelling in WooCommerce"
         )
 
-    # ❌ Digits not found in Stripe
+        # Step 2: Cancel in WooCommerce using the email we found via Stripe
+        woo_result = woo.cancel_subscription(email_from_stripe)
+        woo_status = woo_result.get("status", "")
+
+        if woo_status not in ("not_found", "no_active_sub", "timeout", "error"):
+            # ✅ WC found and cancelled (or dry_run / already_cancelled)
+            cancel_result = {**woo_result, "source": "stripe_last4_woocommerce"}
+            result["cancel_source"] = "stripe_last4_woocommerce"
+            result["email"] = email_from_stripe  # update to the email that worked
+
+            # Clean up card-lookup tags
+            zendesk.remove_tag(ticket_id, "awaiting_card_digits")
+            zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
+
+            # Resolve trial vs sub from actual WC data
+            final_intent = _resolve_intent(result.get("intent", "SUB_CANCELLATION"), cancel_result)
+            result["intent"] = final_intent
+
+            log.info(
+                f"[{ticket_id}] ✅ Found by card last4={last4} via Stripe → "
+                f"WC cancelled — intent={final_intent}"
+            )
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: primary email not found. "
+                f"Located subscription in WooCommerce via Stripe card lookup (last4={last4}). "
+                f"Email: {email_from_stripe}",
+            )
+            return _finish_cancellation(
+                ticket_id, name, language, final_intent, cancel_result, result
+            )
+
+        # Stripe found the email but WC still has no subscription for it → digits not found path
+        log.info(
+            f"[{ticket_id}] Stripe found email {email_from_stripe!r} but WC returned "
+            f"{woo_status!r} — treating as not found"
+        )
+
+    # ❌ Email not found in Stripe, or WC had nothing for that email
     return _digits_not_found(ticket_id, name, language, result, is_retry)
 
 
@@ -712,61 +744,49 @@ def _finish_cancellation(
 
 def _cancel_by_email(email: str, ticket_id: str) -> dict:
     """
-    WooCommerce → Stripe by email.
+    WooCommerce-only cancellation by email.
+
+    Stripe is NOT used here — it is only used in the card-digits flow
+    (_handle_card_digits) to find an email by last4, then we come back to WC.
 
     Returns one of:
-    - cancel result dict — found and cancelled
-    - status="not_found_anywhere" — email unknown in BOTH systems → ask card digits
-    - status="found_no_active_sub" — email found somewhere but NO active subscription
-      (already cancelled or in different system) → Slack alert
+    - cancel result dict          — WC found and cancelled (or dry_run / already_cancelled)
+    - status="found_no_active_sub"— customer found in WC but no active subscription
+                                    → Slack alert / manual review
+    - status="not_found_anywhere" — not found or timeout / error in WC
+                                    → ask for last 4 card digits
     """
-    woo_result  = woo.cancel_subscription(email)
-    woo_status  = woo_result.get("status", "")
+    woo_result = woo.cancel_subscription(email)
+    woo_status = woo_result.get("status", "")
 
-    if woo_status not in ("not_found", "no_active_sub", "error", "timeout"):
+    # Successful WC outcome — return immediately
+    if woo_status not in ("not_found", "no_active_sub", "timeout", "error"):
         return {**woo_result, "source": "woocommerce"}
 
-    if woo_status == "timeout":
-        # WC subscription lookup timed out — server overloaded.
-        # Try Stripe directly; do NOT count as "customer found" because we
-        # couldn't confirm subscription state. If Stripe also misses them,
-        # ask for card digits rather than triggering a Slack alert (we don't
-        # actually know their subscription is gone, just that WC was slow).
-        log.warning(f"[{ticket_id}] WooCommerce timed out → trying Stripe directly")
-        woo_customer_found = False
-    else:
-        woo_customer_found = woo_status == "no_active_sub" # customer exists but no active sub
-        log.info(f"[{ticket_id}] WooCommerce: {woo_status} → trying Stripe")
-
-    stripe_result  = stripe_cli.cancel_subscription(email)
-    stripe_status  = stripe_result.get("status", "")
-
-    if stripe_status not in ("not_found", "no_active_sub", "error"):
-        return {
-            **stripe_result,
-            "source": "stripe",
-            "subscription_type": "trial" if stripe_status == "trialing" else "subscription",
-        }
-
-    stripe_customer_found = stripe_status == "no_active_sub" # customer exists in Stripe
-
-    # Customer found in at least one system but no active subscription
-    if woo_customer_found or stripe_customer_found:
-        found_in = "WooCommerce" if woo_customer_found else "Stripe"
+    # Customer exists in WC but has no active subscription → manual review
+    if woo_status == "no_active_sub":
         log.info(
-            f"[{ticket_id}] Customer found in {found_in} but no active sub → "
-            "might already be cancelled or sub in different system"
+            f"[{ticket_id}] WooCommerce: customer found but no active sub "
+            "→ escalate to agent"
         )
         return {
             "status": "found_no_active_sub",
             "email": email,
             "cancelled": False,
-            "source": found_in.lower(),
-            "found_in": found_in,
+            "source": "woocommerce",
+            "found_in": "WooCommerce",
         }
 
-    # Email completely unknown in both systems → ask for card digits
-    log.info(f"[{ticket_id}] Email not found anywhere → ask for card digits")
+    # not_found / timeout / error — ask customer for last 4 card digits
+    if woo_status == "timeout":
+        log.warning(
+            f"[{ticket_id}] WooCommerce timed out — asking customer for last 4 card digits"
+        )
+    else:
+        log.info(
+            f"[{ticket_id}] WooCommerce: {woo_status} — asking customer for last 4 card digits"
+        )
+
     return {
         "status": "not_found_anywhere",
         "email": email,
