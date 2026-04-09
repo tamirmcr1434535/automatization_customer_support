@@ -259,6 +259,22 @@ def _process(ticket_id: str) -> dict:
     })
     log.info(f"[{ticket_id}] Intent: {intent} ({confidence:.0%}) | Lang: {language}")
 
+    # ── 3c. Refund keyword override ──────────────────────────────────────── #
+    # If the classifier returned a handled intent (TRIAL / SUB cancellation)
+    # but the customer text contains refund keywords (返金, refund, etc.)
+    # → override to REFUND_REQUEST and skip.  Refund tickets always need
+    # human review; the bot should not auto-cancel when a refund is requested.
+    if intent in HANDLED_INTENTS and _contains_refund_request(subject + " " + body):
+        log.info(
+            f"[{ticket_id}] {intent} but refund keywords detected in body "
+            "→ overriding to REFUND_REQUEST (human must handle refund)"
+        )
+        intent = "REFUND_REQUEST"
+        result["intent"] = intent
+        result["status"] = "skipped_refund_request"
+        log_result(result)
+        return result
+
     # ── REFUND / PAYMENT DISPUTE intents ─────────────────────────────────── #
     #
     # Policy: CANCELLATION IS ALWAYS THE PRIORITY.
