@@ -574,42 +574,52 @@ class WooCommerceClient:
         }
 
         log.info(f"[DRY] WC cancel for {email}" if self.dry_run else f"WC cancel for {email}")
-        customer = self.get_customer_by_email(email)
 
+        # ── Step 1: get customer account (fast, 0.3s) ─────────────────── #
+        customer = self.get_customer_by_email(email)
         if not customer:
             customer = self.search_customer_by_email(email)
 
-        if customer:
-            all_subs = self.get_subscriptions(customer["id"])
+        customer_id = customer["id"] if customer else None
 
-            if all_subs is None:
+        # ── Step 2: subscription lookup ────────────────────────────────── #
+        #
+        # ORDER MATTERS — tested on production data:
+        #   /subscriptions?customer=ID      → up to 21s, often returns 0 (WC
+        #                                     stores subs by billing email, not
+        #                                     customer account)
+        #   /subscriptions?billing_email=X  → ~1s, returns correct results
+        #
+        # Strategy (fastest-first):
+        # 2a. billing_email query   — fast & reliable for this WC setup
+        # 2b. customer_id query     — fallback only if billing_email returned empty
+        #     (covers edge case where sub is attached to account, not billing email)
+        # 2c. If customer_id query times out → return "timeout"
+
+        all_subs = self.get_subscriptions_by_billing_email(email)
+
+        if not all_subs and customer_id is not None:
+            log.info(
+                f"WC: billing_email returned 0 subs for {email} — "
+                f"trying customer_id={customer_id} as fallback"
+            )
+            id_subs = self.get_subscriptions(customer_id)
+
+            if id_subs is None:
                 log.warning(
-                    f"WC: subscription lookup timed out for customer #{customer['id']} "
-                    f"({email}) — returning timeout so caller can try Stripe"
+                    f"WC: subscription lookup timed out for customer #{customer_id} ({email})"
                 )
                 return {**base_result, "status": "timeout"}
 
-            if not all_subs:
+            if id_subs:
                 log.info(
-                    f"WC: 0 subs found by customer_id={customer['id']} — "
-                    "checking billing email as fallback"
+                    f"WC: found {len(id_subs)} subscription(s) via customer_id fallback "
+                    f"for {email}"
                 )
-                billing_subs = self.get_subscriptions_by_billing_email(email)
-                if billing_subs:
-                    log.info(
-                        f"WC: found {len(billing_subs)} subscription(s) via billing email "
-                        f"fallback for customer #{customer['id']}"
-                    )
-                    all_subs = billing_subs
-        else:
-            log.info(
-                f"WC: no customer account for {email} — "
-                "falling back to billing-email subscription search"
-            )
-            all_subs = self.get_subscriptions_by_billing_email(email)
+                all_subs = id_subs
 
         if not all_subs:
-            log.info(f"WC: no subscriptions found by billing email for {email}")
+            log.info(f"WC: no subscriptions found for {email}")
             return {**base_result, "status": "not_found"}
 
         active_subs = [s for s in all_subs if s.get("status") in ACTIVE_STATUSES]
