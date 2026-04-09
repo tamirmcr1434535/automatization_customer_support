@@ -166,15 +166,31 @@ Language detection rules:
 - If the message contains multiple languages, pick the dominant one."""
 
 
+_FALLBACK = {
+    "intent": "UNKNOWN",
+    "confidence": 0.0,
+    "language": "EN",
+    "chargeback_risk": False,
+    "reasoning": "classifier error — fallback to UNKNOWN",
+}
+
+
 def classify_ticket(subject: str, body: str) -> dict:
-    response = _client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=200,
-        messages=[{
-            "role": "user",
-            "content": f"{PROMPT}\n\nSubject: {subject}\n\nBody:\n{body[:1500]}"
-        }]
-    )
+    import logging
+    log = logging.getLogger("classifier")
+
+    try:
+        response = _client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=200,
+            messages=[{
+                "role": "user",
+                "content": f"{PROMPT}\n\nSubject: {subject}\n\nBody:\n{body[:1500]}"
+            }]
+        )
+    except Exception as e:
+        log.error(f"classify_ticket API error: {e}")
+        return {**_FALLBACK, "reasoning": f"API error: {e}"}
 
     raw_text = response.content[0].text
 
@@ -193,10 +209,4 @@ def classify_ticket(subject: str, body: str) -> dict:
         # Fall through to fallback
 
     # Fallback: could not parse valid JSON — treat as UNKNOWN so bot skips safely
-    return {
-        "intent": "UNKNOWN",
-        "confidence": 0.0,
-        "language": "EN",
-        "chargeback_risk": False,
-        "reasoning": "parse error — classifier fallback",
-    }
+    return {**_FALLBACK, "reasoning": "parse error — classifier fallback"}
