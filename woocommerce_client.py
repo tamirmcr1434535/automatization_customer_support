@@ -224,8 +224,7 @@ class WooCommerceClient:
         IMPORTANT: Always call cancel_subscription() via customer_id when possible
         (?customer= filter) — that path is reliable. This method is last-resort.
 
-        FIX: timeout increased 10s → 20s for billing_email pass,
-             10s → 20s for ?search= pass.
+        Timeouts: billing_email pass = 15s, ?search= pass = 8s (fast-fail fallback).
         """
         email_lower = email.lower().strip()
         MAX_PAGES = 2  # scan up to 2 × 50 = 100 subscriptions per filter
@@ -237,7 +236,7 @@ class WooCommerceClient:
                     f"{self.base}/subscriptions",
                     params={"billing_email": email, "per_page": 50, "page": page},
                     auth=self.auth,
-                    timeout=20,  # FIX: was 10s
+                    timeout=15,
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC billing_email lookup error for {email} page={page}: {e}")
@@ -299,7 +298,7 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"search": email, "per_page": 50},
                 auth=self.auth,
-                timeout=20,  # FIX: was 10s
+                timeout=8,  # fast-fail: ?search= is last-resort fallback
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC ?search= lookup error for {email}: {e}")
