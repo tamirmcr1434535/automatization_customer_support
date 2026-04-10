@@ -44,23 +44,30 @@ class SlackClient:
         # legacy webhook_url kept for backwards compat — ignored when bot_token is set
         webhook_url: str = "",
     ):
-        self.bot_token     = bot_token
-        self.target_email  = target_email
-        self.dry_run       = dry_run
-        self._user_id_cache: str | None = None
+        self.bot_token = bot_token
+        # Support comma-separated list of emails: "a@x.com,b@x.com"
+        self.target_emails: list[str] = [
+            e.strip() for e in target_email.split(",") if e.strip()
+        ]
+        self.dry_run = dry_run
+        self._user_id_cache: dict[str, str] = {}  # email → user_id
 
         if dry_run:
             log.info("SlackClient: DRY_RUN — no messages will be sent")
         if not bot_token:
             log.warning("SlackClient: SLACK_BOT_TOKEN not set — Slack alerts disabled")
+        if self.target_emails:
+            log.info(f"SlackClient: will notify {len(self.target_emails)} recipient(s): {self.target_emails}")
 
     # ── internal ──────────────────────────────────────────────────────────
 
-    def _resolve_channel(self) -> str | None:
-        """Return cached Slack user ID for target_email."""
-        if self._user_id_cache is None:
-            self._user_id_cache = _get_user_id(self.bot_token, self.target_email)
-        return self._user_id_cache
+    def _resolve_user_id(self, email: str) -> str | None:
+        """Return cached Slack user ID for a single email."""
+        if email not in self._user_id_cache:
+            uid = _get_user_id(self.bot_token, email)
+            if uid:
+                self._user_id_cache[email] = uid
+        return self._user_id_cache.get(email)
 
     def _open_dm_channel(self, user_id: str) -> str | None:
         """Open a DM channel with the user. Required for bot tokens to send DMs."""
@@ -85,25 +92,16 @@ class SlackClient:
             log.error(f"Slack: conversations.open request failed — {e}")
             return None
 
-    def _post(self, text: str, blocks: list | None = None) -> bool:
-        """Core DM send method. Returns True on success."""
-        if self.dry_run:
-            log.info(f"[DRY] Slack DM to {self.target_email}: {text[:120]}")
-            return True
-
-        if not self.bot_token:
-            log.error("Slack: bot token missing — cannot send alert")
-            return False
-
-        user_id = self._resolve_channel()
+    def _post_to_one(self, email: str, text: str, blocks: list | None) -> bool:
+        """Send a message to a single recipient. Returns True on success."""
+        user_id = self._resolve_user_id(email)
         if not user_id:
-            log.error(f"Slack: could not resolve user ID for {self.target_email} — alert NOT sent")
+            log.error(f"Slack: could not resolve user ID for {email} — alert NOT sent")
             return False
 
-        # Open DM channel first — required for bot tokens to send DMs
         dm_channel = self._open_dm_channel(user_id)
         if not dm_channel:
-            log.error(f"Slack: could not open DM channel for {self.target_email} — alert NOT sent")
+            log.error(f"Slack: could not open DM channel for {email} — alert NOT sent")
             return False
 
         payload: dict = {"channel": dm_channel, "text": text}
@@ -122,16 +120,37 @@ class SlackClient:
             )
             data = resp.json()
             if data.get("ok"):
-                log.info(f"Slack: ✅ DM successfully delivered to {self.target_email}")
+                log.info(f"Slack: ✅ DM delivered to {email}")
                 return True
             log.error(
                 f"Slack: ❌ chat.postMessage failed — error={data.get('error')}, "
-                f"channel={dm_channel}, user={self.target_email}"
+                f"channel={dm_channel}, user={email}"
             )
             return False
         except Exception as e:
-            log.error(f"Slack: ❌ request failed — {e}")
+            log.error(f"Slack: ❌ request failed for {email} — {e}")
             return False
+
+    def _post(self, text: str, blocks: list | None = None) -> bool:
+        """Send to all target emails. Returns True if at least one succeeded."""
+        if self.dry_run:
+            log.info(f"[DRY] Slack DM to {self.target_emails}: {text[:120]}")
+            return True
+
+        if not self.bot_token:
+            log.error("Slack: bot token missing — cannot send alert")
+            return False
+
+        if not self.target_emails:
+            log.error("Slack: no target emails configured — cannot send alert")
+            return False
+
+        any_sent = False
+        for email in self.target_emails:
+            ok = self._post_to_one(email, text, blocks)
+            if ok:
+                any_sent = True
+        return any_sent
 
     # ── public API ────────────────────────────────────────────────────────
 
