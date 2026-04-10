@@ -1007,6 +1007,10 @@ def _finish_cancellation(
     # ── Order count gate ─────────────────────────────────────────────── #
     order_count = cancel_result.get("order_count")
     if order_count is not None and order_count >= MAX_BOT_ORDERS:
+        # ── Override intent: this is a renewal, not a simple cancellation ── #
+        intent = "SUB_RENEWAL_CANCELLATION"
+        result["intent"] = intent
+
         email = result.get("email", "unknown")
         log.info(
             f"[{ticket_id}] Renewal: intent={intent}, {order_count} orders "
