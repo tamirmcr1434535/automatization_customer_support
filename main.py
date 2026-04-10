@@ -197,12 +197,20 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 2d. Spam detection — if bot already replied 2+ times, stop and alert.
+    # Tag guard prevents duplicate Slack alerts when Zendesk fires webhook twice
+    # simultaneously (both would otherwise see reply_count >= 2 and both alert).
+    if "bot_spam_guard" in tags:
+        log.info(f"[{ticket_id}] Spam guard tag present — skipping duplicate spam webhook")
+        result["status"] = "skipped_spam_detected"
+        return result
+
     bot_reply_count = zendesk.count_bot_replies(ticket_id)
     if bot_reply_count >= 2:
         log.warning(
             f"[{ticket_id}] Bot already replied {bot_reply_count} times — "
             "possible spam loop, skipping and alerting"
         )
+        zendesk.add_tag(ticket_id, "bot_spam_guard")  # idempotency guard
         result["status"] = "skipped_spam_detected"
         slack_sent = slack.notify_spam_detected(
             ticket_id=ticket_id,
