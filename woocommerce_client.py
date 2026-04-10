@@ -113,7 +113,7 @@ class WooCommerceClient:
                     "order": "desc",
                 },
                 auth=self.auth,
-                timeout=10,
+                timeout=25,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC: orders lookup error for customer {customer_id}: {e}")
