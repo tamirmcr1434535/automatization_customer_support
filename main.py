@@ -163,9 +163,29 @@ def _process(ticket_id: str) -> dict:
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
-    # 2. Early subject/body signals — checked BEFORE any classification or WC lookup.
+    # ── 2. Guard checks (cheapest first, no API calls) ──────────────── #
 
-    # 2a-i. Follow-up ticket detection.
+    # 2a. Idempotency — bot_handled tag blocks all re-processing.
+    # Must be FIRST to prevent duplicate Slack alerts from parallel webhooks.
+    if "bot_handled" in tags:
+        log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping")
+        result["status"] = "skipped_already_handled"
+        return result
+
+    # 2b. Skip merged-away tickets.
+    if "merge" in tags:
+        log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: merge)")
+        result["status"] = "skipped_merged"
+        return result
+
+    if ticket_status == "closed":
+        log.info(f"[{ticket_id}] Skipping — ticket status is 'closed' (likely merged)")
+        result["status"] = "skipped_closed"
+        return result
+
+    # ── 2c. Early subject/body signals (still no API calls) ──────────── #
+
+    # Follow-up ticket detection.
     # Zendesk auto-prepends "This is a follow-up to your previous request #XXXXX"
     # when a customer replies to a closed/solved ticket. These are escalations
     # that an agent already touched — the bot must not interfere.
@@ -184,6 +204,7 @@ def _process(ticket_id: str) -> dict:
             f"[{ticket_id}] Follow-up ticket detected (references previous request) "
             "→ skipping, sending Slack alert for manual review"
         )
+        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         result["status"] = "skipped_followup"
         slack_sent = slack.notify_manual_review(
             ticket_id=ticket_id,
@@ -195,13 +216,14 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 2a-ii. Subject refund check — if the email subject itself contains refund
+    # Subject refund check — if the email subject itself contains refund
     # keywords, this is an escalation/dispute and should go straight to a human.
     if _contains_refund_request(subject):
         log.info(
             f"[{ticket_id}] Refund keyword in subject line: '{subject[:60]}' "
             "→ skipping, sending Slack alert"
         )
+        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         result["intent"] = "REFUND_REQUEST"
         result["status"] = "skipped_refund_request"
         slack_sent = slack.notify_refund_skip(
@@ -212,28 +234,6 @@ def _process(ticket_id: str) -> dict:
         )
         result["slack_sent"] = slack_sent
         log_result(result)
-        return result
-
-    # 2b. Idempotency check — skip if bot already handled this ticket.
-    # Prevents duplicate replies from double Zendesk webhook triggers.
-    # (Zendesk sometimes fires the same trigger twice in quick succession.)
-    if "bot_handled" in tags:
-        log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping duplicate webhook")
-        result["status"] = "skipped_already_handled"
-        return result
-
-    # 2b. Skip merged-away tickets.
-    # Detection 1: Zendesk adds 'merge' tag to the donor ticket.
-    if "merge" in tags:
-        log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: merge)")
-        result["status"] = "skipped_merged"
-        return result
-
-    # Detection 2: Merged donor tickets are set to "closed" by Zendesk.
-    # This catches merges where the webhook fires before the tag is applied.
-    if ticket_status == "closed":
-        log.info(f"[{ticket_id}] Skipping — ticket status is 'closed' (likely merged)")
-        result["status"] = "skipped_closed"
         return result
 
     # 2c. Skip if a human agent already replied publicly.
@@ -261,7 +261,15 @@ def _process(ticket_id: str) -> dict:
             f"[{ticket_id}] Bot already replied {bot_reply_count} times — "
             "possible spam loop, skipping and alerting"
         )
-        zendesk.add_tag(ticket_id, "bot_spam_guard")  # idempotency guard
+        # Race condition guard: re-fetch tags to check if a parallel webhook
+        # already set bot_spam_guard (same pattern as bot_handled checks).
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_spam_guard" in current_tags:
+            log.info(f"[{ticket_id}] Spam guard: parallel webhook already handled — skip")
+            result["status"] = "skipped_spam_detected"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_spam_guard")  # blocks other webhook re-fires
         result["status"] = "skipped_spam_detected"
         slack_sent = slack.notify_spam_detected(
             ticket_id=ticket_id,
@@ -357,6 +365,7 @@ def _process(ticket_id: str) -> dict:
         intent = "REFUND_REQUEST"
         result["intent"] = intent
         result["status"] = "skipped_refund_request"
+        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         slack_sent = slack.notify_refund_skip(
             ticket_id=ticket_id,
             email=email,
@@ -382,6 +391,7 @@ def _process(ticket_id: str) -> dict:
     if intent in _PURE_DISPUTE_INTENTS:
         log.info(f"[{ticket_id}] {intent} — skipping (active payment dispute, human must handle)")
         result["status"] = "skipped_refund_request"
+        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         slack_sent = slack.notify_refund_skip(
             ticket_id=ticket_id, email=email,
             intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
@@ -418,6 +428,7 @@ def _process(ticket_id: str) -> dict:
             # Pure refund request with no cancellation intent → human handles
             log.info(f"[{ticket_id}] {intent} — pure refund, no cancel signal → skipping")
             result["status"] = "skipped_refund_request"
+            zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
             slack_sent = slack.notify_refund_skip(
                 ticket_id=ticket_id, email=email,
                 intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
