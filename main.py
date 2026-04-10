@@ -163,7 +163,58 @@ def _process(ticket_id: str) -> dict:
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
-    # 2. Idempotency check — skip if bot already handled this ticket.
+    # 2. Early subject/body signals — checked BEFORE any classification or WC lookup.
+
+    # 2a-i. Follow-up ticket detection.
+    # Zendesk auto-prepends "This is a follow-up to your previous request #XXXXX"
+    # when a customer replies to a closed/solved ticket. These are escalations
+    # that an agent already touched — the bot must not interfere.
+    _FOLLOWUP_SIGNALS = [
+        "this is a follow-up to your previous request",
+        "follow-up to your previous request",
+        "follow up to your previous request",
+        "following up on my previous request",
+        "following up on ticket",
+        "in reference to ticket",
+        "regarding my previous request",
+    ]
+    body_lower_early = body.lower()
+    if any(sig in body_lower_early for sig in _FOLLOWUP_SIGNALS):
+        log.info(
+            f"[{ticket_id}] Follow-up ticket detected (references previous request) "
+            "→ skipping, sending Slack alert for manual review"
+        )
+        result["status"] = "skipped_followup"
+        slack_sent = slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=email,
+            intent="FOLLOWUP",
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
+        log_result(result)
+        return result
+
+    # 2a-ii. Subject refund check — if the email subject itself contains refund
+    # keywords, this is an escalation/dispute and should go straight to a human.
+    if _contains_refund_request(subject):
+        log.info(
+            f"[{ticket_id}] Refund keyword in subject line: '{subject[:60]}' "
+            "→ skipping, sending Slack alert"
+        )
+        result["intent"] = "REFUND_REQUEST"
+        result["status"] = "skipped_refund_request"
+        slack_sent = slack.notify_refund_skip(
+            ticket_id=ticket_id,
+            email=email,
+            intent="REFUND_REQUEST",
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
+        log_result(result)
+        return result
+
+    # 2b. Idempotency check — skip if bot already handled this ticket.
     # Prevents duplicate replies from double Zendesk webhook triggers.
     # (Zendesk sometimes fires the same trigger twice in quick succession.)
     if "bot_handled" in tags:
