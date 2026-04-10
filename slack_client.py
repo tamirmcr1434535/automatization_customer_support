@@ -336,6 +336,84 @@ class SlackClient:
             log.error(f"Slack: error alert FAILED for ticket #{ticket_id}")
         return sent
 
+    def notify_shadow_result(
+        self,
+        ticket_id: str,
+        result: dict,
+        zendesk_subdomain: str,
+    ) -> bool:
+        """SHADOW_MODE: report what the bot WOULD do for a live ticket (no writes happened)."""
+        ticket_url = (
+            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
+        )
+        status = result.get("status", "unknown")
+        intent = result.get("intent", "—")
+        email  = result.get("email", "—")
+        lang   = result.get("language", "—")
+        conf   = result.get("confidence")
+        conf_s = f"{conf:.0%}" if conf else "—"
+        source = result.get("cancel_source", "—")
+        action = result.get("action", "—")
+        order_count = result.get("order_count", "—")
+
+        # Choose emoji by status
+        emoji_map = {
+            "success": "✅",
+            "manual_review_required": "⚠️",
+            "skipped_refund_request": "💰",
+            "awaiting_card_digits": "💳",
+            "skipped_not_handled": "⏭️",
+            "escalated_low_confidence": "🔻",
+            "skipped_followup": "↩️",
+            "error": "🔴",
+        }
+        emoji = emoji_map.get(status, "👁️")
+
+        # Short reply preview (if any)
+        reply = result.get("reply_text", "")
+        reply_preview = (reply[:120] + "…") if len(reply) > 120 else reply
+
+        text = (
+            f"{emoji} *SHADOW* | <{ticket_url}|#{ticket_id}> "
+            f"| `{email}` | {intent} → {status}"
+        )
+        fields = [
+            {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
+            {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
+            {"type": "mrkdwn", "text": f"*Intent:*\n{intent} ({conf_s})"},
+            {"type": "mrkdwn", "text": f"*Would do:*\n{status}"},
+            {"type": "mrkdwn", "text": f"*Language:*\n{lang}"},
+            {"type": "mrkdwn", "text": f"*Source:*\n{source}"},
+        ]
+        if order_count != "—":
+            fields.append({"type": "mrkdwn", "text": f"*Orders:*\n{order_count}"})
+
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"{emoji} Shadow Mode — Ticket #{ticket_id}"},
+            },
+            {"type": "section", "fields": fields[:8]},  # Slack max 8 fields per section
+        ]
+
+        if reply_preview:
+            blocks.append({
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Reply preview:*\n> {reply_preview}",
+                },
+            })
+
+        blocks.append({"type": "divider"})
+
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: shadow report SENT for ticket #{ticket_id} → {status}")
+        else:
+            log.error(f"Slack: shadow report FAILED for ticket #{ticket_id}")
+        return sent
+
     def notify_spam_detected(
         self,
         ticket_id: str,
