@@ -17,8 +17,9 @@ IMPORTANT — performance notes for iqbooster.org:
 
   Lookup strategy (ordered by speed):
     1. /customers?email=         → meta_data subscription_id → /subscriptions/{id}
-    2. /subscriptions?billing_email=
-    3. (Stripe fallback in main.py if WC fast lookups fail)
+    2. /orders?customer={id}     → extract subscription_id from order meta → /subscriptions/{id}
+    3. /subscriptions?customer=  → slow fallback (25s timeout)
+    4. (Stripe fallback in main.py if all WC lookups fail)
 """
 
 import logging
@@ -93,6 +94,81 @@ class WooCommerceClient:
     # ================================================================== #
     #  READ — subscription lookup (fast paths only)                      #
     # ================================================================== #
+
+    def _find_sub_ids_from_orders(self, customer_id: int) -> list[int]:
+        """
+        Find subscription IDs by looking at customer's orders.
+        /orders?customer={id} is fast (~1-2s, indexed by customer).
+        Each WC Subscription order has a 'subscription_ids' in meta_data
+        or '_subscription_id' linking back to the subscription.
+        Returns list of unique subscription IDs found.
+        """
+        try:
+            resp = requests.get(
+                f"{self.base}/orders",
+                params={
+                    "customer": customer_id,
+                    "per_page": 5,
+                    "orderby": "date",
+                    "order": "desc",
+                },
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"WC: orders lookup error for customer {customer_id}: {e}")
+            return []
+
+        if not resp.ok:
+            log.warning(
+                f"WC: orders lookup failed for customer {customer_id}: "
+                f"{resp.status_code}"
+            )
+            return []
+
+        orders = resp.json()
+        if not isinstance(orders, list):
+            return []
+
+        sub_ids = set()
+        for order in orders:
+            # Check meta_data for subscription references
+            for meta in order.get("meta_data", []):
+                key = meta.get("key", "")
+                if key in ("_subscription_id", "subscription_id", "_subscription_ids"):
+                    val = meta.get("value")
+                    if isinstance(val, (int, str)):
+                        try:
+                            sub_ids.add(int(val))
+                        except (ValueError, TypeError):
+                            pass
+                    elif isinstance(val, list):
+                        for v in val:
+                            try:
+                                sub_ids.add(int(v))
+                            except (ValueError, TypeError):
+                                pass
+
+            # Also check line_items for subscription product references
+            for item in order.get("line_items", []):
+                for meta in item.get("meta_data", []):
+                    if meta.get("key") in ("_subscription_id", "subscription_id"):
+                        try:
+                            sub_ids.add(int(meta["value"]))
+                        except (ValueError, TypeError):
+                            pass
+
+        if sub_ids:
+            log.info(
+                f"WC: found subscription IDs {sub_ids} from orders "
+                f"for customer {customer_id}"
+            )
+        else:
+            log.info(
+                f"WC: no subscription IDs in orders for customer {customer_id}"
+            )
+
+        return sorted(sub_ids)
 
     @staticmethod
     def _sub_id_from_customer_meta(customer: dict) -> int | None:
@@ -407,21 +483,43 @@ class WooCommerceClient:
             else:
                 log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Step 2b: customer-id based subscription lookup ───────────────── #
-        # NOTE: ?billing_email= filter is CONFIRMED BROKEN on this server —
-        # it ignores the email param and returns 50 random subscriptions.
-        # Use /subscriptions?customer={id} instead, which is reliable.
-        # NOTE: ?search= and ?customer= were previously listed as slow, but
-        # ?billing_email= is now confirmed non-functional so this is the only option.
+        # ── Step 2b: find subscription via customer's orders (FAST) ──────── #
+        # /orders?customer={id} is fast (~1-2s) and returns orders that contain
+        # subscription_ids in their line_items or meta_data.
+        # This is MUCH faster than /subscriptions?customer= which is 8-30s.
+        if not all_subs and customer:
+            customer_id = customer.get("id")
+            if customer_id:
+                sub_ids_from_orders = self._find_sub_ids_from_orders(customer_id)
+                if sub_ids_from_orders:
+                    log.info(
+                        f"WC: found {len(sub_ids_from_orders)} subscription ID(s) "
+                        f"via orders for customer {customer_id}: {sub_ids_from_orders}"
+                    )
+                    order_subs = []
+                    for sid in sub_ids_from_orders:
+                        sub = self._get_subscription_by_id(sid)
+                        if sub:
+                            order_subs.append(sub)
+                    if order_subs:
+                        all_subs = order_subs
+
+        # ── Step 2c: /subscriptions?customer= fallback (SLOW, 8-30s) ────── #
+        # Only used when meta_data and orders-based lookup both failed.
+        # Increased timeout to 25s to cover the 8-30s range.
         if not all_subs and customer:
             customer_id = customer.get("id")
             if customer_id:
                 try:
+                    log.info(
+                        f"WC: fast lookups failed, trying slow "
+                        f"?customer={customer_id} (25s timeout)"
+                    )
                     resp = requests.get(
                         f"{self.base}/subscriptions",
                         params={"customer": customer_id, "per_page": 10},
                         auth=self.auth,
-                        timeout=12,
+                        timeout=25,
                     )
                     if resp.ok:
                         customer_subs = resp.json()
@@ -441,7 +539,7 @@ class WooCommerceClient:
                         )
                 except requests.exceptions.Timeout:
                     log.warning(
-                        f"WC: ?customer={customer_id} timed out (12s) for {email} "
+                        f"WC: ?customer={customer_id} timed out (25s) for {email} "
                         "— falling through to Stripe fallback"
                     )
                 except requests.exceptions.RequestException as e:
@@ -491,6 +589,7 @@ class WooCommerceClient:
                     "subscription_type": sub_type,
                     "subscription_id": target["id"],
                     "plan": plan or "IQ Test Subscription",
+                    "order_count": order_count,  # FIX: include for order-count gate in _finish_cancellation
                 }
 
             log.info(f"WC: subscriptions found but none active for {email}")
