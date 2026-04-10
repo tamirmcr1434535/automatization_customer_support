@@ -47,9 +47,17 @@ from bq_logger import log_result
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("bot")
 
+SHADOW_MODE        = os.getenv("SHADOW_MODE", "false").lower() == "true"
 DRY_RUN            = os.getenv("DRY_RUN", "true").lower() == "true"
 TEST_MODE          = os.getenv("TEST_MODE", "true").lower() == "true"
 TEST_TAG           = "automation_test"
+
+# SHADOW_MODE: process ALL tickets, skip ALL writes, send Slack report per ticket.
+# Overrides: DRY_RUN=true (no writes), TEST_MODE=false (all tickets), Slack stays live.
+if SHADOW_MODE:
+    DRY_RUN   = True
+    TEST_MODE = False
+    logging.info("🔍 SHADOW_MODE enabled — processing all tickets, no writes, Slack reports ON")
 # How many days to wait for card/payment info before auto-closing the ticket.
 # Controlled via env var so it can be changed without a code deploy.
 AWAITING_CARD_DAYS = int(os.getenv("AWAITING_CARD_DAYS", "7"))
@@ -86,7 +94,7 @@ stripe_cli = StripeClient(
 slack = SlackClient(
     bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
     target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
-    dry_run=DRY_RUN,
+    dry_run=DRY_RUN and not SHADOW_MODE,  # Slack stays live in shadow mode
 )
 
 
@@ -96,7 +104,7 @@ slack = SlackClient(
 def zendesk_webhook(request):
     if request.method == "GET":
         return json.dumps({
-            "status": "ok", "dry_run": DRY_RUN,
+            "status": "ok", "dry_run": DRY_RUN, "shadow_mode": SHADOW_MODE,
             "test_mode": TEST_MODE, "handles": list(HANDLED_INTENTS),
         }), 200, {"Content-Type": "application/json"}
 
@@ -127,6 +135,24 @@ def zendesk_webhook(request):
             )
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send Slack error alert")
+
+    # ── SHADOW_MODE: send Slack report for every processed ticket ────── #
+    if SHADOW_MODE and result.get("status") not in (
+        "skipped_already_handled",
+        "skipped_merged",
+        "skipped_closed",
+        "skipped_agent_already_replied",
+        "skipped_spam_detected",
+        "skipped_pending_awaiting_reply",
+    ):
+        try:
+            slack.notify_shadow_result(
+                ticket_id=ticket_id,
+                result=result,
+                zendesk_subdomain=ZENDESK_SUBDOMAIN,
+            )
+        except Exception:
+            log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
 
     return json.dumps(result), 200, {"Content-Type": "application/json"}
 
