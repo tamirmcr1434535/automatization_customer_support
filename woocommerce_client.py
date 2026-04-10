@@ -158,7 +158,7 @@ class WooCommerceClient:
 
         exact = []
         trusted_empty = []
-        has_wrong_email = False
+        wrong_email_subs = []
 
         for s in data:
             if self._subscription_matches_email(s, email_lower):
@@ -166,7 +166,12 @@ class WooCommerceClient:
             else:
                 be = s.get("billing", {}).get("email", "").strip()
                 if be:
-                    has_wrong_email = True
+                    wrong_email_subs.append(s)
+                    log.warning(
+                        f"WC: billing_email query returned sub #{s.get('id')} "
+                        f"with mismatched billing.email='{be}' (expected '{email}') "
+                        "— WC server filter may be unreliable"
+                    )
                 else:
                     trusted_empty.append(s)
 
@@ -176,18 +181,32 @@ class WooCommerceClient:
             )
             return exact
 
-        if trusted_empty and not has_wrong_email:
+        # If API returned ONLY trusted-empty subs (billing.email blank, server filtered) —
+        # trust the server result as long as no wrong-email subs were mixed in.
+        if trusted_empty and not wrong_email_subs:
             log.info(
                 f"WC: billing_email returned {len(trusted_empty)} sub(s) with empty "
                 f"billing.email for {email} — trusting server filter"
             )
             return trusted_empty
 
-        if has_wrong_email:
-            log.info(
-                f"WC: billing_email returned subs with wrong emails for {email} "
-                "— server filter broken, discarding results"
+        # If API returned a mix of wrong-email + empty-email subs, the server filter
+        # is unreliable. Log the situation so we can diagnose in logs.
+        if wrong_email_subs and trusted_empty:
+            log.warning(
+                f"WC: billing_email query for {email} returned mixed results "
+                f"({len(trusted_empty)} empty-email, {len(wrong_email_subs)} wrong-email) "
+                "— server filter broken, discarding all to avoid false positives"
             )
+
+        if wrong_email_subs and not trusted_empty and not exact:
+            log.warning(
+                f"WC: billing_email query for {email} returned {len(wrong_email_subs)} "
+                "sub(s) with wrong emails and no matches — server filter broken"
+            )
+
+        if not data:
+            log.info(f"WC: billing_email query returned 0 results for {email}")
 
         return []
 
