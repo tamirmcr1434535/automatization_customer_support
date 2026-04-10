@@ -407,14 +407,45 @@ class WooCommerceClient:
             else:
                 log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Step 2b: billing_email query (~1s) ────────────────────────── #
-        if not all_subs:
-            billing_subs = self._find_subs_by_billing_email(email)
-            if billing_subs:
-                log.info(
-                    f"WC: found {len(billing_subs)} sub(s) via billing_email"
-                )
-                all_subs = billing_subs
+        # ── Step 2b: customer-id based subscription lookup ───────────────── #
+        # NOTE: ?billing_email= filter is CONFIRMED BROKEN on this server —
+        # it ignores the email param and returns 50 random subscriptions.
+        # Use /subscriptions?customer={id} instead, which is reliable.
+        # NOTE: ?search= and ?customer= were previously listed as slow, but
+        # ?billing_email= is now confirmed non-functional so this is the only option.
+        if not all_subs and customer:
+            customer_id = customer.get("id")
+            if customer_id:
+                try:
+                    resp = requests.get(
+                        f"{self.base}/subscriptions",
+                        params={"customer": customer_id, "per_page": 10},
+                        auth=self.auth,
+                        timeout=12,
+                    )
+                    if resp.ok:
+                        customer_subs = resp.json()
+                        if isinstance(customer_subs, list) and customer_subs:
+                            log.info(
+                                f"WC: found {len(customer_subs)} sub(s) via "
+                                f"?customer={customer_id} for {email}"
+                            )
+                            all_subs = customer_subs
+                        else:
+                            log.info(
+                                f"WC: ?customer={customer_id} returned no subs for {email}"
+                            )
+                    else:
+                        log.warning(
+                            f"WC: ?customer={customer_id} failed: {resp.status_code}"
+                        )
+                except requests.exceptions.Timeout:
+                    log.warning(
+                        f"WC: ?customer={customer_id} timed out (12s) for {email} "
+                        "— falling through to Stripe fallback"
+                    )
+                except requests.exceptions.RequestException as e:
+                    log.warning(f"WC: ?customer={customer_id} error: {e}")
 
         # NOTE: ?search= endpoint intentionally NOT used — it times out (30s+)
         # on this server. Stripe email-based fallback in main.py covers
