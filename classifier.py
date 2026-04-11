@@ -45,7 +45,8 @@ Classify into ONE intent:
                            If the customer wants BOTH cancellation AND money back → REFUND_REQUEST
                            (human must handle the refund assessment; bot cannot auto-cancel these).
                            Key refund signals: 返金, 払い戻し, クーリングオフ, Widerruf, refund,
-                           お金を返して, 先日の請求を返して, Rückerstattung, 料金返金.
+                           お金を返して, 先日の請求を返して, Rückerstattung, 料金返金,
+                           geld terug (NL: money back), terugbetaling (NL: repayment).
                            IMPORTANT: if the message contains 返金 (refund) WITHOUT any cancel word
                            (解約, キャンセル, 退会, 取り消し) → ALWAYS REFUND_REQUEST, never TRIAL_CANCELLATION.
                            Examples:
@@ -152,8 +153,8 @@ IMPORTANT RULES:
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
    "annuleren", "avboka", "annullere",
    "batalkan", "hentikan langganan", "berhenti berlangganan" (ID: Indonesian)
-   "opzeggen", "beëindigen", "stopzetten", "abonnement annuleren",
-   "opzegging", "uitschrijven" (NL: Dutch)
+   "opzeggen", "op zeggen", "beëindigen", "stopzetten", "abonnement annuleren",
+   "opzegging", "uitschrijven", "abroment" (common typo for abonnement) (NL: Dutch)
    → ALWAYS a cancellation intent (TRIAL_CANCELLATION or SUB_CANCELLATION). NEVER REFUND_REQUEST
    or SUB_RENEWAL_REFUND if ANY cancellation word is present — UNLESS Rule 0 fraud override applies.
    NOTE: "delete my account" / "remove my account" etc. are NO LONGER in this list.
@@ -228,7 +229,8 @@ Language detection rules:
 - RU  = Russian (Кириллица)
 - IT  = Italian
 - ID  = Indonesian (Bahasa Indonesia: "saya", "langganan", "tagihan", "batalkan", "hentikan")
-- NL  = Dutch (Nederlands: "abonnement", "opzeggen", "beëindigen", "annuleren", "verwijderen")
+- NL  = Dutch (Nederlands: "abonnement", "abroment" (common typo), "opzeggen", "op zeggen",
+         "beëindigen", "annuleren", "verwijderen", "geld terug", "goedemiddag", "vriendelijke groet")
 - UK  = Ukrainian (Українська: "акаунт", "видалити", "підписка")
 - Use the primary language of the customer's message body.
 - If the message contains multiple languages, pick the dominant one."""
