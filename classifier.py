@@ -45,7 +45,14 @@ Classify into ONE intent:
                            If the customer wants BOTH cancellation AND money back → REFUND_REQUEST
                            (human must handle the refund assessment; bot cannot auto-cancel these).
                            Key refund signals: 返金, 払い戻し, クーリングオフ, Widerruf, refund,
-                           お金を返して, 先日の請求を返して, Rückerstattung.
+                           お金を返して, 先日の請求を返して, Rückerstattung, 料金返金.
+                           IMPORTANT: if the message contains 返金 (refund) WITHOUT any cancel word
+                           (解約, キャンセル, 退会, 取り消し) → ALWAYS REFUND_REQUEST, never TRIAL_CANCELLATION.
+                           Examples:
+                             "IQテストレポートの料金返金" → REFUND_REQUEST (返金 only, no cancel)
+                             "料金返金をお願いします" → REFUND_REQUEST
+                             "返金希望" → REFUND_REQUEST
+                             "テスト費用の返金をお願いしたい" → REFUND_REQUEST
 - SUB_RENEWAL_REFUND     — ONLY if customer was charged for a renewal AND asks ONLY to refund
                            THAT SPECIFIC charge, with NO request to cancel the subscription.
                            DO NOT use if the message contains any form of "cancel" / "解約" / "退会".
@@ -146,11 +153,15 @@ IMPORTANT RULES:
 6. Default for any ambiguous cancellation → TRIAL_CANCELLATION.
 7. SUB_RENEWAL_REFUND requires ALL THREE: (a) specific renewal charge already happened,
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
-8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT transcript.
-   The customer's messages are embedded in the conversation body.
-   → Default to TRIAL_CANCELLATION — customers reach this chat through the cancellation flow.
-   → If transcript contains ANY cancel signal (even vague) → TRIAL_CANCELLATION (even with refund words).
-   → If transcript contains ONLY refund/fraud signals (ZERO cancel words) → REFUND_REQUEST.
+8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT / Messaging transcript.
+   The customer's actual request is in the conversation body (often a form submission).
+   Classification rules for chat/messaging transcripts:
+   → If body contains ANY cancel signal (解約, キャンセル, 退会, cancel, 취소, etc.) → TRIAL_CANCELLATION.
+   → If body contains refund signals (返金, refund, 払い戻し, 환불, etc.) WITH ZERO cancel words → REFUND_REQUEST.
+   → If body contains BOTH cancel + refund → TRIAL_CANCELLATION (cancel wins per Rule 1a).
+   → If body contains fraud signals (不正請求, unauthorized, etc.) WITH ZERO cancel words → REFUND_REQUEST.
+   → If body is a form submission like "料金返金" or "返金希望" with no cancel words → REFUND_REQUEST.
+   → If body has no clear signal at all → default to TRIAL_CANCELLATION (cancellation flow origin).
    → NEVER return GENERAL_QUESTION, UNKNOWN, or TECHNICAL_ISSUE for chat transcripts.
 9. BILLING CONTACT RULE — any message where the customer mentions a charge, billing, subscription,
    payment, or monthly deduction → TRIAL_CANCELLATION by default.
