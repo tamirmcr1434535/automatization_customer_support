@@ -70,12 +70,28 @@ IMPORTANT RULES:
      DE: "Betrug", "betrügerisch", "nicht autorisiert", "nicht genehmigt", "ohne mein Wissen",
          "ohne meine Zustimmung", "unberechtigte Abbuchung"
      JP: "不法請求", "不正請求", "詐欺", "不正利用"
+     KR: "구독한게 없", "구독한 게 없", "구독한적 없", "구독한 적 없", "구독하지 않았",
+         "구매한것도 없", "구매한 것도 없", "결제한 적 없", "결제한적 없",
+         "가입한 적 없", "가입한적 없", "가입하지 않았", "신청한 적 없",
+         "모르게 결제", "무단 결제", "무단결제", "결제시도", "잘못된 결제",
+         "결제가 잘못", "결제를 한 적", "결제한 기억", "결제한 적이 없"
      EN: "fraud", "fraudulent", "illegal charge", "illegal billing",
          "charged without my consent/permission/knowledge",
          "I never signed up", "I never authorized", "I didn't know about this charge"
    Exception (Rule 0 does NOT apply — use TRIAL_CANCELLATION instead):
-   - Message contains ANY word from Rule 1 cancel list (cancel, 解約したい, opzeggen,
+   - Message contains cancel words from Rule 1 list (cancel, 解約したい, opzeggen,
      uitschrijven, beëindigen, etc.)
+     HOWEVER this exception has SUB-EXCEPTIONS — the following ALWAYS stay REFUND_REQUEST
+     even if "취소" is present:
+   - KR: if "취소" appears WITH any Korean fraud signal from the list above
+     (구독한게 없, 구매한것도 없, 결제시도, 모르게 결제, etc.)
+     → REFUND_REQUEST. The Korean word "취소" in a fraud/dispute context means
+     "reverse/undo the charge", NOT "cancel my subscription".
+     Examples:
+       "전 구독한게 없고 구매한 것도 없는데 취소해주세요" → REFUND_REQUEST (not TRIAL_CANCELLATION!)
+       "왜 결제시도된거죠? 취소해주세요" → REFUND_REQUEST
+       "모르게 결제된 것 같은데 취소 부탁합니다" → REFUND_REQUEST
+       BUT: "구독 취소하고 싶습니다" (no fraud signal) → TRIAL_CANCELLATION
    - German (DE) messages with "nichts bestellt", "kein Abonnement", "nicht abonniert"
      WITHOUT explicit refund words (Rückerstattung, Geld zurück, erstattet, zurückzahlen)
      → TRIAL_CANCELLATION (customer wants to cancel the unwanted subscription, NOT get a refund).
