@@ -82,6 +82,36 @@ HANDLED_INTENTS = {
 # are renewals that require manual review (refund assessment, etc.).
 MAX_BOT_ORDERS = 3
 
+# ── Cancel signal keywords (used in safety net + refund override guard) ── #
+# If these are present alongside refund/fraud keywords, the CANCEL intent wins
+# (Rule 1a: "cancel always wins"). Only override to REFUND_REQUEST when there
+# are ZERO cancel signals.
+_CANCEL_SIGNALS = [
+    "cancel", "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい",
+    "취소", "해지", "탈퇴", "kündigen", "stornieren", "annuleren", "opzeggen",
+    "annuler", "cancelar", "отменить", "відмінити", "скасувати",
+    "cancel my subscription", "cancel subscription", "cancel immediately",
+    "stop all future charges", "stop future charges", "stop charging",
+    "stop my subscription", "end my subscription",
+    "解約したい", "退会したい", "解約してください", "退会してください",
+    "구독 취소", "구독취소", "해지 요청", "해지요청",
+    "kündigung", "abo kündigen", "abonnement kündigen",
+    "annuler mon abonnement", "résilier",
+    "cancelar suscripción", "cancelar mi suscripción",
+    "darse de baja",  # Spanish: unsubscribe
+    "opzeggen", "beëindigen", "stopzetten", "uitschrijven",  # Dutch
+    "avbryte", "avslutte", "kansellere",  # Norwegian
+    "avboka", "avsluta", "säga upp",  # Swedish
+    "annullere", "opsige",  # Danish
+    "batalkan", "hentikan langganan", "berhenti berlangganan",  # Indonesian
+]
+
+
+def _contains_cancel_signal(text: str) -> bool:
+    """Return True if text contains any cancel/stop-subscription keyword."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _CANCEL_SIGNALS)
+
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
 # ── Shadow deduplication (Firestore-backed distributed lock) ─────────── #
@@ -540,11 +570,6 @@ def _process(ticket_id: str) -> dict:
     # short body with strong signals like "解約したのに...返金してほしい").
     if intent == "UNKNOWN":
         full_text_lower = (subject + " " + body).lower()
-        _CANCEL_KEYWORD_FALLBACK = [
-            "cancel", "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい",
-            "취소", "해지", "탈퇴", "kündigen", "stornieren", "annuleren", "opzeggen",
-            "annuler", "cancelar", "отменить",
-        ]
         _DELETE_ACCOUNT_KEYWORD_FALLBACK = [
             "delete my account", "delete account", "remove my account",
             "close my account", "deactivate my account",
@@ -560,7 +585,7 @@ def _process(ticket_id: str) -> dict:
             "rückerstattung", "widerruf", "remboursement", "환불", "reembolso", "возврат",
             "rimborso", "money back", "chargeback",
         ]
-        has_cancel = any(kw in full_text_lower for kw in _CANCEL_KEYWORD_FALLBACK)
+        has_cancel = any(kw in full_text_lower for kw in _CANCEL_SIGNALS)
         has_delete = any(kw in full_text_lower for kw in _DELETE_ACCOUNT_KEYWORD_FALLBACK)
         has_refund = any(kw in full_text_lower for kw in _REFUND_KEYWORD_FALLBACK)
 
@@ -624,9 +649,25 @@ def _process(ticket_id: str) -> dict:
                 _all_text_for_refund += " " + all_comments
         except Exception:
             log.warning(f"[{ticket_id}] Failed to fetch comments for refund check")
-    if intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund):
+    _has_refund_kw = intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund)
+    _has_cancel_kw = _contains_cancel_signal(_all_text_for_refund) if _has_refund_kw else False
+
+    if _has_refund_kw and _has_cancel_kw:
+        # Both cancel AND refund/fraud signals present — CANCEL WINS (Rule 1a).
+        # Examples: "cancel my subscription + I'll report as fraud"
+        #           "解約したい + 返金してほしい"
+        # The bot cancels first; refund is handled by humans later.
         log.info(
-            f"[{ticket_id}] {intent} but refund keywords detected in body "
+            f"[{ticket_id}] {intent}: refund keywords detected BUT cancel signals "
+            "also present → cancel wins (Rule 1a), NOT overriding to REFUND_REQUEST"
+        )
+        # Continue to cancellation flow — don't override
+
+    elif _has_refund_kw and not _has_cancel_kw:
+        # ONLY refund/fraud signals, ZERO cancel signals → pure refund request.
+        # Human must handle this (bot cannot auto-cancel).
+        log.info(
+            f"[{ticket_id}] {intent} but refund keywords detected (no cancel signals) "
             "→ overriding to REFUND_REQUEST (human must handle refund)"
         )
         intent = "REFUND_REQUEST"
