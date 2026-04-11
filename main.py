@@ -106,8 +106,14 @@ stripe_cli = StripeClient(
 slack = SlackClient(
     bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
     target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
-    dry_run=DRY_RUN and not SHADOW_MODE,  # Slack stays live in shadow mode
+    dry_run=DRY_RUN,  # In SHADOW_MODE: dry_run=True suppresses alerts inside _process
 )
+# Separate live Slack client for shadow reports only (used in webhook handler)
+_shadow_slack = SlackClient(
+    bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
+    target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
+    dry_run=not SHADOW_MODE,  # Live only when SHADOW_MODE is on
+) if SHADOW_MODE else None
 
 
 # ── HTTP handler ──────────────────────────────────────────────────────── #
@@ -155,6 +161,12 @@ def zendesk_webhook(request):
         "skipped_already_handled",
         "skipped_merged",
     ):
+        # 0. Idempotency: if we already processed this ticket, skip entirely
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "shadow_processed" in current_tags:
+            log.info(f"[{ticket_id}] Shadow: already processed (tag present) — skip duplicate")
+            return json.dumps(result), 200, {"Content-Type": "application/json"}
+
         # 1. Enrich: classify tickets that hit early exits (before classifier)
         _shadow_enrich_result(ticket_id, result)
 
@@ -167,9 +179,9 @@ def zendesk_webhook(request):
         #    Uses _bq_log_result directly — bypasses the no-op wrapper
         _bq_log_result(result)
 
-        # 4. Send per-ticket Slack report
+        # 4. Send per-ticket Slack report (via dedicated shadow Slack client)
         try:
-            slack.notify_shadow_result(
+            _shadow_slack.notify_shadow_result(
                 ticket_id=ticket_id,
                 result=result,
                 zendesk_subdomain=ZENDESK_SUBDOMAIN,
