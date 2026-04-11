@@ -360,6 +360,7 @@ class SlackClient:
         emoji_map = {
             "success": "✅",
             "manual_review_required": "⚠️",
+            "escalated_delete_account": "🗑️",
             "skipped_refund_request": "💰",
             "awaiting_card_digits": "💳",
             "skipped_not_handled": "⏭️",
