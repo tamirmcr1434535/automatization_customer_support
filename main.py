@@ -140,6 +140,31 @@ def zendesk_webhook(request):
 
     log.info(f"[{ticket_id}] Webhook received")
 
+    # ── SHADOW_MODE: early claim ──────────────────────────────────────── #
+    # Zendesk fires the webhook multiple times in quick succession.
+    # _process() takes 5-6 seconds (fetch ticket + classify via Claude API).
+    # If we check shadow_processed AFTER _process, all concurrent calls
+    # will have already finished processing before any of them writes the tag
+    # → 6 duplicate Slack reports.
+    #
+    # Fix: check + claim the tag BEFORE _process(). This way:
+    #   Call 1: reads tags → no shadow_processed → writes shadow_processed → runs _process
+    #   Call 2 (200ms later): reads tags → shadow_processed present → skips immediately
+    _shadow_claimed = False
+    if SHADOW_MODE:
+        try:
+            early_tags = zendesk.get_ticket_tags(ticket_id)
+            if "shadow_processed" in early_tags:
+                log.info(f"[{ticket_id}] Shadow: already processed (tag present) — skip duplicate")
+                return json.dumps({"ticket_id": ticket_id, "status": "skipped_shadow_duplicate"}), 200, {"Content-Type": "application/json"}
+            # Claim immediately — any concurrent webhook that reads tags after this
+            # point will see shadow_processed and skip.
+            zendesk.add_tag(ticket_id, "shadow_processed")
+            _shadow_claimed = True
+            log.info(f"[{ticket_id}] Shadow: claimed (tag written before _process)")
+        except Exception:
+            log.warning(f"[{ticket_id}] Shadow early claim failed — proceeding without lock")
+
     try:
         result = _process(ticket_id)
     except Exception as e:
@@ -161,12 +186,6 @@ def zendesk_webhook(request):
         "skipped_already_handled",
         "skipped_merged",
     ):
-        # 0. Idempotency: if we already processed this ticket, skip entirely
-        current_tags = zendesk.get_ticket_tags(ticket_id)
-        if "shadow_processed" in current_tags:
-            log.info(f"[{ticket_id}] Shadow: already processed (tag present) — skip duplicate")
-            return json.dumps(result), 200, {"Content-Type": "application/json"}
-
         # 1. Enrich: classify tickets that hit early exits (before classifier)
         _shadow_enrich_result(ticket_id, result)
 
@@ -189,12 +208,11 @@ def zendesk_webhook(request):
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
 
-        # 5. Tag ticket for future reference
+        # 5. Add shadow decision tag (shadow_processed was already claimed above)
         try:
-            zendesk.add_tag(ticket_id, "shadow_processed")
             zendesk.add_tag(ticket_id, shadow_tag)
         except Exception:
-            log.exception(f"[{ticket_id}] Failed to add shadow tags")
+            log.exception(f"[{ticket_id}] Failed to add shadow decision tag")
 
     return json.dumps(result), 200, {"Content-Type": "application/json"}
 
