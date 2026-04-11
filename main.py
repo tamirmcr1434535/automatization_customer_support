@@ -205,6 +205,7 @@ _SHADOW_STATUS_TO_TAG = {
     "success":                      "shadow_would_cancel",
     "manual_review_required":       "shadow_would_escalate",
     "escalated_low_confidence":     "shadow_would_escalate",
+    "escalated_delete_account":     "shadow_would_escalate",
     "skipped_refund_request":       "shadow_would_skip_refund",
     "skipped_not_handled":          "shadow_would_skip",
     "skipped_followup":             "shadow_would_skip",
@@ -438,7 +439,17 @@ def _process(ticket_id: str) -> dict:
         _CANCEL_KEYWORD_FALLBACK = [
             "cancel", "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい",
             "취소", "해지", "탈퇴", "kündigen", "stornieren", "annuleren", "opzeggen",
-            "annuler", "cancelar", "отменить", "delete my account", "close my account",
+            "annuler", "cancelar", "отменить",
+        ]
+        _DELETE_ACCOUNT_KEYWORD_FALLBACK = [
+            "delete my account", "delete account", "remove my account",
+            "close my account", "deactivate my account",
+            "アカウント削除", "アカウントの削除", "アカウントを削除",
+            "アカウントを消して", "アカウントを消去",
+            "계정 삭제", "계정삭제",
+            "konto löschen", "supprimer mon compte",
+            "видалити акаунт", "удалить аккаунт",
+            "account verwijderen",
         ]
         _REFUND_KEYWORD_FALLBACK = [
             "refund", "返金", "払い戻し", "クーリングオフ", "お金を返して", "geld zurück",
@@ -446,6 +457,7 @@ def _process(ticket_id: str) -> dict:
             "rimborso", "money back", "chargeback",
         ]
         has_cancel = any(kw in full_text_lower for kw in _CANCEL_KEYWORD_FALLBACK)
+        has_delete = any(kw in full_text_lower for kw in _DELETE_ACCOUNT_KEYWORD_FALLBACK)
         has_refund = any(kw in full_text_lower for kw in _REFUND_KEYWORD_FALLBACK)
 
         if has_cancel:
@@ -458,6 +470,17 @@ def _process(ticket_id: str) -> dict:
             classification["reasoning"] = (
                 f"classifier fallback: UNKNOWN overridden — "
                 f"cancel keyword detected in body"
+            )
+        elif has_delete and not has_refund:
+            log.info(
+                f"[{ticket_id}] Classifier returned UNKNOWN but delete-account signal found "
+                "→ overriding to DELETE_ACCOUNT (safety net)"
+            )
+            intent = "DELETE_ACCOUNT"
+            classification["intent"] = intent
+            classification["reasoning"] = (
+                f"classifier fallback: UNKNOWN overridden — "
+                f"delete-account keyword detected in body"
             )
         elif has_refund:
             log.info(
@@ -538,8 +561,7 @@ def _process(ticket_id: str) -> dict:
             "cancel", "キャンセル", "解約", "解除", "退会", "取り消", "止めたい",
             "やめたい", "취소", "해지", "탈퇴", "kündigen", "stornieren",
             "annuleren", "opzeggen", "annuler", "cancelar", "отменить",
-            "отписаться", "delete my account", "close my account",
-            "remove my account", "stop my subscription", "unsubscribe",
+            "отписаться", "stop my subscription", "unsubscribe",
         ]
         has_cancel = any(sig in full_text for sig in _CANCEL_SIGNALS)
 
@@ -614,6 +636,41 @@ def _process(ticket_id: str) -> dict:
         )
 
     # ── NORMAL CANCELLATION FLOW ──────────────────────────────────────── #
+
+    # 3d. DELETE_ACCOUNT — customer wants account/data deletion (GDPR/privacy).
+    # Bot cannot handle this automatically — escalate to human agent.
+    if intent == "DELETE_ACCOUNT":
+        log.info(f"[{ticket_id}] DELETE_ACCOUNT — escalating to agent for data deletion")
+
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+            result["status"] = "skipped_race_condition"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "delete_account")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: customer requests account deletion (DELETE_ACCOUNT, "
+            f"confidence {confidence:.0%}). Requires manual handling — "
+            f"data deletion per privacy policy.",
+        )
+        zendesk.set_open(ticket_id)
+        slack_sent = slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=email,
+            intent="DELETE_ACCOUNT",
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result.update({
+            "status": "escalated_delete_account",
+            "action": "escalated_to_agent_delete_account",
+            "slack_sent": slack_sent,
+        })
+        log_result(result)
+        return result
 
     # 4. Skip unhandled intents
     if intent not in HANDLED_INTENTS:
