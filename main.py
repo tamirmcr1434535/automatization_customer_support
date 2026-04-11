@@ -851,6 +851,55 @@ def _process(ticket_id: str) -> dict:
         intent in HANDLED_INTENTS
         and _contains_cancel_signal(subject + " " + body)
     )
+
+    # Cross-ticket context: if confidence is low AND keyword didn't confirm,
+    # check other recent tickets from the same requester. Often the customer
+    # sends multiple tickets (e.g. "환불 부탁드립니다" + Messaging conversation)
+    # and the Messaging one has no clear signal — but the sibling tickets do.
+    if not _keyword_confirms_intent and confidence < 0.65 and email:
+        try:
+            sibling_tickets = zendesk.search_tickets(
+                f"requester:{email} type:ticket created>-7days"
+            )
+            sibling_texts = []
+            for t in sibling_tickets:
+                if str(t.get("id")) != str(ticket_id):
+                    sibling_texts.append(
+                        (t.get("subject") or "") + " " + (t.get("description") or "")[:300]
+                    )
+            if sibling_texts:
+                combined_sibling_text = " ".join(sibling_texts)
+                sibling_has_cancel = _contains_cancel_signal(combined_sibling_text)
+                sibling_has_refund = _contains_refund_request(combined_sibling_text)
+
+                if sibling_has_refund:
+                    # Sibling tickets show refund intent → override to REFUND_REQUEST
+                    log.info(
+                        f"[{ticket_id}] Low confidence {confidence:.0%} BUT sibling "
+                        f"tickets from {email} contain refund signals → REFUND_REQUEST"
+                    )
+                    intent = "REFUND_REQUEST"
+                    result["intent"] = intent
+                    result["status"] = "skipped_refund_request"
+                    zendesk.add_tag(ticket_id, "bot_handled")
+                    slack_sent = slack.notify_refund_skip(
+                        ticket_id=ticket_id, email=email,
+                        intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
+                    )
+                    result["slack_sent"] = slack_sent
+                    log_result(result)
+                    return result
+
+                if sibling_has_cancel:
+                    # Sibling tickets confirm cancel intent → proceed
+                    _keyword_confirms_intent = True
+                    log.info(
+                        f"[{ticket_id}] Low confidence {confidence:.0%} BUT sibling "
+                        f"tickets from {email} contain cancel signals → proceeding"
+                    )
+        except Exception:
+            log.warning(f"[{ticket_id}] Cross-ticket lookup failed — ignoring")
+
     if _keyword_confirms_intent and confidence < 0.65:
         log.info(
             f"[{ticket_id}] Low confidence {confidence:.0%} BUT cancel keyword "
