@@ -87,23 +87,36 @@ MAX_BOT_ORDERS = 3
 # (Rule 1a: "cancel always wins"). Only override to REFUND_REQUEST when there
 # are ZERO cancel signals.
 _CANCEL_SIGNALS = [
-    "cancel", "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい",
-    "취소", "해지", "탈퇴", "kündigen", "stornieren", "annuleren", "opzeggen",
-    "annuler", "cancelar", "отменить", "відмінити", "скасувати",
+    # English
+    "cancel", "unsubscribe",
     "cancel my subscription", "cancel subscription", "cancel immediately",
     "stop all future charges", "stop future charges", "stop charging",
     "stop my subscription", "end my subscription",
+    # Japanese
+    "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい", "取り消",
     "解約したい", "退会したい", "解約してください", "退会してください",
+    # Korean
+    "취소", "해지", "탈퇴",
     "구독 취소", "구독취소", "해지 요청", "해지요청",
-    "kündigung", "abo kündigen", "abonnement kündigen",
-    "annuler mon abonnement", "résilier",
-    "cancelar suscripción", "cancelar mi suscripción",
-    "darse de baja",  # Spanish: unsubscribe
-    "opzeggen", "beëindigen", "stopzetten", "uitschrijven",  # Dutch
-    "avbryte", "avslutte", "kansellere",  # Norwegian
-    "avboka", "avsluta", "säga upp",  # Swedish
-    "annullere", "opsige",  # Danish
-    "batalkan", "hentikan langganan", "berhenti berlangganan",  # Indonesian
+    # German
+    "kündigen", "stornieren", "kündigung", "abo kündigen", "abonnement kündigen",
+    # French
+    "annuler", "annuler mon abonnement", "résilier", "résiliation",
+    # Spanish
+    "cancelar", "cancelar suscripción", "cancelar mi suscripción", "darse de baja",
+    # Dutch — including typo/space variants (e.g. "op zeggen" = "opzeggen")
+    "opzeggen", "op zeggen", "beëindigen", "stopzetten", "uitschrijven", "annuleren",
+    "abonnement opzeggen", "abonnement annuleren", "abroment",
+    # Norwegian
+    "avbryte", "avslutte", "kansellere",
+    # Swedish
+    "avboka", "avsluta", "säga upp",
+    # Danish
+    "annullere", "opsige",
+    # Indonesian
+    "batalkan", "hentikan langganan", "berhenti berlangganan",
+    # Ukrainian / Russian
+    "отменить", "відмінити", "скасувати", "отписаться",
 ]
 
 
@@ -713,14 +726,8 @@ def _process(ticket_id: str) -> dict:
     # subscription immediately so they stop being charged. The bot cancels,
     # and adds an internal note about the refund request for the human team.
     if intent in ("REFUND_REQUEST", "SUB_RENEWAL_REFUND"):
-        full_text = (subject + " " + body).lower()
-        _CANCEL_SIGNALS = [
-            "cancel", "キャンセル", "解約", "解除", "退会", "取り消", "止めたい",
-            "やめたい", "취소", "해지", "탈퇴", "kündigen", "stornieren",
-            "annuleren", "opzeggen", "annuler", "cancelar", "отменить",
-            "отписаться", "stop my subscription", "unsubscribe",
-        ]
-        has_cancel = any(sig in full_text for sig in _CANCEL_SIGNALS)
+        full_text = subject + " " + body
+        has_cancel = _contains_cancel_signal(full_text)
 
         if has_cancel:
             # Override intent: customer wants cancellation + refund → cancel first
@@ -836,8 +843,22 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 5. Low confidence → escalate
-    if confidence < 0.65:
+    # 5. Low confidence → escalate (unless cancel keyword confirms the intent)
+    # For short Messaging form submissions like "cancel" or "解約", the classifier
+    # often returns low confidence due to lack of context. But the keyword itself
+    # is unambiguous — if it matches a cancel signal, trust the intent.
+    _keyword_confirms_intent = (
+        intent in HANDLED_INTENTS
+        and _contains_cancel_signal(subject + " " + body)
+    )
+    if _keyword_confirms_intent and confidence < 0.65:
+        log.info(
+            f"[{ticket_id}] Low confidence {confidence:.0%} BUT cancel keyword "
+            f"confirms {intent} → proceeding (keyword override)"
+        )
+        # Don't escalate — keyword match confirms the classifier's intent
+
+    elif confidence < 0.65:
         log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent")
 
         # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
@@ -1663,6 +1684,16 @@ _REFUND_KEYWORDS = [
     "возврат",
     # Italian
     "rimborso",
+    # Dutch
+    "geld terug", # money back
+    "terugbetaling", # refund/repayment
+    "terugbetalen", # to refund
+    "terugvordering", # reimbursement/reclaim
+    "ongeautoriseerd", # unauthorized
+    "ongeautoriseerde betaling", # unauthorized payment
+    "niet geautoriseerd", # not authorized
+    "onbekende afschrijving", # unknown debit
+    "niet besteld", # didn't order
     # Norwegian
     "tilbakebetaling", # refund/repayment
     "refusjon", # refund
