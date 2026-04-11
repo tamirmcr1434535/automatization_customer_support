@@ -20,6 +20,24 @@ Classify into ONE intent:
                            Use this when customer explicitly mentions ongoing monthly charges
                            and wants them stopped.
                            NOTE: if uncertain between TRIAL and SUB → always pick TRIAL_CANCELLATION.
+- DELETE_ACCOUNT         — customer wants their ACCOUNT DELETED (data removal, GDPR, privacy).
+                           USE THIS when the customer says "delete my account", "アカウント削除",
+                           "アカウントの削除", "アカウントを削除", "계정 삭제", "계정 삭제 요청",
+                           "Konto löschen", "supprimer mon compte", "eliminar mi cuenta",
+                           "видалити акаунт", "удалить аккаунт", "delete account",
+                           "remove my account", "close my account", "deactivate my account",
+                           "アカウントを消して", "アカウントを消去", "退会してデータを削除",
+                           "account verwijderen" (NL)
+                           AND the message does NOT mention subscription cancellation, billing,
+                           charges, or payments as the primary concern.
+                           Key distinction: if the customer says ONLY "delete my account" or
+                           "remove my data" WITHOUT any billing/subscription/charge context
+                           → DELETE_ACCOUNT.
+                           If the customer says "delete my account" AND also mentions
+                           cancelling subscription, stopping charges, billing, or payments
+                           → TRIAL_CANCELLATION (cancel intent takes priority).
+                           If the Zendesk topic/subject contains "Delete account" and the body
+                           is a short deletion request with no billing context → DELETE_ACCOUNT.
 - SUB_RENEWAL_CANCELLATION — wants to stop auto-renewal before next billing date (no refund request)
 - REFUND_REQUEST         — Use when:
                            (a) customer asks ONLY for money back (no cancel request), OR
@@ -57,12 +75,7 @@ IMPORTANT RULES:
          "I never signed up", "I never authorized", "I didn't know about this charge"
    Exception (Rule 0 does NOT apply — use TRIAL_CANCELLATION instead):
    - Message contains ANY word from Rule 1 cancel list (cancel, 解約したい, opzeggen,
-     account verwijderen, uitschrijven, beëindigen, etc.)
-   - EN account deletion: "delete my account", "remove my account", "close my account",
-     "deactivate my account" → ALWAYS TRIAL_CANCELLATION (account deletion = cancel request,
-     even if the customer also mentions not knowing about the subscription).
-   - Dutch (NL) messages with "account verwijderen" or "opzeggen" → ALWAYS TRIAL_CANCELLATION
-     even if the customer also mentions not knowing about the subscription.
+     uitschrijven, beëindigen, etc.)
    - German (DE) messages with "nichts bestellt", "kein Abonnement", "nicht abonniert"
      WITHOUT explicit refund words (Rückerstattung, Geld zurück, erstattet, zurückzahlen)
      → TRIAL_CANCELLATION (customer wants to cancel the unwanted subscription, NOT get a refund).
@@ -71,6 +84,18 @@ IMPORTANT RULES:
      → TRIAL_CANCELLATION (customer rejecting an unwanted charge, not requesting a refund).
    Pure fraud complaint with ZERO cancel words AND ZERO account-deletion phrases
    → REFUND_REQUEST.
+
+0b. DELETE_ACCOUNT RULE — evaluate BEFORE cancel rules:
+   If the customer's request is PURELY about deleting their account or removing their data,
+   with NO mention of subscription, billing, charges, or cancellation → DELETE_ACCOUNT.
+   Signals: "delete my account", "アカウント削除", "アカウントの削除", "アカウントを削除して",
+   "계정 삭제", "Konto löschen", "supprimer mon compte", "видалити акаунт",
+   "удалить аккаунт", "remove my account", "close my account", "deactivate my account",
+   "account verwijderen", "アカウントを消して", "アカウントを消去".
+   CRITICAL: if "delete account" + subscription/billing/charge context → TRIAL_CANCELLATION.
+   CRITICAL: if "delete account" + refund/money back → REFUND_REQUEST.
+   ONLY use DELETE_ACCOUNT when the SOLE request is account/data removal.
+
 1a. CANCEL ALWAYS WINS (check this FIRST, before any other rule):
    If the customer message contains ANY cancellation signal → ALWAYS classify as
    TRIAL_CANCELLATION (or SUB_CANCELLATION if clearly a paid subscription).
@@ -92,11 +117,11 @@ IMPORTANT RULES:
    "annuleren", "avboka", "annullere",
    "batalkan", "hentikan langganan", "berhenti berlangganan" (ID: Indonesian)
    "opzeggen", "beëindigen", "stopzetten", "abonnement annuleren",
-   "account verwijderen", "opzegging", "uitschrijven" (NL: Dutch)
-   EN account deletion: "delete my account", "delete account", "remove my account",
-   "remove account", "close my account", "close account", "deactivate my account"
+   "opzegging", "uitschrijven" (NL: Dutch)
    → ALWAYS a cancellation intent (TRIAL_CANCELLATION or SUB_CANCELLATION). NEVER REFUND_REQUEST
    or SUB_RENEWAL_REFUND if ANY cancellation word is present — UNLESS Rule 0 fraud override applies.
+   NOTE: "delete my account" / "remove my account" etc. are NO LONGER in this list.
+   They are handled by Rule 0b (DELETE_ACCOUNT) unless billing context is present.
 2. "I noticed recurring/unexpected charges + please cancel" → TRIAL_CANCELLATION.
    Mentioning past charges does NOT make it a refund intent if the customer asks to cancel.
 3. "I only wanted the IQ test / 知能テスト but got a subscription" → TRIAL_CANCELLATION.
@@ -126,6 +151,21 @@ IMPORTANT RULES:
    alongside the refund request → TRIAL_CANCELLATION (Rule 1a always wins).
    DISTINCTION: "please cancel my subscription + refund" → TRIAL_CANCELLATION (cancel wins).
                 "please reverse this specific payment" (no cancel word) → REFUND_REQUEST.
+10. DELETE_ACCOUNT examples:
+   JP: "アカウントの削除をお願いします" → DELETE_ACCOUNT
+   JP: "アカウントを削除してください" → DELETE_ACCOUNT
+   JP: "アカウント削除の依頼" → DELETE_ACCOUNT
+   JP: "私のアカウントの削除の要請" → DELETE_ACCOUNT
+   EN: "Please delete my account" → DELETE_ACCOUNT
+   EN: "I want to remove my account" → DELETE_ACCOUNT
+   UK: "Прошу видалити мій акаунт" → DELETE_ACCOUNT
+   RU: "Удалите мой аккаунт" → DELETE_ACCOUNT
+   DE: "Bitte löschen Sie mein Konto" → DELETE_ACCOUNT
+   NL: "Account verwijderen alstublieft" → DELETE_ACCOUNT
+   KR: "계정 삭제 부탁드립니다" → DELETE_ACCOUNT
+   BUT: "Delete my account, I was charged 1990 yen" → TRIAL_CANCELLATION (billing context!)
+   BUT: "アカウント削除して、返金もお願いします" → REFUND_REQUEST (refund context!)
+   BUT: "解約してアカウントも削除して" → TRIAL_CANCELLATION (cancel keyword present!)
 
 Return ONLY raw valid JSON. No markdown, no ```json, no extra text.
 {
@@ -149,6 +189,7 @@ Language detection rules:
 - IT  = Italian
 - ID  = Indonesian (Bahasa Indonesia: "saya", "langganan", "tagihan", "batalkan", "hentikan")
 - NL  = Dutch (Nederlands: "abonnement", "opzeggen", "beëindigen", "annuleren", "verwijderen")
+- UK  = Ukrainian (Українська: "акаунт", "видалити", "підписка")
 - Use the primary language of the customer's message body.
 - If the message contains multiple languages, pick the dominant one."""
 
