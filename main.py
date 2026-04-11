@@ -655,15 +655,20 @@ def _process(ticket_id: str) -> dict:
     # have a generic description but the actual refund complaint is only in
     # the first customer comment or follow-up replies.
     _all_text_for_refund = subject + " " + body
+    _customer_text_only = body  # body + comments, WITHOUT subject (for cancel check)
     if intent in HANDLED_INTENTS:
         try:
             all_comments = zendesk.get_all_customer_comments_text(ticket_id)
             if all_comments:
                 _all_text_for_refund += " " + all_comments
+                _customer_text_only += " " + all_comments
         except Exception:
             log.warning(f"[{ticket_id}] Failed to fetch comments for refund check")
     _has_refund_kw = intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund)
-    _has_cancel_kw = _contains_cancel_signal(_all_text_for_refund) if _has_refund_kw else False
+    # IMPORTANT: check cancel signals in BODY + COMMENTS only (not subject).
+    # Subjects like "Re: Your Subscription Cancellation Code" are system-generated
+    # and contain "cancel" even when the customer's actual request is a pure refund.
+    _has_cancel_kw = _contains_cancel_signal(_customer_text_only) if _has_refund_kw else False
 
     if _has_refund_kw and _has_cancel_kw:
         # Both cancel AND refund/fraud signals present — CANCEL WINS (Rule 1a).
