@@ -42,7 +42,18 @@ from reply_generator import (
     generate_not_found_reply,
     generate_timeout_reply,
 )
-from bq_logger import log_result
+from bq_logger import log_result as _bq_log_result
+
+
+def log_result(result: dict) -> None:
+    """
+    Wrapper around bq_logger.log_result.
+    In SHADOW_MODE, skip logging inside _process — the webhook handler
+    will call _bq_log_result once with fully enriched data.
+    """
+    if SHADOW_MODE:
+        return  # shadow logging happens in webhook handler after enrichment
+    _bq_log_result(result)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("bot")
@@ -80,6 +91,7 @@ zendesk = ZendeskClient(
     email=os.getenv("ZENDESK_EMAIL"),
     api_token=os.getenv("ZENDESK_API_TOKEN"),
     dry_run=DRY_RUN,
+    shadow_mode=SHADOW_MODE,
 )
 woo = WooCommerceClient(
     site_url=os.getenv("WOO_SITE_URL", "https://iqbooster.org"),
@@ -136,15 +148,26 @@ def zendesk_webhook(request):
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send Slack error alert")
 
-    # ── SHADOW_MODE: send Slack report for every processed ticket ────── #
+    # ── SHADOW_MODE: enrich → log → Slack → tag ────────────────────────── #
+    # Every ticket gets full classification + detailed BQ log so we can
+    # review accuracy by querying: WHERE shadow_mode = TRUE
     if SHADOW_MODE and result.get("status") not in (
         "skipped_already_handled",
         "skipped_merged",
-        "skipped_closed",
-        "skipped_agent_already_replied",
-        "skipped_spam_detected",
-        "skipped_pending_awaiting_reply",
     ):
+        # 1. Enrich: classify tickets that hit early exits (before classifier)
+        _shadow_enrich_result(ticket_id, result)
+
+        # 2. Add shadow-specific fields for BQ
+        shadow_tag = _shadow_tag_for_status(result.get("status", ""))
+        result["shadow_mode"] = True
+        result["shadow_decision"] = shadow_tag.replace("shadow_", "")
+
+        # 3. Log enriched result to BQ (the authoritative shadow entry)
+        #    Uses _bq_log_result directly — bypasses the no-op wrapper
+        _bq_log_result(result)
+
+        # 4. Send per-ticket Slack report
         try:
             slack.notify_shadow_result(
                 ticket_id=ticket_id,
@@ -154,7 +177,74 @@ def zendesk_webhook(request):
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
 
+        # 5. Tag ticket for future reference
+        try:
+            zendesk.add_tag(ticket_id, "shadow_processed")
+            zendesk.add_tag(ticket_id, shadow_tag)
+        except Exception:
+            log.exception(f"[{ticket_id}] Failed to add shadow tags")
+
     return json.dumps(result), 200, {"Content-Type": "application/json"}
+
+
+# ── Shadow mode helpers ───────────────────────────────────────────────── #
+
+_SHADOW_STATUS_TO_TAG = {
+    "success":                      "shadow_would_cancel",
+    "manual_review_required":       "shadow_would_escalate",
+    "escalated_low_confidence":     "shadow_would_escalate",
+    "skipped_refund_request":       "shadow_would_skip_refund",
+    "skipped_not_handled":          "shadow_would_skip",
+    "skipped_followup":             "shadow_would_skip",
+    "skipped_closed":               "shadow_would_skip",
+    "awaiting_card_digits":         "shadow_would_ask_card",
+    "awaiting_card_digits_retry":   "shadow_would_ask_card",
+    "skipped_agent_already_replied":"shadow_agent_handling",
+    "skipped_spam_detected":        "shadow_spam",
+    "not_found_closed":             "shadow_would_escalate",
+    "error":                        "shadow_error",
+}
+
+def _shadow_tag_for_status(status: str) -> str:
+    """Map a processing status to a shadow decision tag for daily comparison."""
+    return _SHADOW_STATUS_TO_TAG.get(status, "shadow_other")
+
+
+def _shadow_enrich_result(ticket_id: str, result: dict) -> None:
+    """
+    SHADOW_MODE: if _process exited early (before classification), fetch the
+    ticket again and classify it so the BQ log has full data for every ticket.
+    """
+    if result.get("confidence") is not None:
+        return  # already classified — nothing to enrich
+
+    try:
+        ticket = zendesk.get_ticket(ticket_id)
+        if not ticket:
+            return
+        subject = ticket.get("subject", "")
+        body = ticket.get("description", "")
+        # Same fallback as in _process: short body → use first customer comment
+        if len(body.strip()) < 30:
+            first_comment = zendesk.get_first_customer_comment(ticket_id)
+            if first_comment:
+                body = first_comment
+
+        classification = classify_ticket(subject, body)
+        # Keep existing intent if it was already set (e.g. REFUND_REQUEST from keyword check)
+        result.update({
+            "intent": result.get("intent") or classification["intent"],
+            "language": classification["language"],
+            "confidence": classification["confidence"],
+            "reasoning": classification.get("reasoning", ""),
+            "chargeback_risk": classification.get("chargeback_risk", ""),
+        })
+        log.info(
+            f"[{ticket_id}] Shadow enriched: {classification['intent']} "
+            f"({classification['confidence']:.0%}) lang={classification['language']}"
+        )
+    except Exception:
+        log.exception(f"[{ticket_id}] Shadow enrichment failed")
 
 
 # ── Core logic ────────────────────────────────────────────────────────── #
@@ -556,6 +646,10 @@ def _process(ticket_id: str) -> dict:
     cancel_result  = _cancel_by_email(email, ticket_id)
     cancel_status  = cancel_result.get("status", "")
     result["cancel_source"] = cancel_result.get("source", "unknown")
+
+    # Enrich result with WC/Stripe lookup data for BQ logging
+    result["subscription_type"] = cancel_result.get("subscription_type", "")
+    result["order_count"] = cancel_result.get("order_count")
 
     log.info(
         f"[{ticket_id}] Cancel result: {cancel_status} "
@@ -1029,6 +1123,10 @@ def _finish_cancellation(
     # Text classifier guesses trial vs sub, but WC order count is the source of truth.
     intent = _resolve_intent(intent, cancel_result)
     result["intent"] = intent
+
+    # ── Enrich result with subscription data for BQ logging ──────────── #
+    result["subscription_type"] = cancel_result.get("subscription_type", "")
+    result["order_count"] = cancel_result.get("order_count")
 
     # ── Order count gate ─────────────────────────────────────────────── #
     order_count = cancel_result.get("order_count")
