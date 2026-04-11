@@ -365,6 +365,10 @@ class SlackClient:
             "skipped_not_handled": "⏭️",
             "escalated_low_confidence": "🔻",
             "skipped_followup": "↩️",
+            "skipped_agent_already_replied": "🧑‍💼",
+            "skipped_spam_detected": "🔁",
+            "skipped_closed": "🔒",
+            "skipped_pending_awaiting_reply": "⏳",
             "error": "🔴",
         }
         emoji = emoji_map.get(status, "👁️")
