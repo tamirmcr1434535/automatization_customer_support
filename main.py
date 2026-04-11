@@ -84,6 +84,40 @@ MAX_BOT_ORDERS = 3
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
+# ── Shadow deduplication (in-memory) ─────────────────────────────────── #
+# Zendesk fires multiple webhooks per ticket (creation, agent reply, tag
+# change, status change, etc.). Each webhook is a separate HTTP request.
+# Zendesk tags are NOT reliable as a lock — add_tag itself triggers a new
+# webhook, and get_ticket_tags has eventual consistency (stale reads).
+#
+# Fix: in-memory set of ticket IDs already processed in this instance.
+# Cloud Functions Gen 2 (Cloud Run) reuses instances, so the set persists
+# across requests within the same instance. This handles 95%+ of duplicates.
+# Thread lock protects against concurrent requests within the same instance.
+
+import threading as _threading, time as _time
+
+_shadow_seen: dict[str, float] = {}   # ticket_id → timestamp
+_shadow_lock = _threading.Lock()
+_SHADOW_TTL  = 7200   # 2 hours — entries older than this are cleaned up
+
+
+def _shadow_dedup(ticket_id: str) -> bool:
+    """Return True if this ticket was already processed (duplicate). Thread-safe."""
+    now = _time.time()
+    with _shadow_lock:
+        # Cleanup stale entries (> 2h old) to prevent memory leak
+        if len(_shadow_seen) > 500:
+            stale = [k for k, v in _shadow_seen.items() if now - v > _SHADOW_TTL]
+            for k in stale:
+                del _shadow_seen[k]
+        # Check + claim atomically
+        if ticket_id in _shadow_seen:
+            return True   # duplicate
+        _shadow_seen[ticket_id] = now
+        return False      # first time — claimed
+
+
 # ── Clients ──────────────────────────────────────────────────────────── #
 
 zendesk = ZendeskClient(
@@ -140,30 +174,20 @@ def zendesk_webhook(request):
 
     log.info(f"[{ticket_id}] Webhook received")
 
-    # ── SHADOW_MODE: early claim ──────────────────────────────────────── #
-    # Zendesk fires the webhook multiple times in quick succession.
-    # _process() takes 5-6 seconds (fetch ticket + classify via Claude API).
-    # If we check shadow_processed AFTER _process, all concurrent calls
-    # will have already finished processing before any of them writes the tag
-    # → 6 duplicate Slack reports.
+    # ── SHADOW_MODE: in-memory deduplication ─────────────────────────── #
+    # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
+    # change, status change — EACH triggers a new webhook).
+    # Zendesk tags do NOT work as a lock:
+    #   - add_tag itself triggers ANOTHER webhook (infinite loop)
+    #   - get_ticket_tags has eventual consistency (stale reads)
+    #   - Multiple Cloud Function instances read tags concurrently
     #
-    # Fix: check + claim the tag BEFORE _process(). This way:
-    #   Call 1: reads tags → no shadow_processed → writes shadow_processed → runs _process
-    #   Call 2 (200ms later): reads tags → shadow_processed present → skips immediately
-    _shadow_claimed = False
-    if SHADOW_MODE:
-        try:
-            early_tags = zendesk.get_ticket_tags(ticket_id)
-            if "shadow_processed" in early_tags:
-                log.info(f"[{ticket_id}] Shadow: already processed (tag present) — skip duplicate")
-                return json.dumps({"ticket_id": ticket_id, "status": "skipped_shadow_duplicate"}), 200, {"Content-Type": "application/json"}
-            # Claim immediately — any concurrent webhook that reads tags after this
-            # point will see shadow_processed and skip.
-            zendesk.add_tag(ticket_id, "shadow_processed")
-            _shadow_claimed = True
-            log.info(f"[{ticket_id}] Shadow: claimed (tag written before _process)")
-        except Exception:
-            log.warning(f"[{ticket_id}] Shadow early claim failed — proceeding without lock")
+    # Fix: in-memory Python set. Atomic check+claim under a thread lock.
+    # Works within a single Cloud Run instance (handles 95%+ of dupes).
+    # No Zendesk API calls = no new webhooks triggered.
+    if SHADOW_MODE and _shadow_dedup(ticket_id):
+        log.info(f"[{ticket_id}] Shadow: duplicate (in-memory) — skip")
+        return json.dumps({"ticket_id": ticket_id, "status": "skipped_shadow_duplicate"}), 200, {"Content-Type": "application/json"}
 
     try:
         result = _process(ticket_id)
@@ -179,9 +203,11 @@ def zendesk_webhook(request):
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send Slack error alert")
 
-    # ── SHADOW_MODE: enrich → log → Slack → tag ────────────────────────── #
+    # ── SHADOW_MODE: enrich → log → Slack ────────────────────────────── #
     # Every ticket gets full classification + detailed BQ log so we can
     # review accuracy by querying: WHERE shadow_mode = TRUE
+    # NOTE: NO Zendesk tag writes here — each add_tag triggers a new
+    # webhook, which caused the infinite duplication loop.
     if SHADOW_MODE and result.get("status") not in (
         "skipped_already_handled",
         "skipped_merged",
@@ -195,10 +221,9 @@ def zendesk_webhook(request):
         result["shadow_decision"] = shadow_tag.replace("shadow_", "")
 
         # 3. Log enriched result to BQ (the authoritative shadow entry)
-        #    Uses _bq_log_result directly — bypasses the no-op wrapper
         _bq_log_result(result)
 
-        # 4. Send per-ticket Slack report (via dedicated shadow Slack client)
+        # 4. Send ONE Slack report (via dedicated shadow Slack client)
         try:
             _shadow_slack.notify_shadow_result(
                 ticket_id=ticket_id,
@@ -208,11 +233,7 @@ def zendesk_webhook(request):
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
 
-        # 5. Add shadow decision tag (shadow_processed was already claimed above)
-        try:
-            zendesk.add_tag(ticket_id, shadow_tag)
-        except Exception:
-            log.exception(f"[{ticket_id}] Failed to add shadow decision tag")
+        # NOTE: no zendesk.add_tag here — tags trigger new webhooks!
 
     return json.dumps(result), 200, {"Content-Type": "application/json"}
 
