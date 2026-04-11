@@ -504,8 +504,21 @@ class WooCommerceClient:
                     if order_subs:
                         all_subs = order_subs
 
-        # ── Step 2c: /subscriptions?customer= fallback (SLOW, 8-30s) ────── #
-        # Only used when meta_data and orders-based lookup both failed.
+        # ── Step 2c: /subscriptions?billing_email= (FAST, ~1s) ────────── #
+        # Direct subscription search by billing email — fast server-side filter.
+        # Covers cases where customer meta_data has no subscription_id and
+        # orders don't reference the subscription (e.g. fresh trials).
+        if not all_subs:
+            billing_subs = self._find_subs_by_billing_email(email)
+            if billing_subs:
+                log.info(
+                    f"WC: found {len(billing_subs)} sub(s) via billing_email "
+                    f"for {email}"
+                )
+                all_subs = billing_subs
+
+        # ── Step 2d: /subscriptions?customer= fallback (SLOW, 8-30s) ────── #
+        # Only used when all fast lookups failed.
         # Increased timeout to 25s to cover the 8-30s range.
         if not all_subs and customer:
             customer_id = customer.get("id")
