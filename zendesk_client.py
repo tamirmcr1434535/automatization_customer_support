@@ -10,11 +10,14 @@ _DEFAULT_RETRY_AFTER = 1  # seconds, if Retry-After header is missing
 
 
 class ZendeskClient:
-    def __init__(self, subdomain, email, api_token, dry_run=True):
+    def __init__(self, subdomain, email, api_token, dry_run=True, shadow_mode=False):
         self.base = f"https://{subdomain}.zendesk.com/api/v2"
         self.auth = (f"{email}/token", api_token)
         self.dry_run = dry_run
-        if dry_run:
+        self.shadow_mode = shadow_mode
+        if shadow_mode:
+            log.info("ZendeskClient: SHADOW_MODE — tags allowed, replies/status blocked")
+        elif dry_run:
             log.info("ZendeskClient: DRY_RUN — no writes")
 
     def _request_with_retry(
@@ -217,7 +220,7 @@ class ZendeskClient:
         )
 
     def add_tag(self, ticket_id: str, tag: str):
-        if self.dry_run:
+        if self.dry_run and not self.shadow_mode:
             log.info(f"[DRY] tag '{tag}' → #{ticket_id}")
             return
         self._request_with_retry(
@@ -226,7 +229,7 @@ class ZendeskClient:
         )
 
     def remove_tag(self, ticket_id: str, tag: str):
-        if self.dry_run:
+        if self.dry_run and not self.shadow_mode:
             log.info(f"[DRY] remove tag '{tag}' from #{ticket_id}")
             return
         self._request_with_retry(
@@ -300,3 +303,23 @@ class ZendeskClient:
             "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {"comment": {"body": note, "public": False}}},
         )
+
+    # ── Search (read-only, always real) ──────────────────────────────────
+
+    def search_tickets(self, query: str, per_page: int = 100) -> list[dict]:
+        """
+        Zendesk Search API. Always real, even in dry_run.
+        Returns list of ticket dicts matching the query.
+        """
+        all_results: list[dict] = []
+        url = f"{self.base}/search.json"
+        params = {"query": query, "per_page": per_page, "sort_by": "created_at", "sort_order": "desc"}
+
+        try:
+            resp = self._request_with_retry("GET", url, params=params)
+            data = resp.json()
+            all_results.extend(data.get("results", []))
+        except Exception as e:
+            log.error(f"Zendesk search failed: {e}")
+
+        return all_results
