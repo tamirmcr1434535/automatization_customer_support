@@ -105,6 +105,19 @@ IMPORTANT RULES:
    - JP: "支払いには応じていない", "支払いを拒否", "この請求に応じていない", "支払いを認めない"
      (refusing/rejecting a charge) WITHOUT explicit 返金/払い戻し/お金を返して
      → TRIAL_CANCELLATION (customer rejecting an unwanted charge, not requesting a refund).
+   IMPORTANT — fraud/chargeback THREAT is NOT a refund request:
+   If the customer says "cancel my subscription" AND adds a THREAT like
+   "I will report as fraud / I will dispute / I will file a chargeback IF you don't cancel"
+   → this is TRIAL_CANCELLATION (cancel is the primary request, fraud is a conditional threat).
+   Examples:
+     "Cancel my subscription. If billing continues, I will report as unauthorized billing." → TRIAL_CANCELLATION
+     "Please cancel immediately or I will file a chargeback" → TRIAL_CANCELLATION
+     "解約してください。続けたらクレジットカード会社に連絡します" → TRIAL_CANCELLATION
+   Only classify as REFUND_REQUEST when the fraud/unauthorized claim is the PRIMARY complaint
+   with ZERO cancel words:
+     "I was charged without my consent. I never signed up." → REFUND_REQUEST
+     "This is fraud. I want my money back." → REFUND_REQUEST
+
    Pure fraud complaint with ZERO cancel words AND ZERO account-deletion phrases
    → REFUND_REQUEST.
 
