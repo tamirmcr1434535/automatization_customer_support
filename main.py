@@ -84,38 +84,91 @@ MAX_BOT_ORDERS = 3
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
-# ── Shadow deduplication (in-memory) ─────────────────────────────────── #
-# Zendesk fires multiple webhooks per ticket (creation, agent reply, tag
+# ── Shadow deduplication (Firestore-backed distributed lock) ─────────── #
+# Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
 # change, status change, etc.). Each webhook is a separate HTTP request.
-# Zendesk tags are NOT reliable as a lock — add_tag itself triggers a new
-# webhook, and get_ticket_tags has eventual consistency (stale reads).
 #
-# Fix: in-memory set of ticket IDs already processed in this instance.
-# Cloud Functions Gen 2 (Cloud Run) reuses instances, so the set persists
-# across requests within the same instance. This handles 95%+ of duplicates.
-# Thread lock protects against concurrent requests within the same instance.
+# In-memory dedup only works within a single Cloud Run instance.
+# Cloud Functions Gen 2 can spin up MULTIPLE instances → each has its
+# own empty Python dict → duplicates leak through.
+#
+# Fix: Firestore atomic create() as distributed mutex.
+#   - create() fails with ALREADY_EXISTS if another instance already claimed
+#   - Two-layer approach: in-memory fast path + Firestore distributed lock
+#   - Firestore TTL policy auto-deletes old entries (set in GCP Console)
+#
+# One-time Firestore TTL setup (run once in GCP Console or gcloud):
+#   gcloud firestore fields ttls update expire_at \
+#     --collection-group=shadow_dedup --enable-ttl
 
 import threading as _threading, time as _time
+from datetime import datetime, timedelta, timezone
 
+# Layer 1: in-memory cache (fast path, avoids Firestore call for same-instance dupes)
 _shadow_seen: dict[str, float] = {}   # ticket_id → timestamp
 _shadow_lock = _threading.Lock()
-_SHADOW_TTL  = 7200   # 2 hours — entries older than this are cleaned up
+_SHADOW_TTL  = 7200   # 2 hours
+
+# Layer 2: Firestore (distributed across all Cloud Run instances)
+_firestore_db = None
+
+def _get_firestore_db():
+    """Lazy-init Firestore client (reused across requests in same instance)."""
+    global _firestore_db
+    if _firestore_db is None:
+        from google.cloud import firestore as _fs
+        _firestore_db = _fs.Client()
+    return _firestore_db
 
 
 def _shadow_dedup(ticket_id: str) -> bool:
-    """Return True if this ticket was already processed (duplicate). Thread-safe."""
+    """
+    Return True if this ticket was already processed (duplicate).
+    Two-layer dedup:
+      1. In-memory dict — instant, handles same-instance dupes (no network call)
+      2. Firestore create() — atomic distributed lock across all instances
+    """
     now = _time.time()
+    tid = str(ticket_id)
+
+    # ── Layer 1: in-memory (fast path) ──
     with _shadow_lock:
-        # Cleanup stale entries (> 2h old) to prevent memory leak
         if len(_shadow_seen) > 500:
             stale = [k for k, v in _shadow_seen.items() if now - v > _SHADOW_TTL]
             for k in stale:
                 del _shadow_seen[k]
-        # Check + claim atomically
-        if ticket_id in _shadow_seen:
-            return True   # duplicate
-        _shadow_seen[ticket_id] = now
-        return False      # first time — claimed
+        if tid in _shadow_seen:
+            return True  # duplicate (same instance hit)
+
+    # ── Layer 2: Firestore (distributed lock) ──
+    try:
+        db = _get_firestore_db()
+        doc_ref = db.collection("shadow_dedup").document(tid)
+        # Atomic create — raises AlreadyExists if another instance claimed first
+        doc_ref.create({
+            "ticket_id": tid,
+            "created_at": datetime.now(timezone.utc),
+            "expire_at": datetime.now(timezone.utc) + timedelta(hours=2),
+        })
+        # Success — we are the first instance to claim this ticket
+        with _shadow_lock:
+            _shadow_seen[tid] = now
+        log.info(f"[{tid}] Shadow dedup: claimed in Firestore (first)")
+        return False
+    except Exception as e:
+        err_str = str(e)
+        if "already exists" in err_str.lower() or "ALREADY_EXISTS" in err_str:
+            # Another instance already claimed — this is a duplicate
+            with _shadow_lock:
+                _shadow_seen[tid] = now  # cache for future fast-path
+            return True
+        # Firestore error (network, permissions, etc.) — fail open with in-memory only
+        log.warning(f"[{tid}] Firestore dedup error, falling back to in-memory: {e}")
+        with _shadow_lock:
+            if tid in _shadow_seen:
+                return True
+            _shadow_seen[tid] = now
+            return False
 
 
 # ── Clients ──────────────────────────────────────────────────────────── #
@@ -276,8 +329,10 @@ def _shadow_enrich_result(ticket_id: str, result: dict) -> None:
             return
         subject = ticket.get("subject", "")
         body = ticket.get("description", "")
-        # Same fallback as in _process: short body → use first customer comment
-        if len(body.strip()) < 30:
+        # Same logic as _process: Messaging tickets have agent greeting as description,
+        # so always fetch first customer comment for classification.
+        _is_msg = subject.lower().startswith("conversation with")
+        if _is_msg or len(body.strip()) < 30:
             first_comment = zendesk.get_first_customer_comment(ticket_id)
             if first_comment:
                 body = first_comment
@@ -456,11 +511,21 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 2b. Messaging/chat tickets have empty description — fetch first real customer comment
-    if len(body.strip()) < 30:
+    # 2b. Messaging/chat tickets: description = agent auto-greeting, NOT customer message.
+    # For Messaging tickets (subject "Conversation with ..."), ALWAYS fetch the first
+    # customer comment — that's where the actual request is (form data, typed message).
+    # For other tickets, fallback if description is very short (< 30 chars).
+    _is_messaging = subject.lower().startswith("conversation with")
+    if _is_messaging or len(body.strip()) < 30:
         first_comment = zendesk.get_first_customer_comment(ticket_id)
         if first_comment:
-            log.info(f"[{ticket_id}] Empty description — using first customer comment for classification")
+            if _is_messaging:
+                log.info(
+                    f"[{ticket_id}] Messaging ticket — using first customer comment "
+                    f"for classification (description is agent greeting)"
+                )
+            else:
+                log.info(f"[{ticket_id}] Empty description — using first customer comment for classification")
             body = first_comment
 
     # 3. Classify (needed for language even in card-lookup flows)
