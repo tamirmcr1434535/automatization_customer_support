@@ -508,7 +508,19 @@ def _process(ticket_id: str) -> dict:
     # but the customer text contains refund keywords (返金, refund, etc.)
     # → override to REFUND_REQUEST and skip.  Refund tickets always need
     # human review; the bot should not auto-cancel when a refund is requested.
-    if intent in HANDLED_INTENTS and _contains_refund_request(subject + " " + body):
+    #
+    # Check subject + body + ALL customer comments — some help-form tickets
+    # have a generic description but the actual refund complaint is only in
+    # the first customer comment or follow-up replies.
+    _all_text_for_refund = subject + " " + body
+    if intent in HANDLED_INTENTS:
+        try:
+            all_comments = zendesk.get_all_customer_comments_text(ticket_id)
+            if all_comments:
+                _all_text_for_refund += " " + all_comments
+        except Exception:
+            log.warning(f"[{ticket_id}] Failed to fetch comments for refund check")
+    if intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund):
         log.info(
             f"[{ticket_id}] {intent} but refund keywords detected in body "
             "→ overriding to REFUND_REQUEST (human must handle refund)"
@@ -1426,7 +1438,7 @@ _REFUND_KEYWORDS = [
     "wasn't aware", "was not aware",
     "had no idea", "have no idea", # "I had no idea I was being charged"
     "never intended to", "never wanted",
-    # Korean
+    # Korean — explicit refund
     "환불",
     "승인취소", # "approval cancellation" = payment reversal (Korean payment term)
     "승인 취소", # spaced variant
@@ -1435,6 +1447,16 @@ _REFUND_KEYWORDS = [
     "모르게 결제", # "payment made without my knowledge"
     "무단 결제", # "unauthorized payment"
     "무단결제", # no-space variant
+    # Korean — payment dispute / wrong charge
+    "결제시도",       # "payment attempt" (왜 결제시도된거죠? = why was a payment attempted?)
+    "잘못된 결제",    # "wrong payment"
+    "결제가 잘못",    # "payment is wrong"
+    "결제를 한 적",   # "I never made this payment"
+    "결제한 기억",    # "I don't recall making this payment"
+    "결제한 적이 없", # "I never made this payment" (formal)
+    "결제된 거",      # "something was charged"
+    "결제가 된",      # "a payment was made" (disputing)
+    "왜 결제",        # "why was I charged" — strong dispute signal
     # Korean — "I never subscribed / didn't sign up / don't recognize this charge"
     # These phrases signal the customer disputes the charge entirely, not just cancels.
     # Example: "전 구독한게 없고 구매한것도 없는데" = "I have no subscription and made no purchase"
