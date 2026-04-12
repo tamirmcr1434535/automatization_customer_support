@@ -1902,7 +1902,25 @@ def _contains_refund_request(text: str) -> bool:
 # is just a secondary wish.  These tickets MUST go to a human for refund
 # review; auto-cancelling would miss the refund part.
 _STRONG_REFUND_SIGNALS = [
-    # ── Japanese ──
+    # ── Bare explicit refund words (unambiguous = always strong) ──
+    "返金",                 # refund (JP) — any mention = strong refund intent
+    "払い戻し",             # repayment (JP)
+    "refund",               # refund (EN)
+    "환불",                 # refund (KR)
+    "rückerstattung",       # refund (DE)
+    "rückzahlung",          # repayment (DE)
+    "erstattet",            # refunded (DE)
+    "remboursement",        # refund (FR)
+    "rembourser",           # to refund (FR)
+    "reembolso",            # refund (ES/PT)
+    "rimborso",             # refund (IT)
+    "возврат",              # refund (RU)
+    "terugbetaling",        # refund (NL)
+    "terugbetalen",         # to refund (NL)
+    "tilbakebetaling",      # refund (NO)
+    "återbetalning",        # refund (SE)
+    "tilbagebetaling",      # refund (DA)
+    # ── Japanese — explicit refund requests ──
     "返金してください",     # please refund (direct request)
     "返金して",             # refund me (imperative/request)
     "返金を希望",           # want a refund
