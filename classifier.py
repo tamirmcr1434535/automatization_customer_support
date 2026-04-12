@@ -133,22 +133,31 @@ IMPORTANT RULES:
    CRITICAL: if "delete account" + refund/money back → REFUND_REQUEST.
    ONLY use DELETE_ACCOUNT when the SOLE request is account/data removal.
 
-1a. CANCEL ALWAYS WINS (check this FIRST, before any other rule):
-   If the customer message contains ANY cancellation signal → ALWAYS classify as
-   TRIAL_CANCELLATION (or SUB_CANCELLATION if clearly a paid subscription).
-   This is true EVEN IF the customer ALSO mentions refund, money back, Widerruf, etc.
-   The bot will cancel the subscription first; the refund part is handled by humans later.
-   Examples (ALL are TRIAL_CANCELLATION, NOT REFUND_REQUEST):
+1a. CANCEL vs REFUND priority (check this FIRST, before any other rule):
+   If the customer message contains cancellation signal + WEAK refund mention
+   → TRIAL_CANCELLATION (cancel wins, bot cancels, refund handled by humans later).
+   Examples (ALL are TRIAL_CANCELLATION):
      JP: "解約したい + 返金してほしい" → TRIAL_CANCELLATION
-     JP: "キャンセル + クーリングオフ" → TRIAL_CANCELLATION
-     JP: "解約 + お金を返して" → TRIAL_CANCELLATION
-     JP: "キャンセル + 1990円を返してほしい" → TRIAL_CANCELLATION
      JP: "解約 + お金が戻ってきますか" → TRIAL_CANCELLATION
-     DE: "kündigen + Widerruf" → TRIAL_CANCELLATION
      DE: "kündigen + Rückerstattung" → TRIAL_CANCELLATION
      EN: "cancel + refund" → TRIAL_CANCELLATION
-     EN: "cancel + money back" → TRIAL_CANCELLATION
-   REFUND_REQUEST is ONLY for messages with ZERO cancellation signals.
+
+   EXCEPTION — STRONG REFUND overrides cancel:
+   If the customer message contains cancel signal + STRONG refund signal → REFUND_REQUEST.
+   Strong refund signals = explicit refund demand with specific amount, fraud accusation,
+   unauthorized charge complaint, or "money back" / 返金してください phrasing.
+   Examples (ALL are REFUND_REQUEST despite cancel words):
+     JP: "解約希望 + 5490円返金してください + 詐欺です" → REFUND_REQUEST
+     JP: "解約 + 身に覚えのない請求 + 返金してください" → REFUND_REQUEST
+     JP: "解約 + 勝手に引き落とし + お金を返して" → REFUND_REQUEST
+     EN: "cancel + this is fraud + I want my money back" → REFUND_REQUEST
+     EN: "cancel + unauthorized charge + full refund" → REFUND_REQUEST
+     DE: "kündigen + Betrug + Geld zurück" → REFUND_REQUEST
+   Rationale: when a customer complains about fraud/unauthorized charges AND demands
+   a specific refund amount, the PRIMARY intent is charge dispute/refund.  Cancel is
+   secondary. These tickets MUST go to a human for refund review.
+
+   REFUND_REQUEST without any cancel signals → always REFUND_REQUEST (no change).
 1b. Any form of "cancel", "キャンセル", "취소", "解約", "解除", "退会", "解除", "メンバーシップの解約",
    "退会したい", "解約したい", "止めたい", "やめたい", "kansellere", "avbryte", "avslutte",
    "annuleren", "avboka", "annullere",
@@ -172,7 +181,8 @@ IMPORTANT RULES:
    Classification rules for chat/messaging transcripts:
    → If body contains ANY cancel signal (解約, キャンセル, 退会, cancel, 취소, etc.) → TRIAL_CANCELLATION.
    → If body contains refund signals (返金, refund, 払い戻し, 환불, etc.) WITH ZERO cancel words → REFUND_REQUEST.
-   → If body contains BOTH cancel + refund → TRIAL_CANCELLATION (cancel wins per Rule 1a).
+   → If body contains BOTH cancel + WEAK refund → TRIAL_CANCELLATION (cancel wins per Rule 1a).
+   → If body contains BOTH cancel + STRONG refund (fraud, explicit amount+refund, 返金してください) → REFUND_REQUEST.
    → If body contains fraud signals (不正請求, unauthorized, etc.) WITH ZERO cancel words → REFUND_REQUEST.
    → If body is a form submission like "料金返金" or "返金希望" with no cancel words → REFUND_REQUEST.
    → If body has no clear signal at all → default to TRIAL_CANCELLATION (cancellation flow origin).
