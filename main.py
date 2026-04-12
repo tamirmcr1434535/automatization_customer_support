@@ -83,9 +83,10 @@ HANDLED_INTENTS = {
 MAX_BOT_ORDERS = 3
 
 # ── Cancel signal keywords (used in safety net + refund override guard) ── #
-# If these are present alongside refund/fraud keywords, the CANCEL intent wins
-# (Rule 1a: "cancel always wins"). Only override to REFUND_REQUEST when there
-# are ZERO cancel signals.
+# Rule 1a (updated): if cancel + refund signals both present:
+#   - STRONG refund (fraud, explicit refund demand, amount+refund, etc.)
+#     → REFUND wins (human must handle the charge dispute)
+#   - WEAK refund (just a keyword mention) → CANCEL wins, bot auto-cancels
 _CANCEL_SIGNALS = [
     # English
     "cancel", "unsubscribe",
@@ -635,6 +636,65 @@ def _process(ticket_id: str) -> dict:
                 f"classifier fallback: UNKNOWN overridden — "
                 f"refund keyword detected in body"
             )
+        elif email:
+            # No signals in body — check sibling/merged tickets from same requester.
+            # Merged tickets often have empty/stub body while the original has the
+            # actual message. Also catches contact-form tickets where the body is
+            # wrapped in form metadata that obscures the customer's intent.
+            try:
+                sibling_tickets = zendesk.search_tickets(
+                    f"requester:{email} type:ticket created>-7days"
+                )
+                sibling_texts = []
+                for t in sibling_tickets:
+                    if str(t.get("id")) != str(ticket_id):
+                        sibling_texts.append(
+                            (t.get("subject") or "") + " "
+                            + (t.get("description") or "")[:500]
+                        )
+                if sibling_texts:
+                    combined = " ".join(sibling_texts).lower()
+                    sib_cancel = any(kw in combined for kw in _CANCEL_SIGNALS)
+                    sib_refund = any(kw in combined for kw in _REFUND_KEYWORD_FALLBACK)
+                    sib_strong_refund = _contains_strong_refund_signal(" ".join(sibling_texts))
+
+                    if sib_cancel and sib_strong_refund:
+                        log.info(
+                            f"[{ticket_id}] UNKNOWN safety net: sibling tickets "
+                            f"from {email} have cancel + strong refund → REFUND_REQUEST"
+                        )
+                        intent = "REFUND_REQUEST"
+                        classification["intent"] = intent
+                        classification["reasoning"] = (
+                            "classifier fallback: UNKNOWN overridden — "
+                            "sibling ticket has cancel + strong refund signals"
+                        )
+                    elif sib_cancel:
+                        log.info(
+                            f"[{ticket_id}] UNKNOWN safety net: sibling tickets "
+                            f"from {email} have cancel signal → TRIAL_CANCELLATION"
+                        )
+                        intent = "TRIAL_CANCELLATION"
+                        classification["intent"] = intent
+                        classification["reasoning"] = (
+                            "classifier fallback: UNKNOWN overridden — "
+                            "sibling ticket has cancel keyword"
+                        )
+                    elif sib_refund:
+                        log.info(
+                            f"[{ticket_id}] UNKNOWN safety net: sibling tickets "
+                            f"from {email} have refund signal → REFUND_REQUEST"
+                        )
+                        intent = "REFUND_REQUEST"
+                        classification["intent"] = intent
+                        classification["reasoning"] = (
+                            "classifier fallback: UNKNOWN overridden — "
+                            "sibling ticket has refund keyword"
+                        )
+            except Exception:
+                log.warning(
+                    f"[{ticket_id}] UNKNOWN cross-ticket lookup failed — ignoring"
+                )
 
     result.update({
         "intent": intent,
@@ -670,14 +730,44 @@ def _process(ticket_id: str) -> dict:
     # and contain "cancel" even when the customer's actual request is a pure refund.
     _has_cancel_kw = _contains_cancel_signal(_customer_text_only) if _has_refund_kw else False
 
-    if _has_refund_kw and _has_cancel_kw:
-        # Both cancel AND refund/fraud signals present — CANCEL WINS (Rule 1a).
-        # Examples: "cancel my subscription + I'll report as fraud"
-        #           "解約したい + 返金してほしい"
-        # The bot cancels first; refund is handled by humans later.
+    _has_strong_refund = (
+        _has_refund_kw
+        and _has_cancel_kw
+        and _contains_strong_refund_signal(_all_text_for_refund)
+    )
+
+    if _has_refund_kw and _has_cancel_kw and _has_strong_refund:
+        # Both cancel AND refund signals present, BUT refund signals are STRONG
+        # (explicit refund demand with amount, fraud accusation, unauthorized charge,
+        # legal withdrawal, etc.) — REFUND WINS over cancel.
+        # Examples: "解約希望 + 5490円返金してください + 詐欺です"
+        #           "cancel my sub + this is fraud + I want my money back"
+        # The primary intent is a charge dispute/refund; cancel is secondary.
+        log.info(
+            f"[{ticket_id}] {intent}: both cancel + refund signals, but STRONG "
+            "refund signal detected → overriding to REFUND_REQUEST (refund wins)"
+        )
+        intent = "REFUND_REQUEST"
+        result["intent"] = intent
+        result["status"] = "skipped_refund_request"
+        zendesk.add_tag(ticket_id, "bot_handled")
+        slack_sent = slack.notify_refund_skip(
+            ticket_id=ticket_id,
+            email=email,
+            intent=intent,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
+        log_result(result)
+        return result
+
+    elif _has_refund_kw and _has_cancel_kw and not _has_strong_refund:
+        # Both cancel AND refund signals, but refund signals are WEAK
+        # (e.g. "cancel my subscription + I'll report as fraud if you don't cancel")
+        # → CANCEL WINS (Rule 1a). Bot cancels; refund handled by humans later.
         log.info(
             f"[{ticket_id}] {intent}: refund keywords detected BUT cancel signals "
-            "also present → cancel wins (Rule 1a), NOT overriding to REFUND_REQUEST"
+            "also present (no strong refund signal) → cancel wins (Rule 1a)"
         )
         # Continue to cancellation flow — don't override
 
@@ -733,16 +823,32 @@ def _process(ticket_id: str) -> dict:
     if intent in ("REFUND_REQUEST", "SUB_RENEWAL_REFUND"):
         full_text = subject + " " + body
         has_cancel = _contains_cancel_signal(full_text)
+        has_strong = _contains_strong_refund_signal(full_text)
 
-        if has_cancel:
-            # Override intent: customer wants cancellation + refund → cancel first
+        if has_cancel and not has_strong:
+            # Cancel + weak refund → cancel first, refund handled by humans later
             log.info(
-                f"[{ticket_id}] {intent} but cancel signal found in text — "
-                "overriding to TRIAL_CANCELLATION (cancel first, refund later)"
+                f"[{ticket_id}] {intent} but cancel signal found (no strong refund) "
+                "— overriding to TRIAL_CANCELLATION (cancel first, refund later)"
             )
             intent = "TRIAL_CANCELLATION"
             result["intent"] = intent
             result["refund_also_requested"] = True
+        elif has_cancel and has_strong:
+            # Cancel + STRONG refund → keep as REFUND_REQUEST (human handles)
+            log.info(
+                f"[{ticket_id}] {intent}: cancel signal found BUT strong refund "
+                "signal overrides → keeping as REFUND_REQUEST (human must handle)"
+            )
+            result["status"] = "skipped_refund_request"
+            zendesk.add_tag(ticket_id, "bot_handled")
+            slack_sent = slack.notify_refund_skip(
+                ticket_id=ticket_id, email=email,
+                intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
+            )
+            result["slack_sent"] = slack_sent
+            log_result(result)
+            return result
         else:
             # Pure refund request with no cancellation intent → human handles
             log.info(f"[{ticket_id}] {intent} — pure refund, no cancel signal → skipping")
@@ -1778,3 +1884,140 @@ def _contains_refund_request(text: str) -> bool:
     """
     text_lower = text.lower()
     return any(kw in text_lower for kw in _REFUND_KEYWORDS)
+
+
+# ── Strong refund signals ────────────────────────────────────────────── #
+# These indicate the PRIMARY intent is a refund/dispute, NOT cancellation.
+# When present, they override cancel signals (exception to Rule 1a).
+#
+# Triggers:
+# - Explicit "refund please / 返金してください" (= direct demand, not just mention)
+# - Fraud accusation (詐欺, fraud, betrug, etc.)
+# - Specific amount + refund verb (5490円返金, refund $49, etc.)
+# - Unauthorized/unknown charge patterns (勝手に, without my consent, etc.)
+# - Legal withdrawal terms (クーリングオフ, Widerruf, etc.)
+#
+# Rationale: when a customer says "cancel" AND "please refund 5490 yen" +
+# "this is fraud" — the real intent is charge dispute / refund, and cancel
+# is just a secondary wish.  These tickets MUST go to a human for refund
+# review; auto-cancelling would miss the refund part.
+_STRONG_REFUND_SIGNALS = [
+    # ── Japanese ──
+    "返金してください",     # please refund (direct request)
+    "返金して",             # refund me (imperative/request)
+    "返金を希望",           # want a refund
+    "返金お願い",           # refund please
+    "返金を求め",           # demand a refund
+    "返金していただ",       # please refund (polite keigo)
+    "返金をお願い",         # polite variant
+    "払い戻しをお願い",     # repayment please
+    "払い戻しを希望",       # want repayment
+    "払い戻してください",   # please repay
+    "お金を返して",         # return my money
+    "お金返して",           # return my money (colloquial)
+    "詐欺",                 # fraud / scam — always strong signal
+    "不正請求",             # fraudulent charge
+    "不正利用",             # fraudulent use
+    "クーリングオフ",       # cooling-off (legal right of withdrawal)
+    "クーリング・オフ",     # variant with middle dot
+    "勝手に引き落とし",     # deducted without consent
+    "勝手に課金",           # charged without consent
+    "勝手に請求",           # billed without consent
+    "無断で引き落とし",     # deducted without consent
+    "身に覚えの",           # I don't recognize this (charge)
+    "身に覚えがない",       # variant
+    "身に覚えがありません", # polite variant
+    # ── English ──
+    "fraud",
+    "fraudulent",
+    "money back",
+    "get my money",
+    "pay me back",
+    "unauthorized charge",
+    "unknown charge",
+    "unexpected charge",
+    "without my consent",
+    "without my permission",
+    "without my knowledge",
+    "didn't authorize",
+    "did not authorize",
+    "i never signed up",
+    "never agreed to",
+    "please refund",
+    "refund please",
+    "i want a refund",
+    "i want my refund",
+    "i want to refund",
+    "i want refund",
+    "i want my money",
+    "want a refund",
+    "demand a refund",
+    "full refund",
+    # ── Korean ──
+    "환불해주세요",         # please refund
+    "환불 해주세요",        # spaced variant
+    "환불해 주세요",        # variant
+    "환불을 원합니다",      # I want a refund
+    "환불 요청",            # refund request
+    "환불요청",             # no-space variant
+    "사기",                 # fraud
+    "무단 결제",            # unauthorized payment
+    "무단결제",             # no-space
+    # ── German ──
+    "betrug",               # fraud
+    "betrügerisch",         # fraudulent
+    "widerruf",             # legal withdrawal (= refund)
+    "widerrufen",           # to withdraw
+    "geld zurück",          # money back
+    "nicht autorisiert",    # not authorized
+    "unberechtigte abbuchung", # unauthorized debit
+    "ohne mein wissen",     # without my knowledge
+    "ohne meine zustimmung", # without my consent
+    # ── Dutch ──
+    "geld terug",           # money back
+    "ongeautoriseerd",      # unauthorized
+    "ongeautoriseerde betaling", # unauthorized payment
+    # ── French ──
+    "remboursez",           # refund (imperative)
+    "fraude",               # fraud
+    # ── Spanish ──
+    "reembolso",            # refund
+    "cargo no autorizado",  # unauthorized charge
+    "fraude",               # fraud
+    # ── Norwegian/Swedish/Danish ──
+    "penger tilbake",       # money back (NO)
+    "uautorisert",          # unauthorized (NO)
+    "uautoriseret",         # unauthorized (DA)
+    "återbetalning",        # refund (SE)
+    "tilbakebetaling",      # refund (NO)
+    "tilbagebetaling",      # refund (DA)
+]
+
+
+def _contains_strong_refund_signal(text: str) -> bool:
+    """
+    Return True if *text* contains a STRONG refund signal that should
+    override cancel signals (exception to Rule 1a "cancel always wins").
+
+    Strong signals = explicit refund demand, fraud accusation, unauthorized
+    charge, legal withdrawal, or "money back" phrasing.
+
+    Also detects amount+refund patterns like "5490円返金" or "refund $49".
+    """
+    text_lower = text.lower()
+    if any(kw in text_lower for kw in _STRONG_REFUND_SIGNALS):
+        return True
+
+    # Pattern: [amount] + refund verb in same vicinity
+    # e.g. "5490円返金", "refund 49.99", "$5,490 refund"
+    import re
+    # Japanese: number + 円 + 返金/返して/戻して
+    if re.search(r"\d+円\s*(?:返金|返して|戻して|払い戻)", text_lower):
+        return True
+    # English: "refund" near a currency amount
+    if re.search(r"refund.{0,20}[\$€£¥]\s*[\d,]+", text_lower):
+        return True
+    if re.search(r"[\$€£¥]\s*[\d,]+.{0,20}refund", text_lower):
+        return True
+
+    return False
