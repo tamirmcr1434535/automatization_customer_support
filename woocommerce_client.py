@@ -218,7 +218,7 @@ class WooCommerceClient:
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions",
-                params={"billing_email": email, "per_page": 50, "status": "any"},
+                params={"billing_email": email, "per_page": 50},
                 auth=self.auth,
                 timeout=15,
             )
