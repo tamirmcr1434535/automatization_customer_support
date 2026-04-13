@@ -9,9 +9,9 @@ IMPORTANT — performance notes for iqbooster.org:
     GET /customers?email=             — exact email lookup, indexed
     GET /subscriptions/{id}           — direct single-row lookup
 
-  SLOW endpoints (8–30s):
-    GET /subscriptions?customer=      — customer_id filter (30s timeout, MAIN PATH)
-    GET /subscriptions?search=        — full-text search, not indexed (12s timeout)
+  SLOW endpoints (8–25s):
+    GET /subscriptions?customer=      — customer_id filter (25s timeout, MAIN PATH)
+    GET /subscriptions?search=        — full-text search, not indexed (10s timeout)
     GET /customers?search=            — full-text search, not indexed (8s timeout)
 
   BROKEN endpoints (do NOT use):
@@ -19,16 +19,17 @@ IMPORTANT — performance notes for iqbooster.org:
     GET /orders?customer={id}         — always times out on iqbooster.org (removed)
 
   Lookup strategy (optimized for 60s Cloud Function budget):
-    1.  /customers?email=              (~0.3s, indexed)
+    1.  /customers?email=              (~0.3s, indexed, 5s timeout)
     1b. /customers?search=             (8s timeout, PayPal fallback)
-    2a. customer meta_data → /subscriptions/{id}  (~0.3s)
-    2b. /subscriptions?customer=       (30s timeout, MOST RELIABLE)
-    2c. /subscriptions?billing_email=  (only if NO customer found, broken filter)
-    2d. /subscriptions?search=         (12s timeout, last resort)
-    Total WC budget: ~1s + 30s + 12s = 43s max (leaves 17s for classifier+ZD)
+    2a. customer meta_data → /subscriptions/{id}  (~0.3s, 8s timeout)
+    2b. /subscriptions?customer=       (25s timeout, MOST RELIABLE)
+    2c. /subscriptions?billing_email=  (only if NO customer found, 10s timeout)
+    2d. /subscriptions?search=         (10s timeout, last resort)
+    Worst case: 5s + 8s + 25s + 10s = 48s (leaves 12s for classifier+ZD)
 """
 
 import logging
+import time
 import requests
 from datetime import datetime, timezone
 
@@ -59,23 +60,22 @@ class WooCommerceClient:
         """
         Return the first WooCommerce customer matching *email* (exact), or None.
 
-        Uses only ?email= (fast, indexed). Two passes for role compatibility:
-        1. ?role=all — finds users of ANY WordPress role (subscriber, customer,
-           administrator, etc.).
-        2. Default (no role filter) — fallback for WC versions that reject role=all.
-
-        Does NOT use ?search= — it's a full-text scan that times out on this server.
+        Uses ?email= (fast, indexed). Tries ?role=all first; if the server
+        rejects it (4xx), falls back to no role filter.
+        If ?role=all returns 200 OK with empty results → email simply doesn't
+        exist, no point retrying without role.  Timeout: 5s (indexed query).
         """
-        for params in [
+        t0 = time.time()
+        for i, params in enumerate([
             {"email": email, "per_page": 1, "role": "all"},
             {"email": email, "per_page": 1},
-        ]:
+        ]):
             try:
                 resp = requests.get(
                     f"{self.base}/customers",
                     params=params,
                     auth=self.auth,
-                    timeout=10,
+                    timeout=5,
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC customer lookup error for {email}: {e}")
@@ -92,9 +92,21 @@ class WooCommerceClient:
 
             data = resp.json()
             if data:
-                log.info(f"WC: found customer for {email} (id={data[0]['id']})")
+                log.info(
+                    f"WC: found customer for {email} (id={data[0]['id']}) "
+                    f"in {time.time()-t0:.1f}s"
+                )
                 return data[0]
 
+            # 200 OK with empty data → email not in WC, skip second pass
+            if i == 0:
+                log.info(
+                    f"WC: ?email= (role=all) returned 0 customers for {email} "
+                    f"in {time.time()-t0:.1f}s — skipping second pass"
+                )
+                return None
+
+        log.info(f"WC: no customer found for {email} in {time.time()-t0:.1f}s")
         return None
 
     # ================================================================== #
@@ -224,7 +236,7 @@ class WooCommerceClient:
                 f"{self.base}/subscriptions",
                 params={"billing_email": email, "per_page": 50},
                 auth=self.auth,
-                timeout=15,
+                timeout=10,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC: billing_email lookup error for {email}: {e}")
@@ -450,17 +462,19 @@ class WooCommerceClient:
         Find customer → find subscription → cancel.
 
         Lookup chain (optimized for 60s Cloud Function budget):
-          1.  /customers?email=           (~0.3s, indexed)
-          1b. /customers?search=          (8s timeout, fallback for PayPal users)
-          2a. customer meta_data → /subscriptions/{id}  (~0.3s)
-          2b. /subscriptions?customer=                   (30s timeout, MAIN PATH)
-          2c. /subscriptions?billing_email=              (only if NO customer found)
-          2d. /subscriptions?search=                     (12s timeout, last resort)
-          Total WC budget: ~1s + 30s + 12s = 43s max (leaves 17s for classifier+ZD)
+          1.  /customers?email=           (~0.3s, indexed, 5s timeout)
+          1b. /customers?search=          (8s timeout, PayPal fallback)
+          2a. customer meta_data → /subscriptions/{id}  (~0.3s, 8s timeout)
+          2b. /subscriptions?customer=    (25s timeout, MAIN PATH)
+          2c. /subscriptions?billing_email= (only if NO customer, 10s timeout)
+          2d. /subscriptions?search=      (10s timeout, last resort)
+          Worst case: 5s + 8s + 25s + 10s = 48s (leaves 12s for classifier+ZD)
 
         If subscription not found → returns "not_found" → bot asks customer
         for last 4 card digits → Stripe finds email → we try again.
         """
+        wc_start = time.time()
+
         base_result = {
             "email": email,
             "cancelled": False,
@@ -472,12 +486,15 @@ class WooCommerceClient:
 
         log.info(f"{'[DRY] ' if self.dry_run else ''}WC cancel for {email}")
 
-        # ── Step 1: customer lookup (fast, ~0.3s) ─────────────────────── #
+        # ── Step 1: customer lookup (fast, ~0.3s, 5s timeout) ─────────── #
         customer = self.get_customer_by_email(email)
+        step1_elapsed = time.time() - wc_start
+        log.info(f"WC TIMING: step1 customer?email= done in {step1_elapsed:.1f}s")
 
         # Step 1b: if ?email= didn't find customer, try ?search= (slower but
         # catches PayPal users whose WP account email differs from billing email)
         if not customer:
+            t1b = time.time()
             try:
                 resp = requests.get(
                     f"{self.base}/customers",
@@ -500,7 +517,6 @@ class WooCommerceClient:
                                 )
                                 break
                         if not customer and data:
-                            # Accept first result if search returned exactly 1
                             if len(data) == 1:
                                 customer = data[0]
                                 log.info(
@@ -516,6 +532,7 @@ class WooCommerceClient:
                 log.warning(f"WC: customer ?search= timed out (8s) for {email}")
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC: customer ?search= error for {email}: {e}")
+            log.info(f"WC TIMING: step1b customer?search= done in {time.time()-t1b:.1f}s")
 
         all_subs: list[dict] | None = None
 
@@ -538,52 +555,51 @@ class WooCommerceClient:
             else:
                 log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Step 2b: /subscriptions?customer= (MOST RELIABLE) ────────── #
-        # When we have a customer_id, go DIRECTLY to ?customer= — skip orders.
-        # Orders lookup always times out on iqbooster.org and wastes 8s budget.
-        # ?customer= is the only reliable way to find subscriptions by customer.
-        # Timeout: 30s — this is the main lookup path, give it enough time.
+        # ── Step 2b: /subscriptions?customer= (MOST RELIABLE, 25s) ───── #
         if not all_subs and customer:
             customer_id = customer.get("id")
             if customer_id:
+                t2b = time.time()
                 try:
                     log.info(
-                        f"WC: trying ?customer={customer_id} (30s timeout)"
+                        f"WC: trying ?customer={customer_id} (25s timeout)"
                     )
                     resp = requests.get(
                         f"{self.base}/subscriptions",
                         params={"customer": customer_id, "per_page": 10, "status": "any"},
                         auth=self.auth,
-                        timeout=30,
+                        timeout=25,
                     )
                     if resp.ok:
                         customer_subs = resp.json()
                         if isinstance(customer_subs, list) and customer_subs:
                             log.info(
                                 f"WC: found {len(customer_subs)} sub(s) via "
-                                f"?customer={customer_id} for {email}"
+                                f"?customer={customer_id} for {email} "
+                                f"in {time.time()-t2b:.1f}s"
                             )
                             all_subs = customer_subs
                         else:
                             log.info(
-                                f"WC: ?customer={customer_id} returned no subs for {email}"
+                                f"WC: ?customer={customer_id} returned no subs "
+                                f"in {time.time()-t2b:.1f}s"
                             )
                     else:
                         log.warning(
-                            f"WC: ?customer={customer_id} failed: {resp.status_code}"
+                            f"WC: ?customer={customer_id} failed: {resp.status_code} "
+                            f"in {time.time()-t2b:.1f}s"
                         )
                 except requests.exceptions.Timeout:
                     log.warning(
-                        f"WC: ?customer={customer_id} timed out (30s) for {email}"
+                        f"WC: ?customer={customer_id} TIMED OUT (25s) for {email}"
                     )
                 except requests.exceptions.RequestException as e:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
+                log.info(f"WC TIMING: step2b ?customer= done in {time.time()-t2b:.1f}s (total {time.time()-wc_start:.1f}s)")
 
-        # ── Step 2d: /subscriptions?billing_email= (ONLY without customer) ── #
-        # billing_email filter is broken on iqbooster.org — returns ALL subs
-        # for any email. Only useful as fallback for guest checkout (no customer).
-        # When we have a customer_id, ?customer= above is always better.
+        # ── Step 2c: /subscriptions?billing_email= (ONLY without customer, 10s) ── #
         if not all_subs and not customer:
+            t2c = time.time()
             billing_subs = self._find_subs_by_billing_email(email)
             if billing_subs:
                 log.info(
@@ -591,23 +607,21 @@ class WooCommerceClient:
                     f"for {email}"
                 )
                 all_subs = billing_subs
+            log.info(f"WC TIMING: step2c billing_email done in {time.time()-t2c:.1f}s (total {time.time()-wc_start:.1f}s)")
 
-        # ── Step 2e: /subscriptions?search= last resort (12s timeout) ──── #
-        # Full-text search across all subscription fields.
-        # Catches PayPal subs and guest checkouts where billing_email failed.
-        # Timeout reduced from 20s to 12s to fit in Cloud Function 60s budget:
-        #   ~1s customer lookup + 30s ?customer= + 12s ?search= = 43s max WC time
+        # ── Step 2d: /subscriptions?search= last resort (10s timeout) ──── #
         if not all_subs:
+            t2d = time.time()
             try:
                 log.info(
                     f"WC: all lookups failed for {email}, "
-                    "trying ?search= last resort (12s timeout)"
+                    "trying ?search= last resort (10s timeout)"
                 )
                 resp = requests.get(
                     f"{self.base}/subscriptions",
                     params={"search": email, "per_page": 20, "status": "any"},
                     auth=self.auth,
-                    timeout=12,
+                    timeout=10,
                 )
                 if resp.ok:
                     search_subs = resp.json()
@@ -618,8 +632,6 @@ class WooCommerceClient:
                                 s, email.lower().strip()
                             )
                         ]
-                        # Also accept subs with empty billing.email (server
-                        # matched on _billing_email post meta not in REST response)
                         if not verified:
                             verified = [
                                 s for s in search_subs
@@ -642,18 +654,20 @@ class WooCommerceClient:
                     log.warning(f"WC: ?search= failed: {resp.status_code}")
             except requests.exceptions.Timeout:
                 log.warning(
-                    f"WC: ?search= timed out (12s) for {email} "
+                    f"WC: ?search= TIMED OUT (10s) for {email} "
                     "— falling through to Stripe fallback"
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC: ?search= error: {e}")
+            log.info(f"WC TIMING: step2d ?search= done in {time.time()-t2d:.1f}s (total {time.time()-wc_start:.1f}s)")
 
         if not all_subs:
+            total = time.time() - wc_start
             if customer:
-                log.info(f"WC: customer found for {email} but no subscription")
+                log.info(f"WC: customer found for {email} but no subscription (total WC: {total:.1f}s)")
                 return {**base_result, "status": "no_active_sub"}
             else:
-                log.info(f"WC: no customer and no subscription for {email}")
+                log.info(f"WC: no customer and no subscription for {email} (total WC: {total:.1f}s)")
                 return {**base_result, "status": "not_found"}
 
         # ── Step 3: filter active subscriptions ───────────────────────── #
@@ -725,6 +739,12 @@ class WooCommerceClient:
 
         # ── Step 5: cancel ────────────────────────────────────────────── #
         cancel = self._cancel_sub_by_id(target["id"])
+
+        total_wc = time.time() - wc_start
+        log.info(
+            f"WC TIMING: total cancel_subscription for {email} = {total_wc:.1f}s "
+            f"(sub #{target['id']}, type={sub_type}, orders={order_count})"
+        )
 
         if self.dry_run:
             status_label = "dry_run"
