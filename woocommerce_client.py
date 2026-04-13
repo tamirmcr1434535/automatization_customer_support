@@ -8,20 +8,24 @@ IMPORTANT — performance notes for iqbooster.org:
   FAST endpoints (< 1s):
     GET /customers?email=             — exact email lookup, indexed
     GET /subscriptions/{id}           — direct single-row lookup
-    GET /subscriptions?billing_email= — server-side billing email filter
 
   SLOW endpoints (8–30s):
-    GET /subscriptions?search=        — full-text search, not indexed (8s timeout)
-    GET /customers?search=            — full-text search, not indexed
-    GET /subscriptions?customer=      — customer_id filter, not indexed (25s timeout)
+    GET /subscriptions?customer=      — customer_id filter (30s timeout, MAIN PATH)
+    GET /subscriptions?search=        — full-text search, not indexed (12s timeout)
+    GET /customers?search=            — full-text search, not indexed (8s timeout)
 
-  Lookup strategy (fast first, reliable fallbacks):
-    1. /customers?email=         → meta_data subscription_id → /subscriptions/{id}
-    2. /orders?customer={id}     → extract subscription_id from order meta (8s timeout)
-    3. /subscriptions?customer=  → MOST RELIABLE when customer found (25s timeout)
-    4. /subscriptions?billing_email= → only when NO customer (broken on iqbooster.org)
-    5. /subscriptions?search=    → last-resort full-text search (20s timeout)
-    6. (Stripe fallback in main.py if all WC lookups fail)
+  BROKEN endpoints (do NOT use):
+    GET /subscriptions?billing_email= — returns ALL subs on iqbooster.org (server bug)
+    GET /orders?customer={id}         — always times out on iqbooster.org (removed)
+
+  Lookup strategy (optimized for 60s Cloud Function budget):
+    1.  /customers?email=              (~0.3s, indexed)
+    1b. /customers?search=             (8s timeout, PayPal fallback)
+    2a. customer meta_data → /subscriptions/{id}  (~0.3s)
+    2b. /subscriptions?customer=       (30s timeout, MOST RELIABLE)
+    2c. /subscriptions?billing_email=  (only if NO customer found, broken filter)
+    2d. /subscriptions?search=         (12s timeout, last resort)
+    Total WC budget: ~1s + 30s + 12s = 43s max (leaves 17s for classifier+ZD)
 """
 
 import logging
@@ -445,14 +449,14 @@ class WooCommerceClient:
         """
         Find customer → find subscription → cancel.
 
-        Lookup chain (fast first, reliable fallbacks):
+        Lookup chain (optimized for 60s Cloud Function budget):
           1.  /customers?email=           (~0.3s, indexed)
           1b. /customers?search=          (8s timeout, fallback for PayPal users)
           2a. customer meta_data → /subscriptions/{id}  (~0.3s)
-          2b. /orders?customer={id} → subscription IDs  (8s timeout, quick try)
-          2c. /subscriptions?customer=                   (25s timeout, RELIABLE)
-          2d. /subscriptions?billing_email=              (only if NO customer found)
-          2e. /subscriptions?search=                     (20s timeout, last resort)
+          2b. /subscriptions?customer=                   (30s timeout, MAIN PATH)
+          2c. /subscriptions?billing_email=              (only if NO customer found)
+          2d. /subscriptions?search=                     (12s timeout, last resort)
+          Total WC budget: ~1s + 30s + 12s = 43s max (leaves 17s for classifier+ZD)
 
         If subscription not found → returns "not_found" → bot asks customer
         for last 4 card digits → Stripe finds email → we try again.
@@ -534,45 +538,23 @@ class WooCommerceClient:
             else:
                 log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Step 2b: find subscription via customer's orders (QUICK TRY) ── #
-        # /orders?customer={id} — quick try with 8s timeout.
-        # If the server is fast, this returns in 1-2s and we get sub IDs.
-        # If it times out (common on iqbooster.org), we fall through quickly
-        # to ?customer= which is more reliable.
-        if not all_subs and customer:
-            customer_id = customer.get("id")
-            if customer_id:
-                sub_ids_from_orders = self._find_sub_ids_from_orders(customer_id)
-                if sub_ids_from_orders:
-                    log.info(
-                        f"WC: found {len(sub_ids_from_orders)} subscription ID(s) "
-                        f"via orders for customer {customer_id}: {sub_ids_from_orders}"
-                    )
-                    order_subs = []
-                    for sid in sub_ids_from_orders:
-                        sub = self._get_subscription_by_id(sid)
-                        if sub:
-                            order_subs.append(sub)
-                    if order_subs:
-                        all_subs = order_subs
-
-        # ── Step 2c: /subscriptions?customer= (RELIABLE, 25s timeout) ──── #
-        # When we have a customer_id, this is the MOST RELIABLE path.
-        # Moved BEFORE billing_email because billing_email filter is broken
-        # on iqbooster.org (returns ALL subscriptions for any email).
-        # ?customer= is slower (8-30s) but actually filters correctly.
+        # ── Step 2b: /subscriptions?customer= (MOST RELIABLE) ────────── #
+        # When we have a customer_id, go DIRECTLY to ?customer= — skip orders.
+        # Orders lookup always times out on iqbooster.org and wastes 8s budget.
+        # ?customer= is the only reliable way to find subscriptions by customer.
+        # Timeout: 30s — this is the main lookup path, give it enough time.
         if not all_subs and customer:
             customer_id = customer.get("id")
             if customer_id:
                 try:
                     log.info(
-                        f"WC: trying ?customer={customer_id} (25s timeout)"
+                        f"WC: trying ?customer={customer_id} (30s timeout)"
                     )
                     resp = requests.get(
                         f"{self.base}/subscriptions",
                         params={"customer": customer_id, "per_page": 10, "status": "any"},
                         auth=self.auth,
-                        timeout=25,
+                        timeout=30,
                     )
                     if resp.ok:
                         customer_subs = resp.json()
@@ -592,7 +574,7 @@ class WooCommerceClient:
                         )
                 except requests.exceptions.Timeout:
                     log.warning(
-                        f"WC: ?customer={customer_id} timed out (25s) for {email}"
+                        f"WC: ?customer={customer_id} timed out (30s) for {email}"
                     )
                 except requests.exceptions.RequestException as e:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
@@ -610,20 +592,22 @@ class WooCommerceClient:
                 )
                 all_subs = billing_subs
 
-        # ── Step 2e: /subscriptions?search= last resort (20s timeout) ──── #
+        # ── Step 2e: /subscriptions?search= last resort (12s timeout) ──── #
         # Full-text search across all subscription fields.
         # Catches PayPal subs and guest checkouts where billing_email failed.
+        # Timeout reduced from 20s to 12s to fit in Cloud Function 60s budget:
+        #   ~1s customer lookup + 30s ?customer= + 12s ?search= = 43s max WC time
         if not all_subs:
             try:
                 log.info(
                     f"WC: all lookups failed for {email}, "
-                    "trying ?search= last resort (20s timeout)"
+                    "trying ?search= last resort (12s timeout)"
                 )
                 resp = requests.get(
                     f"{self.base}/subscriptions",
                     params={"search": email, "per_page": 20, "status": "any"},
                     auth=self.auth,
-                    timeout=20,
+                    timeout=12,
                 )
                 if resp.ok:
                     search_subs = resp.json()
@@ -658,7 +642,7 @@ class WooCommerceClient:
                     log.warning(f"WC: ?search= failed: {resp.status_code}")
             except requests.exceptions.Timeout:
                 log.warning(
-                    f"WC: ?search= timed out (20s) for {email} "
+                    f"WC: ?search= timed out (12s) for {email} "
                     "— falling through to Stripe fallback"
                 )
             except requests.exceptions.RequestException as e:
