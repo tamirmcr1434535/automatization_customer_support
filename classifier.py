@@ -38,7 +38,10 @@ Classify into ONE intent:
                            → TRIAL_CANCELLATION (cancel intent takes priority).
                            If the Zendesk topic/subject contains "Delete account" and the body
                            is a short deletion request with no billing context → DELETE_ACCOUNT.
-- SUB_RENEWAL_CANCELLATION — wants to stop auto-renewal before next billing date (no refund request)
+- SUB_RENEWAL_CANCELLATION — DO NOT USE. Classify as TRIAL_CANCELLATION instead.
+                           Any request to stop auto-renewal, stop future charges, or cancel
+                           a subscription → TRIAL_CANCELLATION. The bot determines trial vs sub
+                           from actual WooCommerce data, not from the classifier.
 - REFUND_REQUEST         — Use when:
                            (a) customer asks ONLY for money back (no cancel request), OR
                            (b) customer asks BOTH to cancel AND to refund/reverse a past charge.
@@ -108,6 +111,9 @@ IMPORTANT RULES:
      NL: "is mijn abonnement opgezegd", "is de opzegging verwerkt"
    Key pattern: cancel word + PAST TENSE + QUESTION form = verification, not new request.
    The customer already cancelled and wants confirmation → EXPLANATION.
+   NOTE: "解約の方法" (how to cancel), "キャンセル方法" (cancel method), "how do I cancel",
+   "how to cancel my subscription" → These are CANCEL REQUESTS, not verification.
+   The customer wants to cancel but doesn't know how → TRIAL_CANCELLATION.
 
 -1. EXPLANATION / BILLING INQUIRY RULE — evaluate FIRST, before ALL other rules:
    If the customer is ASKING about a charge (what is this? why was I billed? what is this payment?)
@@ -121,12 +127,16 @@ IMPORTANT RULES:
          "can you explain this charge", "what am I being charged for"
      DE: "was ist diese Abbuchung", "wofür wurde ich belastet"
      KR: "이게 뭔 결제인가요", "왜 결제된 건가요"
-   IMPORTANT: even if "勝手に" (without consent) or similar emotional words appear,
-   if the PRIMARY message is a QUESTION asking for explanation → EXPLANATION.
-   Example: "勝手に支払いされていますが、これはなんの支払いですか？" → EXPLANATION
-            (asking WHAT is this charge, not demanding refund)
-   EXCEPTION: if also contains explicit refund demand (返金してください, refund, money back)
-   or cancel request (解約, cancel) → use those rules instead.
+   CRITICAL EXCEPTIONS — do NOT classify as EXPLANATION if ANY of these are present:
+   (a) "勝手に" (without consent) + specific amount (e.g. "1990円") → REFUND_REQUEST
+       because the customer is COMPLAINING about an unauthorized charge, not just asking.
+       Example: "199円と別に1990円勝手に支払いされていますが、これはなんの支払いですか？"
+       → REFUND_REQUEST (unauthorized charge complaint with specific amounts, not a pure question)
+   (b) explicit refund demand (返金してください, refund, money back) → REFUND_REQUEST
+   (c) cancel request (解約, cancel, キャンセル) → TRIAL_CANCELLATION
+   (d) fraud signals (不正請求, 詐欺, unauthorized) → REFUND_REQUEST
+   ONLY use EXPLANATION when the message is a PURE question with NO complaint tone,
+   NO specific amounts being disputed, and NO "勝手に" / unauthorized language.
 
 -0.5 AUTO-REPLY / OOO / SYSTEM MESSAGE RULE:
    If the message is an automated reply, out-of-office, vacation notice, or system notification
@@ -238,6 +248,10 @@ IMPORTANT RULES:
 4. "I signed up by mistake / didn't know I'd be charged" → TRIAL_CANCELLATION.
 5. TECHNICAL_ISSUE is ONLY for login/access problems — never for billing or cancellation requests.
 6. Default for any ambiguous cancellation → TRIAL_CANCELLATION.
+   IMPORTANT: "サブスクリプション解約", "subscription cancellation", "Abo kündigen",
+   "구독 취소", "cancel my subscription", "解約したい" → ALL are TRIAL_CANCELLATION.
+   NEVER classify a cancel request as SUB_RENEWAL_CANCELLATION — that intent is deprecated.
+   The bot determines trial vs subscription from actual WC/Stripe data.
 7. SUB_RENEWAL_REFUND requires ALL THREE: (a) specific renewal charge already happened,
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
 8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT / Messaging transcript.
