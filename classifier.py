@@ -140,6 +140,13 @@ IMPORTANT RULES:
    (a) "勝手に" (without consent) + specific amount (e.g. "1990円") → REFUND_REQUEST
        because the customer is COMPLAINING about an unauthorized charge, not just asking.
        Example: "199円と別に1990円勝手に支払いされていますが、これはなんの支払いですか？"
+   (e) Korean billing complaints with MULTIPLE charges or LARGE unexpected amounts
+       → NEVER EXPLANATION. Examples:
+       "출금 되었습니다" / "결제 되었습니다" (was withdrawn/charged) + complaint tone
+       + specific amounts → SUB_CANCELLATION or REFUND_REQUEST.
+       Example: "4/6일 ₩5,110, 4/6일 ₩20,461... 오늘 ₩41,381원이 출금 되었습니다.
+       상기 3건에 대해서 내용 확인하시어 연락 바랍니다" → SUB_CANCELLATION
+       (customer is reporting unexpected charges, not just asking a neutral question).
        → REFUND_REQUEST (unauthorized charge complaint with specific amounts, not a pure question)
    (b) explicit refund demand (返金してください, refund, money back) → REFUND_REQUEST
    (c) cancel request (解約, cancel, キャンセル) → TRIAL_CANCELLATION
