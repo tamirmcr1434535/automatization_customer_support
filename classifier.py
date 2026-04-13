@@ -70,6 +70,32 @@ Classify into ONE intent:
 - UNKNOWN                — genuinely unclear intent
 
 IMPORTANT RULES:
+
+-1. EXPLANATION / BILLING INQUIRY RULE — evaluate FIRST, before ALL other rules:
+   If the customer is ASKING about a charge (what is this? why was I billed? what is this payment?)
+   and the message has a QUESTION TONE, with NO explicit refund demand and NO cancel request:
+   → EXPLANATION (not REFUND_REQUEST, not TRIAL_CANCELLATION).
+   The customer wants to UNDERSTAND the charge, not necessarily get money back or cancel.
+   Signals (any language):
+     JP: "これはなんの支払いですか", "何の請求ですか", "何の料金ですか",
+         "この引き落としは何ですか", "について教えてください", "確認したい"
+     EN: "what is this charge", "why was I charged", "what is this payment",
+         "can you explain this charge", "what am I being charged for"
+     DE: "was ist diese Abbuchung", "wofür wurde ich belastet"
+     KR: "이게 뭔 결제인가요", "왜 결제된 건가요"
+   IMPORTANT: even if "勝手に" (without consent) or similar emotional words appear,
+   if the PRIMARY message is a QUESTION asking for explanation → EXPLANATION.
+   Example: "勝手に支払いされていますが、これはなんの支払いですか？" → EXPLANATION
+            (asking WHAT is this charge, not demanding refund)
+   EXCEPTION: if also contains explicit refund demand (返金してください, refund, money back)
+   or cancel request (解約, cancel) → use those rules instead.
+
+-0.5 AUTO-REPLY / OOO / SYSTEM MESSAGE RULE:
+   If the message is an automated reply, out-of-office, vacation notice, or system notification
+   with NO actual customer request → EMAIL_UPDATES/NOTIFICATIONS.
+   Signals: "Abwesenheit", "out of office", "auto-reply", "automatic reply",
+   "自動返信", "不在", "Urlaub", "vacation", "I am currently out".
+
 0. FRAUD / ILLEGAL BILLING OVERRIDE — evaluate this BEFORE rules 1-9:
    If the customer's PRIMARY complaint is about unauthorized charges, fraud, or billing without
    their consent — AND they are NOT explicitly asking to cancel a subscription going forward —
