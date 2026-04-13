@@ -38,6 +38,19 @@ Classify into ONE intent:
                            → TRIAL_CANCELLATION (cancel intent takes priority).
                            If the Zendesk topic/subject contains "Delete account" and the body
                            is a short deletion request with no billing context → DELETE_ACCOUNT.
+- SUB_RENEWAL_CANCELLATION — VERY RARE. Use ONLY when ALL of these conditions are true:
+                           (a) customer explicitly uses the EXACT phrase "auto-renewal" /
+                               "自動更新" / "자동 갱신" / "automatische Verlängerung", AND
+                           (b) customer says they want to KEEP the subscription but stop
+                               the NEXT renewal only, AND
+                           (c) there is NO cancel word anywhere (解約, キャンセル, 退会,
+                               cancel, 취소, kündigen, opzeggen, annuleren, etc.)
+                           If ANY cancel word is present → TRIAL_CANCELLATION or SUB_CANCELLATION.
+                           CRITICAL: "サブスクの解約", "サブスクリプション解約",
+                           "subscription cancellation", "구독 취소", "Abo kündigen"
+                           → these are ALL cancel requests → TRIAL_CANCELLATION or SUB_CANCELLATION.
+                           The word "subscription/サブスク/구독" does NOT make it SUB_RENEWAL_CANCELLATION.
+                           Only the EXPLICIT phrase "auto-renewal/自動更新/자동 갱신" does.
 - REFUND_REQUEST         — Use when:
                            (a) customer asks ONLY for money back (no cancel request), OR
                            (b) customer asks BOTH to cancel AND to refund/reverse a past charge.
@@ -244,9 +257,13 @@ IMPORTANT RULES:
 4. "I signed up by mistake / didn't know I'd be charged" → TRIAL_CANCELLATION.
 5. TECHNICAL_ISSUE is ONLY for login/access problems — never for billing or cancellation requests.
 6. Default for any ambiguous cancellation → TRIAL_CANCELLATION.
-   IMPORTANT: "サブスクリプション解約", "subscription cancellation", "Abo kündigen",
-   "구독 취소", "cancel my subscription", "解約したい" → ALL are TRIAL_CANCELLATION.
-   The bot determines trial vs subscription from actual WC/Stripe data.
+   IMPORTANT: "サブスクリプション解約", "サブスクの解約", "subscription cancellation",
+   "Abo kündigen", "구독 취소", "cancel my subscription", "解約したい",
+   "サブスクの解約をお願いしたい", "サブスクリプションを解約してください"
+   → ALL are TRIAL_CANCELLATION (or SUB_CANCELLATION if clearly a paid sub).
+   NEVER SUB_RENEWAL_CANCELLATION for these — the word "サブスク/subscription" does NOT
+   make it a renewal request. The bot determines trial vs sub from actual WC/Stripe data.
+   When in doubt between TRIAL and SUB → always pick TRIAL_CANCELLATION.
 7. SUB_RENEWAL_REFUND requires ALL THREE: (a) specific renewal charge already happened,
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
 8. If the ticket subject is "Conversation with [name]", this is a Zendesk LIVE CHAT / Messaging transcript.
@@ -262,12 +279,22 @@ IMPORTANT RULES:
    → NEVER return GENERAL_QUESTION, UNKNOWN, or TECHNICAL_ISSUE for chat transcripts.
 9. BILLING CONTACT RULE — any message where the customer mentions a charge, billing, subscription,
    payment, or monthly deduction → TRIAL_CANCELLATION by default.
-   GENERAL_QUESTION is FORBIDDEN if billing is mentioned. Concrete examples:
+   GENERAL_QUESTION and EXPLANATION are FORBIDDEN if billing complaint is the core message.
+   Concrete examples:
      JP: "請求について" (about billing) → TRIAL_CANCELLATION
      JP: "料金について" (about the fee) → TRIAL_CANCELLATION
      JP: "課金について" (about the charge) → TRIAL_CANCELLATION
      JP: "引き落としについて" (about the deduction) → TRIAL_CANCELLATION
      EN: "about my subscription" → TRIAL_CANCELLATION
+     KR: "계좌 출금 관련" (about account withdrawal) → SUB_CANCELLATION
+     KR: "출금", "결제", "구독", "과금", "인출" (withdrawal, payment, subscription,
+         billing, debit) in complaint context → TRIAL_CANCELLATION or SUB_CANCELLATION
+     KR: "정기 결제" (recurring payment) → SUB_CANCELLATION
+     KR: "구독 해지" (cancel subscription) → SUB_CANCELLATION
+   IMPORTANT for Korean: if the subject or body mentions a bank account charge/withdrawal
+   (계좌, 출금, 인출) in a COMPLAINT tone → this is a cancellation request (the customer
+   wants to stop the charges), NOT an EXPLANATION. Only use EXPLANATION if the customer
+   is purely asking a neutral question with zero complaint tone.
    EXCEPTION 1: if the complaint is pure fraud/unauthorized (see Rule 0) with ZERO cancel words
    → REFUND_REQUEST.
    EXCEPTION 2: if the message mentions ONLY a specific past payment reversal with ZERO
@@ -383,38 +410,5 @@ def classify_ticket(subject: str, body: str) -> dict:
 
     if result is None:
         return {**_FALLBACK, "reasoning": "parse error — classifier fallback"}
-
-    # ── Post-processing remaps ──────────────────────────────────────
-    intent = result.get("intent", "UNKNOWN")
-
-    # SUB_RENEWAL_CANCELLATION is deprecated — remap to TRIAL_CANCELLATION
-    if intent == "SUB_RENEWAL_CANCELLATION":
-        log.info(
-            "classify_ticket: remapped SUB_RENEWAL_CANCELLATION → "
-            "TRIAL_CANCELLATION (deprecated intent)"
-        )
-        result["intent"] = "TRIAL_CANCELLATION"
-        result["reasoning"] = (
-            result.get("reasoning", "") +
-            " [remapped from SUB_RENEWAL_CANCELLATION]"
-        )
-        intent = "TRIAL_CANCELLATION"
-
-    # Safety: if chargeback_risk is flagged and bot would auto-cancel,
-    # escalate instead — human must handle chargeback/dispute tickets.
-    if (
-        result.get("chargeback_risk") is True
-        and intent in ("TRIAL_CANCELLATION", "SUB_CANCELLATION")
-    ):
-        log.warning(
-            "classify_ticket: chargeback_risk=true with cancel intent %s → "
-            "remapped to CHARGEBACK_THREAT for escalation",
-            intent,
-        )
-        result["intent"] = "CHARGEBACK_THREAT"
-        result["reasoning"] = (
-            result.get("reasoning", "") +
-            f" [remapped from {intent}: chargeback_risk=true]"
-        )
 
     return result
