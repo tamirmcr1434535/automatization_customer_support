@@ -9,10 +9,10 @@ IMPORTANT — performance notes for iqbooster.org:
     GET /customers?email=             — exact email lookup, indexed
     GET /subscriptions/{id}           — direct single-row lookup
 
-  SLOW endpoints (8–25s):
-    GET /subscriptions?customer=      — customer_id filter (25s timeout, MAIN PATH)
-    GET /subscriptions?search=        — full-text search, not indexed (10s timeout)
-    GET /customers?search=            — full-text search, not indexed (8s timeout)
+  SLOW endpoints (8–45s):
+    GET /subscriptions?customer=      — customer_id filter (45s timeout, MAIN PATH)
+    GET /subscriptions?search=        — full-text search, not indexed (15s timeout)
+    GET /customers?search=            — full-text search, not indexed (10s timeout)
 
   BROKEN endpoints (do NOT use):
     GET /subscriptions?billing_email= — returns ALL subs on iqbooster.org (server bug)
@@ -25,7 +25,7 @@ IMPORTANT — performance notes for iqbooster.org:
     2b. /subscriptions?customer=       (25s timeout, MOST RELIABLE)
     2c. /subscriptions?billing_email=  (only if NO customer found, 10s timeout)
     2d. /subscriptions?search=         (10s timeout, last resort)
-    Worst case: 5s + 8s + 25s + 10s = 48s (leaves 12s for classifier+ZD)
+    Worst case: 5s + 10s + 45s + 15s = 75s (CF timeout is 3600s — plenty of room)
 """
 
 import logging
@@ -463,12 +463,12 @@ class WooCommerceClient:
 
         Lookup chain (optimized for 60s Cloud Function budget):
           1.  /customers?email=           (~0.3s, indexed, 5s timeout)
-          1b. /customers?search=          (8s timeout, PayPal fallback)
+          1b. /customers?search=          (10s timeout, PayPal fallback)
           2a. customer meta_data → /subscriptions/{id}  (~0.3s, 8s timeout)
-          2b. /subscriptions?customer=    (25s timeout, MAIN PATH)
-          2c. /subscriptions?billing_email= (only if NO customer, 10s timeout)
-          2d. /subscriptions?search=      (10s timeout, last resort)
-          Worst case: 5s + 8s + 25s + 10s = 48s (leaves 12s for classifier+ZD)
+          2b. /subscriptions?customer=    (45s timeout, MAIN PATH)
+          2c. /subscriptions?billing_email= (10s timeout, only if NO customer)
+          2d. /subscriptions?search=      (15s timeout, last resort)
+          Worst case: 5s + 10s + 45s + 15s = 75s (CF timeout is 3600s — plenty of room)
 
         If subscription not found → returns "not_found" → bot asks customer
         for last 4 card digits → Stripe finds email → we try again.
@@ -500,7 +500,7 @@ class WooCommerceClient:
                     f"{self.base}/customers",
                     params={"search": email, "per_page": 5},
                     auth=self.auth,
-                    timeout=8,
+                    timeout=10,
                 )
                 if resp.ok:
                     data = resp.json()
@@ -529,7 +529,7 @@ class WooCommerceClient:
                                     f"for {email} but none matched exactly"
                                 )
             except requests.exceptions.Timeout:
-                log.warning(f"WC: customer ?search= timed out (8s) for {email}")
+                log.warning(f"WC: customer ?search= timed out (10s) for {email}")
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC: customer ?search= error for {email}: {e}")
             log.info(f"WC TIMING: step1b customer?search= done in {time.time()-t1b:.1f}s")
@@ -555,20 +555,22 @@ class WooCommerceClient:
             else:
                 log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Step 2b: /subscriptions?customer= (MOST RELIABLE, 25s) ───── #
+        # ── Step 2b: /subscriptions?customer= (MOST RELIABLE, 45s) ───── #
+        # CF timeout is 3600s — give this endpoint plenty of time.
+        # iqbooster.org regularly takes 30-70s for this query.
         if not all_subs and customer:
             customer_id = customer.get("id")
             if customer_id:
                 t2b = time.time()
                 try:
                     log.info(
-                        f"WC: trying ?customer={customer_id} (25s timeout)"
+                        f"WC: trying ?customer={customer_id} (45s timeout)"
                     )
                     resp = requests.get(
                         f"{self.base}/subscriptions",
                         params={"customer": customer_id, "per_page": 10, "status": "any"},
                         auth=self.auth,
-                        timeout=25,
+                        timeout=45,
                     )
                     if resp.ok:
                         customer_subs = resp.json()
@@ -591,7 +593,7 @@ class WooCommerceClient:
                         )
                 except requests.exceptions.Timeout:
                     log.warning(
-                        f"WC: ?customer={customer_id} TIMED OUT (25s) for {email}"
+                        f"WC: ?customer={customer_id} TIMED OUT (45s) for {email}"
                     )
                 except requests.exceptions.RequestException as e:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
@@ -609,19 +611,19 @@ class WooCommerceClient:
                 all_subs = billing_subs
             log.info(f"WC TIMING: step2c billing_email done in {time.time()-t2c:.1f}s (total {time.time()-wc_start:.1f}s)")
 
-        # ── Step 2d: /subscriptions?search= last resort (10s timeout) ──── #
+        # ── Step 2d: /subscriptions?search= last resort (15s timeout) ──── #
         if not all_subs:
             t2d = time.time()
             try:
                 log.info(
                     f"WC: all lookups failed for {email}, "
-                    "trying ?search= last resort (10s timeout)"
+                    "trying ?search= last resort (15s timeout)"
                 )
                 resp = requests.get(
                     f"{self.base}/subscriptions",
                     params={"search": email, "per_page": 20, "status": "any"},
                     auth=self.auth,
-                    timeout=10,
+                    timeout=15,
                 )
                 if resp.ok:
                     search_subs = resp.json()
@@ -654,7 +656,7 @@ class WooCommerceClient:
                     log.warning(f"WC: ?search= failed: {resp.status_code}")
             except requests.exceptions.Timeout:
                 log.warning(
-                    f"WC: ?search= TIMED OUT (10s) for {email} "
+                    f"WC: ?search= TIMED OUT (15s) for {email} "
                     "— falling through to Stripe fallback"
                 )
             except requests.exceptions.RequestException as e:
