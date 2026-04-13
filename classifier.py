@@ -65,11 +65,49 @@ Classify into ONE intent:
                            how the test works, or account features — with ABSOLUTELY ZERO mention
                            of billing, charges, subscription, or payments. If the customer
                            mentions ANY charge, billing, or subscription → NEVER GENERAL_QUESTION.
+- EXPLANATION            — customer is asking about a charge, requesting clarification, or
+                           verifying a previous cancellation. NOT requesting new action.
 - UNSUBSCRIBE_EMAIL      — only wants to be removed from mailing/marketing list
+- SPAM                   — message is spam, automated form submission with no real customer
+                           request, or nonsensical content. Signals: "16 Persons", "Contact Form"
+                           with no actual support question, gibberish text, SEO spam, bot-generated
+                           content with no human intent.
 - DUPLICATE              — repeat of an existing ticket
 - UNKNOWN                — genuinely unclear intent
 
 IMPORTANT RULES:
+
+-2. QUOTED TEXT / AGENT REPLY RULE — evaluate BEFORE all other rules:
+   Support tickets often contain QUOTED REPLIES from support agents (IQ Booster Support Team,
+   Daniel, Mia, Rina, Anastasiia, Iryna, etc.) and previous ticket history.
+   YOU MUST ONLY classify based on the CUSTOMER'S OWN LATEST MESSAGE — ignore:
+   - Text after "Best regards," or "Best," from support agents
+   - Text inside quoted blocks ("引用元メッセージ", "From:", "-----", "> ")
+   - Previous agent responses explaining billing or confirming cancellation
+   - Signature blocks with "IQ Booster Support Team"
+   If the customer's OWN words contain cancel/refund keywords → use those.
+   If ONLY the quoted agent text contains cancel/refund keywords → DO NOT use them.
+   Example: customer says "詐欺のような誘導!" (fraud-like!) and the quoted agent reply
+   contains "キャンセルされました" (was cancelled) → the customer is NOT requesting cancel.
+   Focus on the customer's complaint = REFUND_REQUEST (fraud).
+
+-1.5. CANCELLATION VERIFICATION RULE — evaluate BEFORE cancel rules:
+   If the customer is ASKING WHETHER a previous cancellation was successful, or CONFIRMING
+   that their subscription was already cancelled — this is NOT a new cancel request.
+   → EXPLANATION (not TRIAL_CANCELLATION, not SUB_CANCELLATION).
+   Signals (any language):
+     KR: "취소가 올바르게 되었나요", "취소가 됐나요", "취소 확인", "취소가 잘 되었나요",
+         "취소가 되었는지", "취소 처리 되었나요", "취소가 완료되었나요"
+     JP: "解約できていますか", "解約されましたか", "キャンセルされていますか",
+         "キャンセルは完了していますか", "解約手続きは完了しましたか",
+         "ちゃんと解約されていますか", "解約の確認"
+     EN: "was my cancellation successful", "did my cancellation go through",
+         "is my subscription cancelled", "can you confirm cancellation",
+         "has my subscription been cancelled"
+     DE: "wurde meine Kündigung bearbeitet", "ist mein Abo gekündigt"
+     NL: "is mijn abonnement opgezegd", "is de opzegging verwerkt"
+   Key pattern: cancel word + PAST TENSE + QUESTION form = verification, not new request.
+   The customer already cancelled and wants confirmation → EXPLANATION.
 
 -1. EXPLANATION / BILLING INQUIRY RULE — evaluate FIRST, before ALL other rules:
    If the customer is ASKING about a charge (what is this? why was I billed? what is this payment?)
