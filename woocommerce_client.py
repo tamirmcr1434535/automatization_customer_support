@@ -234,9 +234,35 @@ class WooCommerceClient:
         if not isinstance(data, list) or not data:
             return []
 
+        # ── Early sanity check: detect broken WC server filter ──────────
+        # The WC billing_email filter is known to be broken on some servers:
+        # it returns ALL subscriptions instead of filtering by email.
+        # Check the first few results — if none match, bail immediately
+        # with ONE warning instead of logging 50 individual mismatches.
+        PROBE_SIZE = min(5, len(data))
+        probe_matches = sum(
+            1 for s in data[:PROBE_SIZE]
+            if self._subscription_matches_email(s, email_lower)
+        )
+        probe_empty = sum(
+            1 for s in data[:PROBE_SIZE]
+            if not s.get("billing", {}).get("email", "").strip()
+        )
+
+        # If we got many results and NONE of the first 5 match the email
+        # (and they're not empty-email), the server filter is broken.
+        if len(data) > 5 and probe_matches == 0 and probe_empty == 0:
+            log.warning(
+                f"WC: billing_email filter BROKEN for {email} — server returned "
+                f"{len(data)} sub(s), first {PROBE_SIZE} all have wrong billing "
+                "emails. Discarding all results."
+            )
+            return []
+
+        # ── Normal processing for smaller / partially-matching results ──
         exact = []
         trusted_empty = []
-        wrong_email_subs = []
+        wrong_count = 0
 
         for s in data:
             if self._subscription_matches_email(s, email_lower):
@@ -244,14 +270,15 @@ class WooCommerceClient:
             else:
                 be = s.get("billing", {}).get("email", "").strip()
                 if be:
-                    wrong_email_subs.append(s)
-                    log.warning(
-                        f"WC: billing_email query returned sub #{s.get('id')} "
-                        f"with mismatched billing.email='{be}' (expected '{email}') "
-                        "— WC server filter may be unreliable"
-                    )
+                    wrong_count += 1
                 else:
                     trusted_empty.append(s)
+
+        if wrong_count:
+            log.warning(
+                f"WC: billing_email query for {email} returned {wrong_count} "
+                f"sub(s) with wrong billing emails — server filter unreliable"
+            )
 
         if exact:
             log.info(
@@ -261,30 +288,20 @@ class WooCommerceClient:
 
         # If API returned ONLY trusted-empty subs (billing.email blank, server filtered) —
         # trust the server result as long as no wrong-email subs were mixed in.
-        if trusted_empty and not wrong_email_subs:
+        if trusted_empty and wrong_count == 0:
             log.info(
                 f"WC: billing_email returned {len(trusted_empty)} sub(s) with empty "
                 f"billing.email for {email} — trusting server filter"
             )
             return trusted_empty
 
-        # If API returned a mix of wrong-email + empty-email subs, the server filter
-        # is unreliable. Log the situation so we can diagnose in logs.
-        if wrong_email_subs and trusted_empty:
+        # Mixed or all-wrong results — discard everything.
+        if wrong_count and trusted_empty:
             log.warning(
                 f"WC: billing_email query for {email} returned mixed results "
-                f"({len(trusted_empty)} empty-email, {len(wrong_email_subs)} wrong-email) "
-                "— server filter broken, discarding all to avoid false positives"
+                f"({len(trusted_empty)} empty-email, {wrong_count} wrong-email) "
+                "— discarding all to avoid false positives"
             )
-
-        if wrong_email_subs and not trusted_empty and not exact:
-            log.warning(
-                f"WC: billing_email query for {email} returned {len(wrong_email_subs)} "
-                "sub(s) with wrong emails and no matches — server filter broken"
-            )
-
-        if not data:
-            log.info(f"WC: billing_email query returned 0 results for {email}")
 
         return []
 
