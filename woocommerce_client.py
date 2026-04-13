@@ -15,12 +15,12 @@ IMPORTANT — performance notes for iqbooster.org:
     GET /customers?search=            — full-text search, not indexed
     GET /subscriptions?customer=      — customer_id filter, not indexed (25s timeout)
 
-  Lookup strategy (ordered by speed):
+  Lookup strategy (fast first, reliable fallbacks):
     1. /customers?email=         → meta_data subscription_id → /subscriptions/{id}
-    2. /orders?customer={id}     → extract subscription_id from order meta → /subscriptions/{id}
-    3. /subscriptions?billing_email=  → server-side billing email filter
-    4. /subscriptions?customer=  → slow fallback (25s timeout)
-    5. /subscriptions?search=    → last-resort full-text search (8s timeout)
+    2. /orders?customer={id}     → extract subscription_id from order meta (8s timeout)
+    3. /subscriptions?customer=  → MOST RELIABLE when customer found (25s timeout)
+    4. /subscriptions?billing_email= → only when NO customer (broken on iqbooster.org)
+    5. /subscriptions?search=    → last-resort full-text search (20s timeout)
     6. (Stripe fallback in main.py if all WC lookups fail)
 """
 
@@ -115,7 +115,7 @@ class WooCommerceClient:
                     "order": "desc",
                 },
                 auth=self.auth,
-                timeout=30,
+                timeout=8,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC: orders lookup error for customer {customer_id}: {e}")
@@ -445,14 +445,14 @@ class WooCommerceClient:
         """
         Find customer → find subscription → cancel.
 
-        Lookup chain (fast first, slow fallbacks):
+        Lookup chain (fast first, reliable fallbacks):
           1.  /customers?email=           (~0.3s, indexed)
           1b. /customers?search=          (8s timeout, fallback for PayPal users)
           2a. customer meta_data → /subscriptions/{id}  (~0.3s)
-          2b. /orders?customer={id} → subscription IDs  (~1-2s)
-          2c. /subscriptions?billing_email=              (~1s)
-          2d. /subscriptions?customer=                   (25s timeout)
-          2e. /subscriptions?search=                     (8s timeout, last resort)
+          2b. /orders?customer={id} → subscription IDs  (8s timeout, quick try)
+          2c. /subscriptions?customer=                   (25s timeout, RELIABLE)
+          2d. /subscriptions?billing_email=              (only if NO customer found)
+          2e. /subscriptions?search=                     (20s timeout, last resort)
 
         If subscription not found → returns "not_found" → bot asks customer
         for last 4 card digits → Stripe finds email → we try again.
@@ -534,10 +534,11 @@ class WooCommerceClient:
             else:
                 log.info(f"WC: customer found but no subscription_id in meta_data")
 
-        # ── Step 2b: find subscription via customer's orders (FAST) ──────── #
-        # /orders?customer={id} is fast (~1-2s) and returns orders that contain
-        # subscription_ids in their line_items or meta_data.
-        # This is MUCH faster than /subscriptions?customer= which is 8-30s.
+        # ── Step 2b: find subscription via customer's orders (QUICK TRY) ── #
+        # /orders?customer={id} — quick try with 8s timeout.
+        # If the server is fast, this returns in 1-2s and we get sub IDs.
+        # If it times out (common on iqbooster.org), we fall through quickly
+        # to ?customer= which is more reliable.
         if not all_subs and customer:
             customer_id = customer.get("id")
             if customer_id:
@@ -555,29 +556,17 @@ class WooCommerceClient:
                     if order_subs:
                         all_subs = order_subs
 
-        # ── Step 2c: /subscriptions?billing_email= (FAST, ~1s) ────────── #
-        # Direct subscription search by billing email — fast server-side filter.
-        # Covers cases where customer meta_data has no subscription_id and
-        # orders don't reference the subscription (e.g. fresh trials).
-        if not all_subs:
-            billing_subs = self._find_subs_by_billing_email(email)
-            if billing_subs:
-                log.info(
-                    f"WC: found {len(billing_subs)} sub(s) via billing_email "
-                    f"for {email}"
-                )
-                all_subs = billing_subs
-
-        # ── Step 2d: /subscriptions?customer= fallback (SLOW, 8-30s) ────── #
-        # Only used when all fast lookups failed.
-        # Increased timeout to 25s to cover the 8-30s range.
+        # ── Step 2c: /subscriptions?customer= (RELIABLE, 25s timeout) ──── #
+        # When we have a customer_id, this is the MOST RELIABLE path.
+        # Moved BEFORE billing_email because billing_email filter is broken
+        # on iqbooster.org (returns ALL subscriptions for any email).
+        # ?customer= is slower (8-30s) but actually filters correctly.
         if not all_subs and customer:
             customer_id = customer.get("id")
             if customer_id:
                 try:
                     log.info(
-                        f"WC: fast lookups failed, trying slow "
-                        f"?customer={customer_id} (25s timeout)"
+                        f"WC: trying ?customer={customer_id} (25s timeout)"
                     )
                     resp = requests.get(
                         f"{self.base}/subscriptions",
@@ -603,24 +592,31 @@ class WooCommerceClient:
                         )
                 except requests.exceptions.Timeout:
                     log.warning(
-                        f"WC: ?customer={customer_id} timed out (25s) for {email} "
-                        "— falling through to Stripe fallback"
+                        f"WC: ?customer={customer_id} timed out (25s) for {email}"
                     )
                 except requests.exceptions.RequestException as e:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
 
-        # ── Step 2e: /subscriptions?search= last resort (SLOW, 20s timeout) ─── #
-        # Full-text search across all subscription fields (billing name, email,
-        # order IDs, etc.). This is the same search WC admin uses.
-        # Slow (8–30s) but catches PayPal subs and other edge cases where
-        # billing_email filter and customer-based lookups fail.
-        # NOTE: timeout increased from 8s to 20s because billing_email filter
-        # is broken for some emails (returns ALL subs), making this the ONLY
-        # reliable path to find the subscription. 20s is enough for most cases.
+        # ── Step 2d: /subscriptions?billing_email= (ONLY without customer) ── #
+        # billing_email filter is broken on iqbooster.org — returns ALL subs
+        # for any email. Only useful as fallback for guest checkout (no customer).
+        # When we have a customer_id, ?customer= above is always better.
+        if not all_subs and not customer:
+            billing_subs = self._find_subs_by_billing_email(email)
+            if billing_subs:
+                log.info(
+                    f"WC: found {len(billing_subs)} sub(s) via billing_email "
+                    f"for {email}"
+                )
+                all_subs = billing_subs
+
+        # ── Step 2e: /subscriptions?search= last resort (20s timeout) ──── #
+        # Full-text search across all subscription fields.
+        # Catches PayPal subs and guest checkouts where billing_email failed.
         if not all_subs:
             try:
                 log.info(
-                    f"WC: all fast lookups failed for {email}, "
+                    f"WC: all lookups failed for {email}, "
                     "trying ?search= last resort (20s timeout)"
                 )
                 resp = requests.get(
@@ -632,8 +628,6 @@ class WooCommerceClient:
                 if resp.ok:
                     search_subs = resp.json()
                     if isinstance(search_subs, list) and search_subs:
-                        # Verify at least one result actually matches the email
-                        # (search is fuzzy — can return unrelated results)
                         verified = [
                             s for s in search_subs
                             if self._subscription_matches_email(
