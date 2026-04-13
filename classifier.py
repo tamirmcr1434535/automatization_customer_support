@@ -38,10 +38,6 @@ Classify into ONE intent:
                            → TRIAL_CANCELLATION (cancel intent takes priority).
                            If the Zendesk topic/subject contains "Delete account" and the body
                            is a short deletion request with no billing context → DELETE_ACCOUNT.
-- SUB_RENEWAL_CANCELLATION — DO NOT USE. Classify as TRIAL_CANCELLATION instead.
-                           Any request to stop auto-renewal, stop future charges, or cancel
-                           a subscription → TRIAL_CANCELLATION. The bot determines trial vs sub
-                           from actual WooCommerce data, not from the classifier.
 - REFUND_REQUEST         — Use when:
                            (a) customer asks ONLY for money back (no cancel request), OR
                            (b) customer asks BOTH to cancel AND to refund/reverse a past charge.
@@ -250,7 +246,6 @@ IMPORTANT RULES:
 6. Default for any ambiguous cancellation → TRIAL_CANCELLATION.
    IMPORTANT: "サブスクリプション解約", "subscription cancellation", "Abo kündigen",
    "구독 취소", "cancel my subscription", "解約したい" → ALL are TRIAL_CANCELLATION.
-   NEVER classify a cancel request as SUB_RENEWAL_CANCELLATION — that intent is deprecated.
    The bot determines trial vs subscription from actual WC/Stripe data.
 7. SUB_RENEWAL_REFUND requires ALL THREE: (a) specific renewal charge already happened,
    (b) explicit refund request, (c) NO cancellation word anywhere in the message.
@@ -376,16 +371,50 @@ def classify_ticket(subject: str, body: str) -> dict:
     start_idx = raw_text.find('{')
     end_idx   = raw_text.rfind('}')
 
+    result = None
     if start_idx != -1 and end_idx != -1:
         clean_json_str = raw_text[start_idx:end_idx + 1]
         try:
-            return json.loads(clean_json_str)
+            result = json.loads(clean_json_str)
         except json.JSONDecodeError as e:
             print(f"JSON Decode Error on cleaned string: {clean_json_str}")
-            # Fall through to fallback
     else:
         print(f"Claude returned invalid response without JSON brackets: {raw_text}")
-        # Fall through to fallback
 
-    # Fallback: could not parse valid JSON — treat as UNKNOWN so bot skips safely
-    return {**_FALLBACK, "reasoning": "parse error — classifier fallback"}
+    if result is None:
+        return {**_FALLBACK, "reasoning": "parse error — classifier fallback"}
+
+    # ── Post-processing remaps ──────────────────────────────────────
+    intent = result.get("intent", "UNKNOWN")
+
+    # SUB_RENEWAL_CANCELLATION is deprecated — remap to TRIAL_CANCELLATION
+    if intent == "SUB_RENEWAL_CANCELLATION":
+        log.info(
+            "classify_ticket: remapped SUB_RENEWAL_CANCELLATION → "
+            "TRIAL_CANCELLATION (deprecated intent)"
+        )
+        result["intent"] = "TRIAL_CANCELLATION"
+        result["reasoning"] = (
+            result.get("reasoning", "") +
+            " [remapped from SUB_RENEWAL_CANCELLATION]"
+        )
+        intent = "TRIAL_CANCELLATION"
+
+    # Safety: if chargeback_risk is flagged and bot would auto-cancel,
+    # escalate instead — human must handle chargeback/dispute tickets.
+    if (
+        result.get("chargeback_risk") is True
+        and intent in ("TRIAL_CANCELLATION", "SUB_CANCELLATION")
+    ):
+        log.warning(
+            "classify_ticket: chargeback_risk=true with cancel intent %s → "
+            "remapped to CHARGEBACK_THREAT for escalation",
+            intent,
+        )
+        result["intent"] = "CHARGEBACK_THREAT"
+        result["reasoning"] = (
+            result.get("reasoning", "") +
+            f" [remapped from {intent}: chargeback_risk=true]"
+        )
+
+    return result
