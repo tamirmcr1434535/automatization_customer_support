@@ -234,32 +234,12 @@ class WooCommerceClient:
         if not isinstance(data, list) or not data:
             return []
 
-        # ── Early sanity check: detect broken WC server filter ──────────
-        # The WC billing_email filter is known to be broken on some servers:
-        # it returns ALL subscriptions instead of filtering by email.
-        # Check the first few results — if none match, bail immediately
-        # with ONE warning instead of logging 50 individual mismatches.
-        PROBE_SIZE = min(5, len(data))
-        probe_matches = sum(
-            1 for s in data[:PROBE_SIZE]
-            if self._subscription_matches_email(s, email_lower)
-        )
-        probe_empty = sum(
-            1 for s in data[:PROBE_SIZE]
-            if not s.get("billing", {}).get("email", "").strip()
-        )
-
-        # If we got many results and NONE of the first 5 match the email
-        # (and they're not empty-email), the server filter is broken.
-        if len(data) > 5 and probe_matches == 0 and probe_empty == 0:
-            log.warning(
-                f"WC: billing_email filter BROKEN for {email} — server returned "
-                f"{len(data)} sub(s), first {PROBE_SIZE} all have wrong billing "
-                "emails. Discarding all results."
-            )
-            return []
-
-        # ── Normal processing for smaller / partially-matching results ──
+        # ── Scan ALL results for matches ────────────────────────────────
+        # The WC billing_email filter is broken on some servers — it may
+        # return ALL subscriptions instead of just the matching one.
+        # We MUST scan every result because the correct subscription could
+        # be at any position (not necessarily in the first few).
+        # Log only ONE summary warning instead of per-subscription warnings.
         exact = []
         trusted_empty = []
         wrong_count = 0
@@ -274,15 +254,18 @@ class WooCommerceClient:
                 else:
                     trusted_empty.append(s)
 
+        # Log one summary warning for all mismatches (not 50 individual ones)
         if wrong_count:
             log.warning(
                 f"WC: billing_email query for {email} returned {wrong_count} "
-                f"sub(s) with wrong billing emails — server filter unreliable"
+                f"sub(s) with wrong billing emails out of {len(data)} total "
+                "— server filter unreliable"
             )
 
         if exact:
             log.info(
-                f"WC: billing_email found {len(exact)} exact match(es) for {email}"
+                f"WC: billing_email found {len(exact)} exact match(es) for "
+                f"{email} (among {len(data)} total results)"
             )
             return exact
 
@@ -295,12 +278,19 @@ class WooCommerceClient:
             )
             return trusted_empty
 
-        # Mixed or all-wrong results — discard everything.
+        # Mixed or all-wrong results — discard trusted_empty too (can't trust
+        # server filter when it also returned wrong-email subs).
         if wrong_count and trusted_empty:
             log.warning(
-                f"WC: billing_email query for {email} returned mixed results "
-                f"({len(trusted_empty)} empty-email, {wrong_count} wrong-email) "
-                "— discarding all to avoid false positives"
+                f"WC: billing_email query for {email}: discarding "
+                f"{len(trusted_empty)} empty-email sub(s) because {wrong_count} "
+                "wrong-email sub(s) also present — server filter broken"
+            )
+
+        if wrong_count and not exact and not trusted_empty:
+            log.warning(
+                f"WC: billing_email query for {email}: all {wrong_count} "
+                "results had wrong emails, no matches found"
             )
 
         return []
