@@ -100,7 +100,7 @@ class WooCommerceClient:
     def _find_sub_ids_from_orders(self, customer_id: int) -> list[int]:
         """
         Find subscription IDs by looking at customer's orders.
-        /orders?customer={id} is fast (~1-2s, indexed by customer).
+        /orders?customer={id} — usually 1-2s, but can take 15-30s on slow server.
         Each WC Subscription order has a 'subscription_ids' in meta_data
         or '_subscription_id' linking back to the subscription.
         Returns list of unique subscription IDs found.
@@ -110,12 +110,12 @@ class WooCommerceClient:
                 f"{self.base}/orders",
                 params={
                     "customer": customer_id,
-                    "per_page": 5,
+                    "per_page": 3,
                     "orderby": "date",
                     "order": "desc",
                 },
                 auth=self.auth,
-                timeout=25,
+                timeout=30,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC: orders lookup error for customer {customer_id}: {e}")
@@ -602,22 +602,25 @@ class WooCommerceClient:
                 except requests.exceptions.RequestException as e:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
 
-        # ── Step 2e: /subscriptions?search= last resort (SLOW, 8s timeout) ─── #
+        # ── Step 2e: /subscriptions?search= last resort (SLOW, 20s timeout) ─── #
         # Full-text search across all subscription fields (billing name, email,
         # order IDs, etc.). This is the same search WC admin uses.
         # Slow (8–30s) but catches PayPal subs and other edge cases where
         # billing_email filter and customer-based lookups fail.
+        # NOTE: timeout increased from 8s to 20s because billing_email filter
+        # is broken for some emails (returns ALL subs), making this the ONLY
+        # reliable path to find the subscription. 20s is enough for most cases.
         if not all_subs:
             try:
                 log.info(
                     f"WC: all fast lookups failed for {email}, "
-                    "trying ?search= last resort (8s timeout)"
+                    "trying ?search= last resort (20s timeout)"
                 )
                 resp = requests.get(
                     f"{self.base}/subscriptions",
                     params={"search": email, "per_page": 20, "status": "any"},
                     auth=self.auth,
-                    timeout=8,
+                    timeout=20,
                 )
                 if resp.ok:
                     search_subs = resp.json()
@@ -654,7 +657,7 @@ class WooCommerceClient:
                     log.warning(f"WC: ?search= failed: {resp.status_code}")
             except requests.exceptions.Timeout:
                 log.warning(
-                    f"WC: ?search= timed out (8s) for {email} "
+                    f"WC: ?search= timed out (20s) for {email} "
                     "— falling through to Stripe fallback"
                 )
             except requests.exceptions.RequestException as e:
