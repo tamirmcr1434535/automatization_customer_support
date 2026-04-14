@@ -1773,6 +1773,18 @@ _REFUND_KEYWORDS = [
     "引き落とされていた", # past tense variant
     "勝手に課金", # "charged without consent"
     "勝手に請求", # "billed without consent"
+    # Japanese — unauthorized/auto-charge patterns (complement _STRONG_REFUND_SIGNALS)
+    "購読契約していないのに", # "despite not having a subscription"
+    "契約していないのに",     # "despite not subscribing"
+    "登録していないのに",     # "despite not registering"
+    "自動で料金が",           # "fee was charged automatically"
+    "自動で引かれ",           # "automatically deducted"
+    "自動で課金",             # "automatically charged"
+    "2回も引かれ",            # "charged twice"
+    "何度も引かれ",           # "charged multiple times"
+    "二重に引かれ",           # "double-charged"
+    "二重請求",               # "double billing"
+    "二重課金",               # "double charging"
     # English
     "refund", "repayment", "reimbursement", "money back", "chargeback",
     "charge back", "get my money", "pay me back",
@@ -1977,6 +1989,18 @@ _STRONG_REFUND_SIGNALS = [
     "身に覚えの",           # I don't recognize this (charge)
     "身に覚えがない",       # variant
     "身に覚えがありません", # polite variant
+    # ── Japanese — unauthorized/auto-charge without consent ──
+    "購読契約していないのに",  # "despite not having a subscription" + charged
+    "契約していないのに",      # "despite not subscribing" (shorter)
+    "登録していないのに",      # "despite not registering"
+    "自動で料金が",            # "fee was charged automatically"
+    "自動で引かれ",            # "automatically deducted"
+    "自動で課金",              # "automatically charged"
+    "2回も引かれ",             # "charged twice" (specific complaint)
+    "何度も引かれ",            # "charged multiple times"
+    "二重に引かれ",            # "double-charged"
+    "二重請求",                # "double billing"
+    "二重課金",                # "double charging"
     # ── English ──
     "fraud",
     "fraudulent",
