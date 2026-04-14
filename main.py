@@ -374,12 +374,16 @@ def _shadow_enrich_result(ticket_id: str, result: dict) -> None:
         subject = ticket.get("subject", "")
         body = ticket.get("description", "")
         # Same logic as _process: Messaging tickets have agent greeting as description,
-        # so always fetch first customer comment for classification.
+        # so always fetch ALL customer comments for classification (not just the first).
         _is_msg = subject.lower().startswith("conversation with")
         if _is_msg or len(body.strip()) < 30:
-            first_comment = zendesk.get_first_customer_comment(ticket_id)
-            if first_comment:
-                body = first_comment
+            all_customer_text = zendesk.get_all_customer_comments_text(ticket_id)
+            if all_customer_text:
+                body = all_customer_text
+            else:
+                first_comment = zendesk.get_first_customer_comment(ticket_id)
+                if first_comment:
+                    body = first_comment
 
         classification = classify_ticket(subject, body)
         # Keep existing intent if it was already set (e.g. REFUND_REQUEST from keyword check)
@@ -556,21 +560,49 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 2b. Messaging/chat tickets: description = agent auto-greeting, NOT customer message.
-    # For Messaging tickets (subject "Conversation with ..."), ALWAYS fetch the first
-    # customer comment — that's where the actual request is (form data, typed message).
+    # For Messaging tickets (subject "Conversation with ..."), ALWAYS fetch ALL
+    # customer comments — the first one may be just a form submission ("Unsubscribe")
+    # while follow-ups contain the real intent ("refund 39900 won").
     # For other tickets, fallback if description is very short (< 30 chars).
+    #
+    # FIX: Messaging conversations arrive in bursts — the customer submits a form,
+    # then immediately types 1-2 follow-up messages with details. The webhook fires
+    # on ticket creation when only the first message exists. We wait briefly so
+    # follow-up messages are available via the Zendesk API.
     _is_messaging = subject.lower().startswith("conversation with")
     if _is_messaging or len(body.strip()) < 30:
-        first_comment = zendesk.get_first_customer_comment(ticket_id)
-        if first_comment:
+        # Delay for messaging tickets to capture follow-up messages
+        if _is_messaging:
+            import time as _t
+            _MESSAGING_DELAY = int(os.getenv("MESSAGING_CLASSIFY_DELAY_SEC", "45"))
+            log.info(
+                f"[{ticket_id}] Messaging ticket — waiting {_MESSAGING_DELAY}s "
+                f"for follow-up messages before classification"
+            )
+            _t.sleep(_MESSAGING_DELAY)
+
+        # Fetch ALL customer comments (oldest first), not just the first one.
+        # This captures follow-up messages that clarify intent (e.g. refund requests
+        # that arrive after the initial "Unsubscribe" form submission).
+        all_customer_text = zendesk.get_all_customer_comments_text(ticket_id)
+        if all_customer_text:
             if _is_messaging:
                 log.info(
-                    f"[{ticket_id}] Messaging ticket — using first customer comment "
-                    f"for classification (description is agent greeting)"
+                    f"[{ticket_id}] Messaging ticket — using ALL customer comments "
+                    f"for classification ({len(all_customer_text)} chars)"
                 )
             else:
-                log.info(f"[{ticket_id}] Empty description — using first customer comment for classification")
-            body = first_comment
+                log.info(
+                    f"[{ticket_id}] Short description — using ALL customer comments "
+                    f"for classification"
+                )
+            body = all_customer_text
+        else:
+            # Fallback: if no comments found, try first comment only
+            first_comment = zendesk.get_first_customer_comment(ticket_id)
+            if first_comment:
+                body = first_comment
+                log.info(f"[{ticket_id}] No aggregated comments — using first customer comment")
 
     # 3. Classify (needed for language even in card-lookup flows)
     classification = classify_ticket(subject, body)
