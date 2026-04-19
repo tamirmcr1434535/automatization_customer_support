@@ -87,11 +87,6 @@ HANDLED_INTENTS = {
 # are renewals that require manual review (refund assessment, etc.).
 MAX_BOT_ORDERS = 3
 
-# ── FIX-C: Minimum confidence to act even with keyword override ────────── #
-# If confidence is below this AND keyword override was used, escalate anyway.
-# Prevents the bot from acting on tickets where keyword match is accidental.
-MIN_KEYWORD_OVERRIDE_CONFIDENCE = 0.40
-
 # ── Cancel signal keywords (used in safety net + refund override guard) ── #
 # Rule 1a (updated): if cancel + refund signals both present:
 #   - STRONG refund (fraud, explicit refund demand, amount+refund, etc.)
@@ -1104,83 +1099,23 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 5. Low confidence → escalate (unless cancel keyword confirms the intent)
-    # For short Messaging form submissions like "cancel" or "解約", the classifier
-    # often returns low confidence due to lack of context. But the keyword itself
-    # is unambiguous — if it matches a cancel signal, trust the intent.
-    _keyword_confirms_intent = (
-        intent in HANDLED_INTENTS
-        and _contains_cancel_signal(subject + " " + body)
-    )
+    # 5. Low confidence → always escalate to human.
+    # Threshold: 80%. If the classifier is not confident enough, a human must review.
+    # The bot tells the agent what it THINKS the intent is, so they have a head start.
+    # No auto-actions below 80% — strict rule, can be softened later with keyword boost.
+    if confidence < 0.80:
+        # Build a hint for the agent: what did the bot detect + any keyword signals
+        _keyword_hint_parts = []
+        if _contains_cancel_signal(subject + " " + body):
+            _keyword_hint_parts.append("cancel keyword found in text")
+        if _contains_refund_request(subject + " " + body):
+            _keyword_hint_parts.append("refund keyword found in text")
+        _keyword_hint = (" | " + ", ".join(_keyword_hint_parts)) if _keyword_hint_parts else ""
 
-    # Cross-ticket context: if confidence is low AND keyword didn't confirm,
-    # check other recent tickets from the same requester. Often the customer
-    # sends multiple tickets (e.g. "환불 부탁드립니다" + Messaging conversation)
-    # and the Messaging one has no clear signal — but the sibling tickets do.
-    if not _keyword_confirms_intent and confidence < 0.65 and email:
-        try:
-            sibling_tickets = zendesk.search_tickets(
-                f"requester:{email} type:ticket created>-7days"
-            )
-            sibling_texts = []
-            for t in sibling_tickets:
-                if str(t.get("id")) != str(ticket_id):
-                    sibling_texts.append(
-                        (t.get("subject") or "") + " " + (t.get("description") or "")[:300]
-                    )
-            if sibling_texts:
-                combined_sibling_text = " ".join(sibling_texts)
-                sibling_has_cancel = _contains_cancel_signal(combined_sibling_text)
-                sibling_has_refund = _contains_refund_request(combined_sibling_text)
-
-                if sibling_has_refund:
-                    # Sibling tickets show refund intent → override to REFUND_REQUEST
-                    log.info(
-                        f"[{ticket_id}] Low confidence {confidence:.0%} BUT sibling "
-                        f"tickets from {email} contain refund signals → REFUND_REQUEST"
-                    )
-                    intent = "REFUND_REQUEST"
-                    result["intent"] = intent
-                    result["status"] = "skipped_refund_request"
-                    zendesk.add_tag(ticket_id, "bot_handled")
-                    slack_sent = slack.notify_refund_skip(
-                        ticket_id=ticket_id, email=email,
-                        intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
-                    )
-                    result["slack_sent"] = slack_sent
-                    log_result(result)
-                    return result
-
-                if sibling_has_cancel:
-                    # Sibling tickets confirm cancel intent → proceed
-                    _keyword_confirms_intent = True
-                    log.info(
-                        f"[{ticket_id}] Low confidence {confidence:.0%} BUT sibling "
-                        f"tickets from {email} contain cancel signals → proceeding"
-                    )
-        except Exception:
-            log.warning(f"[{ticket_id}] Cross-ticket lookup failed — ignoring")
-
-    # FIX-C: Even with keyword override, if confidence is absurdly low, don't trust it.
-    # This catches cases where keyword match is accidental (e.g. "cancel" appears in
-    # a quoted agent reply, or "解約" is part of a different word).
-    if _keyword_confirms_intent and confidence < MIN_KEYWORD_OVERRIDE_CONFIDENCE:
-        log.warning(
-            f"[{ticket_id}] Keyword override active BUT confidence {confidence:.0%} "
-            f"< {MIN_KEYWORD_OVERRIDE_CONFIDENCE:.0%} — revoking keyword override, "
-            f"will escalate instead"
-        )
-        _keyword_confirms_intent = False  # force escalation via the elif branch below
-
-    if _keyword_confirms_intent and confidence < 0.65:
         log.info(
-            f"[{ticket_id}] Low confidence {confidence:.0%} BUT cancel keyword "
-            f"confirms {intent} → proceeding (keyword override)"
+            f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent "
+            f"(potential intent: {intent}{_keyword_hint})"
         )
-        # Don't escalate — keyword match confirms the classifier's intent
-
-    elif confidence < 0.65:
-        log.info(f"[{ticket_id}] Low confidence {confidence:.0%} → escalate to agent")
 
         # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
         # when Zendesk fires multiple webhooks in rapid succession.
@@ -1195,8 +1130,12 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: detected {intent} but confidence {confidence:.0%} is too low to act automatically. "
-            "Please review and handle manually.",
+            f"🤖 Bot: confidence too low to act automatically ({confidence:.0%}).\n\n"
+            f"Potential intent: {intent}\n"
+            f"Language: {language}\n"
+            f"Reasoning: {classification.get('reasoning', 'N/A')}\n"
+            f"{('Keywords detected: ' + ', '.join(_keyword_hint_parts)) if _keyword_hint_parts else 'No keyword signals detected.'}\n\n"
+            f"Please review and handle this ticket manually.",
         )
         zendesk.set_open(ticket_id)
         slack_sent = slack.notify_manual_review(
