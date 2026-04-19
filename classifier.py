@@ -3,6 +3,30 @@ from anthropic import Anthropic
 
 _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
+# ── FIX-A: Alert callback (set by main.py to send Slack alerts on API failure) ── #
+_alert_callback = None
+
+def set_alert_callback(callback):
+    """
+    Register a callback function that will be called when Claude API fails.
+    Signature: callback(error_msg: str) -> None
+    Called from main.py to wire up Slack notifications.
+    """
+    global _alert_callback
+    _alert_callback = callback
+
+
+def _notify_api_failure(error_msg: str):
+    """Internal: call the alert callback if registered."""
+    import logging
+    logging.getLogger("classifier").error(f"Classifier API failure: {error_msg}")
+    if _alert_callback:
+        try:
+            _alert_callback(f"Classifier API failure: {error_msg}")
+        except Exception as e:
+            logging.getLogger("classifier").error(f"Failed to send API failure alert: {e}")
+
+
 PROMPT = """You classify support tickets for an IQ test + brain training subscription service.
 
 STEP 1 — READ ONLY THE CUSTOMER'S OWN WORDS.
@@ -17,9 +41,9 @@ A) REFUND signals (返金, 払い戻し, refund, money back, geld terug, Rücker
    → If refund + fraud/unauthorized (詐欺, 不正請求, fraud, Betrug) → REFUND_REQUEST.
    → Special: "詐欺です。返金してください" = REFUND_REQUEST (even without cancel word).
 
-A2) UNAUTHORIZED CHARGE signals — customer says they were charged without consent,
-   didn't sign up, don't recognize the charge, or charges happened automatically
-   without their knowledge. These are REFUND signals, NOT chargeback threats:
+   A2) UNAUTHORIZED CHARGE signals — customer says they were charged without consent,
+       didn't sign up, don't recognize the charge, or charges happened automatically
+       without their knowledge. These are REFUND signals, NOT chargeback threats:
    → "購読契約していないのに料金が引かれている" = REFUND_REQUEST (NOT CHARGEBACK_THREAT).
    → "I was charged without my consent" = REFUND_REQUEST (NOT CHARGEBACK_THREAT).
    → "I didn't sign up for this" + billing complaint = REFUND_REQUEST.
@@ -27,6 +51,7 @@ A2) UNAUTHORIZED CHARGE signals — customer says they were charged without cons
    → "覚えがない" (don't recall) + charge = REFUND_REQUEST.
    → If customer mentions RENEWAL charges specifically (自動更新, auto-renewal,
      2回目の請求, second charge, renewal charge) + refund → SUB_RENEWAL_REFUND.
+
    CRITICAL: unauthorized/unknown charge complaints are REFUND_REQUEST by default.
    Only use CHARGEBACK_THREAT if customer uses explicit threat words (see Step 3).
 
@@ -70,28 +95,23 @@ E) NONE of the above signals:
    → UNKNOWN: genuinely unclear.
 
 STEP 3 — SPECIAL CASES:
-
 - "Conversation with [name]" subjects = live chat transcripts. Read the BODY for the
   actual customer request. Apply the same signal detection. If body mentions account
   deletion / data removal → DELETE_ALL_DATA. Default → TRIAL_CANCELLATION.
-
 - Cancellation VERIFICATION (past tense questions: "解約できていますか", "was my
   cancellation successful", "취소가 되었나요") → EXPLANATION. But "how to cancel" /
   "解約の方法" → TRIAL_CANCELLATION.
-
 - SUB_RENEWAL_CANCELLATION: use ONLY when ALL of these are true:
-  (1) customer explicitly mentions "auto-renewal" / "自動更新" / "자동 갱신"
-  (2) there is NO cancel word (解約, cancel, kündigen, etc.) anywhere in the message
-  (3) there is NO refund word anywhere in the message
-  (4) the customer is asking ONLY to stop future renewals, not to cancel the subscription itself
+    (1) customer explicitly mentions "auto-renewal" / "自動更新" / "자동 갱신"
+    (2) there is NO cancel word (解約, cancel, kündigen, etc.) anywhere in the message
+    (3) there is NO refund word anywhere in the message
+    (4) the customer is asking ONLY to stop future renewals, not to cancel the subscription itself
   If ANY cancel or refund word is present → use TRIAL_CANCELLATION, SUB_CANCELLATION,
   or REFUND_REQUEST instead. When in doubt → TRIAL_CANCELLATION.
-
 - SUB_RENEWAL_REFUND: customer charged for renewal + asks for refund of THAT charge
   only, with NO cancel word → SUB_RENEWAL_REFUND.
   Also: customer says they were charged multiple times / auto-charged without consent
   and wants money back for those specific charges → SUB_RENEWAL_REFUND.
-
 - CHARGEBACK_THREAT: ONLY when customer uses EXPLICIT threat language:
   "I will file a chargeback", "I will dispute this with my bank",
   "I will contact my credit card company", "チャージバック", "紛争",
@@ -99,7 +119,6 @@ STEP 3 — SPECIAL CASES:
   IMPORTANT: simply complaining about unauthorized charges, saying "I didn't sign up",
   or expressing anger about being charged is NOT a chargeback threat — that is
   REFUND_REQUEST. The customer must explicitly state they WILL take action.
-
 - PAYPAL_DISPUTE: PayPal or bank dispute already opened.
 - UNSUBSCRIBE_EMAIL: only wants off mailing list.
 - DUPLICATE: repeat of an existing ticket.
@@ -134,7 +153,6 @@ Language codes: EN=English, JP=Japanese, KR=Korean, DE=German, FR=French,
 ZH=Chinese, ES=Spanish, PT=Portuguese, RU=Russian, IT=Italian,
 ID=Indonesian, NL=Dutch, UK=Ukrainian."""
 
-
 _FALLBACK = {
     "intent": "UNKNOWN",
     "confidence": 0.0,
@@ -147,6 +165,17 @@ _FALLBACK = {
 def classify_ticket(subject: str, body: str) -> dict:
     import logging, time
     log = logging.getLogger("classifier")
+
+    # ── FIX-A: Check if API key is configured ──────────────────────────── #
+    api_key = os.getenv("ANTHROPIC_API_KEY", "")
+    if not api_key or api_key.strip() == "":
+        error_msg = (
+            "ANTHROPIC_API_KEY is empty or not set — classifier cannot work. "
+            "All tickets will get UNKNOWN intent and fall through to safety net / escalation."
+        )
+        log.critical(error_msg)
+        _notify_api_failure(error_msg)
+        return {**_FALLBACK, "reasoning": "API key not configured — classifier disabled"}
 
     # Retry up to 3 times on 529 overloaded; immediate fail on other errors.
     last_err = None
@@ -174,12 +203,18 @@ def classify_ticket(subject: str, body: str) -> dict:
                 )
                 time.sleep(wait)
                 continue
+
             # Any other error (auth, network, etc.) — fail immediately
+            # FIX-A: send Slack alert on API errors
+            error_msg = f"Claude API error (status={status}): {e}"
             log.error(f"classify_ticket API error: {e}")
+            _notify_api_failure(error_msg)
             return {**_FALLBACK, "reasoning": f"API error: {e}"}
 
     if last_err is not None:
+        error_msg = f"Anthropic overloaded after all retries: {last_err}"
         log.error(f"classify_ticket: all retries exhausted — {last_err}")
+        _notify_api_failure(error_msg)
         return {**_FALLBACK, "reasoning": f"overloaded after retries: {last_err}"}
 
     raw_text = response.content[0].text
