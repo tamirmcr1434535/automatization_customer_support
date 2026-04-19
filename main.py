@@ -850,52 +850,23 @@ def _process(ticket_id: str) -> dict:
         and _contains_strong_refund_signal(_all_text_for_refund)
     )
 
-    if _has_refund_kw and _has_cancel_kw and _has_strong_refund:
-        # Both cancel AND refund signals present, BUT refund signals are STRONG
-        # (explicit refund demand with amount, fraud accusation, unauthorized charge,
-        # legal withdrawal, etc.) — REFUND WINS over cancel.
-        # Examples: "解約希望 + 5490円返金してください + 詐欺です"
-        #           "cancel my sub + this is fraud + I want my money back"
-        # The primary intent is a charge dispute/refund; cancel is secondary.
+    if _has_refund_kw:
+        # ANY refund signal (weak or strong, with or without cancel) → human must handle.
+        # Bot never auto-cancels when customer mentions refund — even casually.
+        # This is the safe default: refund = money question = human decides.
+        _refund_context = (
+            "strong refund" if _has_strong_refund else "weak refund"
+        ) + (
+            " + cancel signal" if _has_cancel_kw else ", no cancel signal"
+        )
         log.info(
-            f"[{ticket_id}] {intent}: both cancel + refund signals, but STRONG "
-            "refund signal detected → overriding to REFUND_REQUEST (refund wins)"
+            f"[{ticket_id}] {intent}: refund keywords detected ({_refund_context}) "
+            "→ overriding to REFUND_REQUEST (human must handle any refund)"
         )
         intent = "REFUND_REQUEST"
         result["intent"] = intent
         result["status"] = "skipped_refund_request"
         zendesk.add_tag(ticket_id, "bot_handled")
-        slack_sent = slack.notify_refund_skip(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-        result["slack_sent"] = slack_sent
-        log_result(result)
-        return result
-
-    elif _has_refund_kw and _has_cancel_kw and not _has_strong_refund:
-        # Both cancel AND refund signals, but refund signals are WEAK
-        # (e.g. "cancel my subscription + I'll report as fraud if you don't cancel")
-        # → CANCEL WINS (Rule 1a). Bot cancels; refund handled by humans later.
-        log.info(
-            f"[{ticket_id}] {intent}: refund keywords detected BUT cancel signals "
-            "also present (no strong refund signal) → cancel wins (Rule 1a)"
-        )
-        # Continue to cancellation flow — don't override
-
-    elif _has_refund_kw and not _has_cancel_kw:
-        # ONLY refund/fraud signals, ZERO cancel signals → pure refund request.
-        # Human must handle this (bot cannot auto-cancel).
-        log.info(
-            f"[{ticket_id}] {intent} but refund keywords detected (no cancel signals) "
-            "→ overriding to REFUND_REQUEST (human must handle refund)"
-        )
-        intent = "REFUND_REQUEST"
-        result["intent"] = intent
-        result["status"] = "skipped_refund_request"
-        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         slack_sent = slack.notify_refund_skip(
             ticket_id=ticket_id,
             email=email,
@@ -930,51 +901,21 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # REFUND_REQUEST / SUB_RENEWAL_REFUND — check if there's also a cancel intent.
-    # Many customers say "cancel and refund" but the priority is to cancel the
-    # subscription immediately so they stop being charged. The bot cancels,
-    # and adds an internal note about the refund request for the human team.
+    # REFUND_REQUEST / SUB_RENEWAL_REFUND — always human.
+    # Any refund intent = money question = human decides. No exceptions.
     if intent in ("REFUND_REQUEST", "SUB_RENEWAL_REFUND"):
-        full_text = subject + " " + body
-        has_cancel = _contains_cancel_signal(full_text)
-        has_strong = _contains_strong_refund_signal(full_text)
-
-        if has_cancel and not has_strong:
-            # Cancel + weak refund → cancel first, refund handled by humans later
-            log.info(
-                f"[{ticket_id}] {intent} but cancel signal found (no strong refund) "
-                "— overriding to TRIAL_CANCELLATION (cancel first, refund later)"
-            )
-            intent = "TRIAL_CANCELLATION"
-            result["intent"] = intent
-            result["refund_also_requested"] = True
-        elif has_cancel and has_strong:
-            # Cancel + STRONG refund → keep as REFUND_REQUEST (human handles)
-            log.info(
-                f"[{ticket_id}] {intent}: cancel signal found BUT strong refund "
-                "signal overrides → keeping as REFUND_REQUEST (human must handle)"
-            )
-            result["status"] = "skipped_refund_request"
-            zendesk.add_tag(ticket_id, "bot_handled")
-            slack_sent = slack.notify_refund_skip(
-                ticket_id=ticket_id, email=email,
-                intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
-            )
-            result["slack_sent"] = slack_sent
-            log_result(result)
-            return result
-        else:
-            # Pure refund request with no cancellation intent → human handles
-            log.info(f"[{ticket_id}] {intent} — pure refund, no cancel signal → skipping")
-            result["status"] = "skipped_refund_request"
-            zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
-            slack_sent = slack.notify_refund_skip(
-                ticket_id=ticket_id, email=email,
-                intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
-            )
-            result["slack_sent"] = slack_sent
-            log_result(result)
-            return result
+        log.info(
+            f"[{ticket_id}] {intent} — refund intent, always escalate to human"
+        )
+        result["status"] = "skipped_refund_request"
+        zendesk.add_tag(ticket_id, "bot_handled")
+        slack_sent = slack.notify_refund_skip(
+            ticket_id=ticket_id, email=email,
+            intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result["slack_sent"] = slack_sent
+        log_result(result)
+        return result
 
     # ── CARD DIGITS FLOWS ─────────────────────────────────────────────── #
     # Timeout: Zendesk Automation added tag after AWAITING_CARD_DAYS days of no reply
