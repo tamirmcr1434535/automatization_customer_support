@@ -50,6 +50,32 @@ from reply_generator import (
 from bq_logger import log_result as _bq_log_result
 
 
+# ── Email normalization ────────────────────────────────────────────── #
+
+def _normalize_email(raw: str) -> str:
+    """
+    Fix common email typos from Zendesk form submissions:
+      - consecutive dots in domain  (co..jp → co.jp)
+      - leading/trailing dots in domain (.gmail.com → gmail.com)
+      - leading/trailing whitespace
+      - uppercase → lowercase
+    Does NOT touch the local part before @ (dots can be meaningful there).
+    Returns empty string if input is clearly invalid.
+    """
+    raw = raw.strip().lower()
+    if not raw or "@" not in raw:
+        return raw
+    local, domain = raw.rsplit("@", 1)
+    # Remove consecutive dots in domain
+    while ".." in domain:
+        domain = domain.replace("..", ".")
+    # Strip leading/trailing dots from domain
+    domain = domain.strip(".")
+    if not domain or "." not in domain:
+        return raw  # don't mangle beyond repair
+    return f"{local}@{domain}"
+
+
 def log_result(result: dict) -> None:
     """
     Wrapper around bq_logger.log_result.
@@ -510,9 +536,13 @@ def _process(ticket_id: str) -> dict:
     tags       = ticket.get("tags", [])
     ticket_status = ticket.get("status", "open")  # FIX: used for pending-check anti-spam
     requester  = ticket.get("requester", {})
-    email      = requester.get("email", "")
+    raw_email  = requester.get("email", "")
+    email      = _normalize_email(raw_email)
     name       = requester.get("name", "")
     result["email"] = email
+
+    if email != raw_email:
+        log.warning(f"[{ticket_id}] Email normalized: {raw_email!r} → {email!r}")
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
@@ -1339,6 +1369,8 @@ def _handle_card_digits(
     # Step 1: Use Stripe only to find the customer's email by card last4.
     # Stripe is NOT used for cancellation — WooCommerce is always the cancel target.
     email_from_stripe = stripe_cli.find_email_by_last4(last4)
+    if email_from_stripe:
+        email_from_stripe = _normalize_email(email_from_stripe)
 
     if email_from_stripe:
         log.info(
@@ -1555,6 +1587,9 @@ def _try_alt_emails(
     or None if none of them worked (caller should then fall back to card digits / Slack).
     """
     alt_emails = _extract_emails(search_text, exclude=primary_email)
+    # Normalize all extracted emails (fix double-dots, whitespace, etc.)
+    alt_emails = [_normalize_email(e) for e in alt_emails]
+    alt_emails = [e for e in alt_emails if e and e != primary_email]
     if not alt_emails:
         return None
 
