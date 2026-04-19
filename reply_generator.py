@@ -9,14 +9,45 @@ Claude translates them faithfully — it does NOT generate free-form replies.
 
 NOTE: No sign-off / signature is appended — the Zendesk agent profile
 already has a footer configured, so adding one here would duplicate it.
+
+FIX-A: Added try/except to _translate() — if Claude API fails, returns EN
+       master template instead of crashing. Added validate_reply() to catch
+       hallucinated or garbage responses before they reach the customer.
+       Added alert callback so main.py can wire Slack notifications on API failure.
 """
 
 import os
+import logging
 from anthropic import Anthropic
+
+log = logging.getLogger("reply_generator")
 
 _client    = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 BRAND_NAME = os.getenv("BRAND_NAME", "IQ Booster")
 AGENT_NAME = os.getenv("AGENT_NAME", "Mia")
+
+# ── FIX-A: Alert callback (set by main.py to send Slack alerts on API failure) ── #
+_alert_callback = None
+
+
+def set_alert_callback(callback):
+    """
+    Register a callback function that will be called when Claude API fails.
+    Signature: callback(error_msg: str) -> None
+    Called from main.py to wire up Slack notifications.
+    """
+    global _alert_callback
+    _alert_callback = callback
+
+
+def _notify_api_failure(error_msg: str):
+    """Internal: call the alert callback if registered."""
+    log.error(f"Reply generator API failure: {error_msg}")
+    if _alert_callback:
+        try:
+            _alert_callback(f"Reply Generator: {error_msg}")
+        except Exception as e:
+            log.error(f"Failed to send API failure alert: {e}")
 
 
 # ── Master templates (source of truth) ────────────────────────────────── #
@@ -112,23 +143,123 @@ Rules:
 
 
 def _translate(text: str, language: str) -> str:
-    """Translate *text* into *language* using the strict translation prompt."""
+    """
+    Translate *text* into *language* using the strict translation prompt.
+
+    FIX-A: wrapped in try/except — if Claude API fails (empty key, auth error,
+    network issue, overload), returns the original EN text as fallback and
+    sends an alert via the registered callback.
+    """
     if language.upper() == "EN":
         return text  # already English — no translation needed
 
-    r = _client.messages.create(
-        model="claude-sonnet-4-5",
-        max_tokens=600,
-        messages=[{
-            "role": "user",
-            "content": (
-                f"{_TRANSLATE_SYSTEM}\n\n"
-                f"Target language: {language}\n\n"
-                f"Translate this message:\n\n{text}"
-            ),
-        }],
-    )
-    return r.content[0].text.strip()
+    try:
+        r = _client.messages.create(
+            model="claude-sonnet-4-5",
+            max_tokens=600,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"{_TRANSLATE_SYSTEM}\n\n"
+                    f"Target language: {language}\n\n"
+                    f"Translate this message:\n\n{text}"
+                ),
+            }],
+        )
+        translated = r.content[0].text.strip()
+
+        # FIX-A: Validate the translation before returning
+        is_valid, reason = validate_reply(translated, language)
+        if not is_valid:
+            log.warning(
+                f"Translation validation failed ({reason}) — using EN fallback"
+            )
+            _notify_api_failure(
+                f"Translation to {language} failed validation: {reason}. "
+                f"Sending EN fallback to customer."
+            )
+            return text  # return EN master template as safe fallback
+
+        return translated
+
+    except Exception as e:
+        log.error(f"Translation to {language} failed: {e} — using EN fallback")
+        _notify_api_failure(
+            f"Claude API error during translation to {language}: {e}. "
+            f"Sending EN master template to customer instead."
+        )
+        return text  # return EN master template — better than crashing
+
+
+# ── FIX-A: Reply validation ──────────────────────────────────────────── #
+# Validates that a generated/translated reply is safe to send to a customer.
+# Catches hallucinations, system prompt leakage, garbage output.
+
+_HALLUCINATION_MARKERS = [
+    # System prompt leakage
+    "you are a professional translator",
+    "your only task is to translate",
+    "target language:",
+    "translate this message:",
+    "anthropic",
+    "as an ai",
+    "as a language model",
+    "i'm an ai",
+    "i am an ai",
+    # JSON/code leakage
+    '"intent"',
+    '"confidence"',
+    '"language"',
+    "```",
+    # Internal bot markers
+    "bot_handled",
+    "dry_run",
+    "shadow_mode",
+    # Inappropriate content
+    "i cannot",
+    "i can't help",
+    "i'm sorry, but i cannot",
+]
+
+
+def validate_reply(reply_text: str, language: str = "EN") -> tuple[bool, str]:
+    """
+    Validate that a reply is safe to send to a customer.
+
+    Returns (is_valid, reason).
+    - is_valid=True: reply is OK to send
+    - is_valid=False: reply should NOT be sent, use EN fallback or escalate
+
+    Checks:
+    1. Minimum length (at least 20 chars — anything shorter is likely garbage)
+    2. No hallucination/prompt leakage markers
+    3. No empty or whitespace-only response
+    4. No excessively long response (runaway generation)
+    5. Not raw JSON
+    """
+    if not reply_text or not reply_text.strip():
+        return False, "empty_response"
+
+    stripped = reply_text.strip()
+
+    if len(stripped) < 20:
+        return False, f"too_short ({len(stripped)} chars)"
+
+    # Check for hallucination markers (case-insensitive)
+    lower = stripped.lower()
+    for marker in _HALLUCINATION_MARKERS:
+        if marker in lower:
+            return False, f"hallucination_marker: {marker}"
+
+    # Check that the response doesn't look like raw JSON
+    if stripped.startswith("{") and stripped.endswith("}"):
+        return False, "looks_like_json"
+
+    # Master templates are ~100-400 chars; translations shouldn't exceed ~5x
+    if len(stripped) > 3000:
+        return False, f"too_long ({len(stripped)} chars)"
+
+    return True, "ok"
 
 
 # ── Public API ─────────────────────────────────────────────────────────── #
