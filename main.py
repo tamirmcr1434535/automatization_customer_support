@@ -22,6 +22,10 @@ Cancellation flow:
 NOTE: WooCommerce is the primary cancellation target. Stripe is used as:
       (a) email-based fallback when WC lookup fails (step 3)
       (b) email-lookup tool via card last4 digits (step 4)
+
+FIX-C: Added API health check at startup; UNKNOWN escalation instead of skip;
+       confidence gate before _finish_cancellation; validate_reply before sending.
+FIX-A: Wired Slack alert callbacks for classifier and reply_generator API failures.
 """
 
 import os
@@ -41,6 +45,7 @@ from reply_generator import (
     generate_ask_card_digits_retry_reply,
     generate_not_found_reply,
     generate_timeout_reply,
+    validate_reply,
 )
 from bq_logger import log_result as _bq_log_result
 
@@ -81,6 +86,11 @@ HANDLED_INTENTS = {
 # Max order count for bot to handle. Subscriptions with >= this many orders
 # are renewals that require manual review (refund assessment, etc.).
 MAX_BOT_ORDERS = 3
+
+# ── FIX-C: Minimum confidence to act even with keyword override ────────── #
+# If confidence is below this AND keyword override was used, escalate anyway.
+# Prevents the bot from acting on tickets where keyword match is accidental.
+MIN_KEYWORD_OVERRIDE_CONFIDENCE = 0.40
 
 # ── Cancel signal keywords (used in safety net + refund override guard) ── #
 # Rule 1a (updated): if cancel + refund signals both present:
@@ -246,6 +256,82 @@ _shadow_slack = SlackClient(
     dry_run=not SHADOW_MODE,  # Live only when SHADOW_MODE is on
 ) if SHADOW_MODE else None
 
+# ── FIX-A: Wire Slack alert callbacks for classifier + reply_generator ── #
+# A live Slack client specifically for API failure alerts (always live, not dry_run).
+# This ensures we get Slack notifications even when bot runs in DRY_RUN mode.
+_alert_slack = SlackClient(
+    bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
+    target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
+    dry_run=False,  # Always live — API failures must always be reported
+)
+
+# Dedup: avoid flooding Slack with the same alert on every ticket
+_api_alert_sent: set[str] = set()
+_api_alert_lock = _threading.Lock()
+
+
+def _send_api_failure_alert(error_msg: str):
+    """
+    FIX-A: Send a Slack alert when Claude API fails (classifier or reply_generator).
+    Deduplicates so we don't send 100 identical alerts when API is down.
+    """
+    # Dedup key: first 80 chars of the error (captures the error type)
+    dedup_key = error_msg[:80]
+    with _api_alert_lock:
+        if dedup_key in _api_alert_sent:
+            return  # already alerted
+        _api_alert_sent.add(dedup_key)
+
+    log.critical(f"API FAILURE ALERT: {error_msg}")
+    try:
+        _alert_slack._post(
+            f"🚨 *Claude API Failure* | {error_msg[:300]}",
+            blocks=[
+                {
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": "🚨 Claude API Failure"},
+                },
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*Error:*\n```{error_msg[:500]}```\n\n"
+                            "Bot is degraded: classifier returning UNKNOWN, "
+                            "translations falling back to English. "
+                            "Check ANTHROPIC_API_KEY in Secret Manager and "
+                            "Anthropic status page."
+                        ),
+                    },
+                },
+                {"type": "divider"},
+            ],
+        )
+    except Exception as e:
+        log.error(f"Failed to send API failure Slack alert: {e}")
+
+
+# Register the callback with classifier and reply_generator
+import classifier as _classifier_module
+import reply_generator as _reply_generator_module
+_classifier_module.set_alert_callback(_send_api_failure_alert)
+_reply_generator_module.set_alert_callback(_send_api_failure_alert)
+
+# ── FIX-C: API health check at startup ──────────────────────────────── #
+# If the API key is missing, the bot will be in degraded mode from the start.
+# Log a critical warning and send a Slack alert immediately.
+_ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+if not _ANTHROPIC_API_KEY or not _ANTHROPIC_API_KEY.strip():
+    log.critical(
+        "⚠️ ANTHROPIC_API_KEY is EMPTY — classifier and reply generator will NOT work. "
+        "Bot will operate in degraded mode: keyword safety net only, EN templates only."
+    )
+    _send_api_failure_alert(
+        "ANTHROPIC_API_KEY is empty or not set at startup. "
+        "Bot is running in DEGRADED MODE — no AI classification, no translations. "
+        "All tickets will use keyword fallback or be escalated to humans."
+    )
+
 
 # ── HTTP handler ──────────────────────────────────────────────────────── #
 
@@ -343,6 +429,7 @@ _SHADOW_STATUS_TO_TAG = {
     "escalated_low_confidence":     "shadow_would_escalate",
     "escalated_delete_account":     "shadow_would_escalate",
     "skipped_refund_request":       "shadow_would_skip_refund",
+    "escalated_unknown":            "shadow_would_escalate",     # FIX-C: new status
     "skipped_not_handled":          "shadow_would_skip",
     "skipped_followup":             "shadow_would_skip",
     "skipped_closed":               "shadow_would_skip",
@@ -979,7 +1066,38 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
-    # 4. Skip unhandled intents
+    # 4. FIX-C: UNKNOWN after all safety nets → escalate to human, don't silently skip.
+    # The safety net above tried keyword matching and sibling ticket cross-referencing.
+    # If intent is STILL UNKNOWN, a human must look at this ticket.
+    if intent == "UNKNOWN":
+        log.warning(
+            f"[{ticket_id}] Intent UNKNOWN after all safety nets — escalating to human"
+        )
+        zendesk.add_tag(ticket_id, "bot_handled")       # mark that bot touched it
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: could not determine intent (UNKNOWN after safety nets).\n"
+            f"Confidence: {confidence:.0%}\n"
+            f"Reasoning: {classification.get('reasoning', 'N/A')}\n\n"
+            f"Please review this ticket manually."
+        )
+        zendesk.set_open(ticket_id)
+        slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=email,
+            reason=(
+                f"UNKNOWN intent after all safety nets — "
+                f"confidence={confidence:.0%}, "
+                f"reasoning: {classification.get('reasoning', 'N/A')}"
+            ),
+        )
+        result["status"] = "escalated_unknown"
+        log_result(result)
+        return result
+
+    # 4b. Skip other unhandled intents (GENERAL_QUESTION, EXPLANATION, SPAM, etc.)
     if intent not in HANDLED_INTENTS:
         log.info(f"[{ticket_id}] Skip — not a cancellation ({intent})")
         result["status"] = "skipped_not_handled"
@@ -1042,6 +1160,17 @@ def _process(ticket_id: str) -> dict:
                     )
         except Exception:
             log.warning(f"[{ticket_id}] Cross-ticket lookup failed — ignoring")
+
+    # FIX-C: Even with keyword override, if confidence is absurdly low, don't trust it.
+    # This catches cases where keyword match is accidental (e.g. "cancel" appears in
+    # a quoted agent reply, or "解約" is part of a different word).
+    if _keyword_confirms_intent and confidence < MIN_KEYWORD_OVERRIDE_CONFIDENCE:
+        log.warning(
+            f"[{ticket_id}] Keyword override active BUT confidence {confidence:.0%} "
+            f"< {MIN_KEYWORD_OVERRIDE_CONFIDENCE:.0%} — revoking keyword override, "
+            f"will escalate instead"
+        )
+        _keyword_confirms_intent = False  # force escalation via the elif branch below
 
     if _keyword_confirms_intent and confidence < 0.65:
         log.info(
@@ -1234,6 +1363,28 @@ def _process(ticket_id: str) -> dict:
             return result
 
         reply_text = generate_ask_card_digits_reply(language=language, customer_name=name)
+
+        # FIX-A: Validate reply before sending to customer
+        is_valid, reason = validate_reply(reply_text, language)
+        if not is_valid:
+            log.error(f"[{ticket_id}] ask_card_digits reply failed validation ({reason})")
+            zendesk.add_tag(ticket_id, "bot_handled")
+            zendesk.add_tag(ticket_id, "needs_manual_review")
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: account not found, but reply failed validation ({reason}). "
+                f"Please ask for card digits manually.",
+            )
+            zendesk.set_open(ticket_id)
+            slack.notify_manual_review(
+                ticket_id=ticket_id, email=email,
+                reason=f"ask_card_digits reply validation failed: {reason}",
+            )
+            result["status"] = "manual_review_required"
+            result["validation_fail_reason"] = reason
+            log_result(result)
+            return result
+
         # Tag BEFORE reply: Zendesk can fire the webhook twice in quick succession.
         # If the tag is set first, any concurrent/duplicate call will be routed to
         # _handle_card_digits instead of re-entering this path and sending a second message.
@@ -1373,6 +1524,28 @@ def _digits_not_found(
         reply_text = generate_ask_card_digits_retry_reply(
             language=language, customer_name=name
         )
+
+        # FIX-A: Validate reply before sending to customer
+        is_valid, reason = validate_reply(reply_text, language)
+        if not is_valid:
+            log.error(f"[{ticket_id}] digits_retry reply failed validation ({reason})")
+            zendesk.add_tag(ticket_id, "bot_handled")
+            zendesk.add_tag(ticket_id, "needs_manual_review")
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: digits retry reply failed validation ({reason}). "
+                f"Please follow up with the customer manually.",
+            )
+            zendesk.set_open(ticket_id)
+            slack.notify_manual_review(
+                ticket_id=ticket_id, email=result.get("email", "unknown"),
+                reason=f"digits_retry reply validation failed: {reason}",
+            )
+            result["status"] = "manual_review_required"
+            result["validation_fail_reason"] = reason
+            log_result(result)
+            return result
+
         # Tags BEFORE reply — same race-condition fix as in the initial ask:
         # swap state first so any duplicate webhook call routes to the retry handler.
         zendesk.remove_tag(ticket_id, "awaiting_card_digits")
@@ -1398,6 +1571,28 @@ def _digits_not_found(
         log.info(f"[{ticket_id}] Digits not found (retry) → closing ticket")
 
         reply_text = generate_not_found_reply(language=language, customer_name=name)
+
+        # FIX-A: Validate reply before sending to customer
+        is_valid, reason = validate_reply(reply_text, language)
+        if not is_valid:
+            log.error(f"[{ticket_id}] not_found reply failed validation ({reason})")
+            zendesk.add_tag(ticket_id, "bot_handled")
+            zendesk.add_tag(ticket_id, "needs_manual_review")
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: not_found reply failed validation ({reason}). "
+                f"Please close ticket manually.",
+            )
+            zendesk.set_open(ticket_id)
+            slack.notify_manual_review(
+                ticket_id=ticket_id, email=result.get("email", "unknown"),
+                reason=f"not_found reply validation failed: {reason}",
+            )
+            result["status"] = "manual_review_required"
+            result["validation_fail_reason"] = reason
+            log_result(result)
+            return result
+
         zendesk.post_reply(ticket_id, reply_text)
         zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
         zendesk.add_tag(ticket_id, "not_found_closed")
@@ -1618,6 +1813,34 @@ def _finish_cancellation(
         customer_name=name,
         cancel_result=cancel_result,
     )
+
+    # FIX-A: Validate reply before sending to customer.
+    # Catches hallucinations, prompt leakage, garbage output from Claude.
+    is_valid, reason = validate_reply(reply_text, language)
+    if not is_valid:
+        log.error(
+            f"[{ticket_id}] Reply failed validation ({reason}) — escalating to human"
+        )
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: cancellation succeeded but generated reply failed validation.\n"
+            f"Reason: {reason}\n"
+            f"Language: {language}\n\n"
+            f"Please reply to the customer manually to confirm cancellation.",
+        )
+        zendesk.set_open(ticket_id)
+        slack.notify_manual_review(
+            ticket_id=ticket_id,
+            email=result.get("email", "unknown"),
+            reason=f"Reply validation failed: {reason}",
+        )
+        result["status"] = "manual_review_required"
+        result["validation_fail_reason"] = reason
+        log_result(result)
+        return result
 
     cancel_tag = {
         "TRIAL_CANCELLATION": "trial_cancellation",
