@@ -459,6 +459,7 @@ _SHADOW_STATUS_TO_TAG = {
     "skipped_agent_already_replied":"shadow_agent_handling",
     "skipped_spam_detected":        "shadow_spam",
     "not_found_closed":             "shadow_would_escalate",
+    "closed_no_response":           "shadow_would_timeout",
     "error":                        "shadow_error",
 }
 
@@ -1308,10 +1309,17 @@ def _process(ticket_id: str) -> dict:
             "Asked for last 4 card digits. Waiting up to 7 days.",
         )
 
+        # Slack alert: bot couldn't find customer, asked for card digits
+        slack_sent = slack.notify_card_digits_asked(
+            ticket_id=ticket_id, email=email,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN, is_retry=False,
+        )
+
         result.update({
             "status": "awaiting_card_digits",
             "action": "asked_for_card_digits",
             "reply_text": reply_text,
+            "slack_sent": slack_sent,
         })
         log_result(result)
         return result # ticket set to Pending — awaiting customer reply
@@ -1470,10 +1478,17 @@ def _digits_not_found(
             "Asked customer for correct digits. Waiting up to 2 days.",
         )
 
+        # Slack alert: first digit attempt failed, asked again
+        slack_sent = slack.notify_card_digits_asked(
+            ticket_id=ticket_id, email=email,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN, is_retry=True,
+        )
+
         result.update({
             "status": "awaiting_card_digits_retry",
             "action": "asked_for_correct_digits",
             "reply_text": reply_text,
+            "slack_sent": slack_sent,
         })
         log_result(result)
         return result # ticket set to Pending — awaiting customer reply
@@ -1558,10 +1573,19 @@ def _handle_card_digits_timeout(
     zendesk.add_tag(ticket_id, "ai_bot_failed")
     zendesk.solve_ticket(ticket_id)
 
+    # Slack alert: customer never replied with card digits
+    slack_sent = slack.notify_card_digits_timeout(
+        ticket_id=ticket_id,
+        email=result.get("email", "unknown"),
+        days=AWAITING_CARD_DAYS,
+        zendesk_subdomain=ZENDESK_SUBDOMAIN,
+    )
+
     result.update({
         "status": "closed_no_response",
         "action": f"timeout_closed_{AWAITING_CARD_DAYS}d",
         "reply_text": reply_text,
+        "slack_sent": slack_sent,
     })
     log.info(f"[{ticket_id}] ⏰ Closed — no response within {AWAITING_CARD_DAYS} days")
     log_result(result)
