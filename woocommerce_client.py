@@ -17,8 +17,9 @@ IMPORTANT — performance notes for iqbooster.org:
     GET /subscriptions?search=        — full-text search, not indexed (45s timeout)
     GET /customers?search=            — full-text search, not indexed (30s timeout)
 
-  BROKEN endpoints (do NOT use):
+  BROKEN endpoints (use with caution):
     GET /subscriptions?billing_email= — returns ALL subs on iqbooster.org (server bug)
+                                        → we paginate + client-side filter (up to 5 pages)
     GET /orders?customer={id}         — always times out on iqbooster.org (removed)
 
   Lookup strategy (CF timeout = 3600s, generous timeouts):
@@ -26,9 +27,9 @@ IMPORTANT — performance notes for iqbooster.org:
     1b. /customers?search=             (30s timeout, PayPal fallback)
     2a. customer meta_data → /subscriptions/{id}  (15s timeout)
     2b. /subscriptions?customer=       (90s timeout, MOST RELIABLE)
-    2c. /subscriptions?billing_email=  (only if NO customer found, 20s timeout)
-    2d. /subscriptions?search=         (45s timeout, last resort)
-    Worst case: 15s + 30s + 90s + 45s = 180s (CF=3600s — plenty of room)
+    2c. /subscriptions?billing_email=  (60s timeout per page, up to 5 pages if filter broken)
+    2d. /subscriptions?search=         (120s timeout, per_page=100, last resort)
+    Worst case: 15s + 30s + 90s + 300s + 120s = 555s (CF=3600s — plenty of room)
 """
 
 import logging
@@ -223,68 +224,99 @@ class WooCommerceClient:
 
     def _find_subs_by_billing_email(self, email: str) -> list[dict]:
         """
-        Search subscriptions by ?billing_email= ONLY (no ?search= fallback).
+        Search subscriptions by ?billing_email= with pagination.
 
-        ?billing_email= is fast (~1s) because WC Subscriptions plugin filters
-        server-side. ?search= is a full-text scan that times out — not used.
-
-        Accepts:
-        - Subscriptions with exact billing.email match
-        - Subscriptions with empty billing.email (WC stores email in _billing_email
-          post meta which isn't in the REST response — trust server filter)
+        The billing_email filter is broken on some servers (returns ALL subs).
+        We paginate through up to MAX_PAGES pages to find an exact match,
+        because the correct subscription could be on any page.
         """
         email_lower = email.lower().strip()
-        try:
-            resp = requests.get(
-                f"{self.base}/subscriptions",
-                params={"billing_email": email, "per_page": 50},
-                auth=self.auth,
-                timeout=20,
-            )
-        except requests.exceptions.RequestException as e:
-            log.warning(f"WC: billing_email lookup error for {email}: {e}")
-            return []
+        MAX_PAGES = 5       # scan up to 500 subs (5 × 100)
+        PER_PAGE  = 100
+        TIMEOUT   = 60      # generous — server is slow
 
-        if not resp.ok:
-            log.warning(f"WC: billing_email lookup failed for {email}: {resp.status_code}")
-            return []
-
-        data = resp.json()
-        if not isinstance(data, list) or not data:
-            return []
-
-        # ── Scan ALL results for matches ────────────────────────────────
-        # The WC billing_email filter is broken on some servers — it may
-        # return ALL subscriptions instead of just the matching one.
-        # We MUST scan every result because the correct subscription could
-        # be at any position (not necessarily in the first few).
-        # Log only ONE summary warning instead of per-subscription warnings.
         exact = []
         trusted_empty = []
         wrong_count = 0
+        filter_looks_broken = False
 
-        for s in data:
-            if self._subscription_matches_email(s, email_lower):
-                exact.append(s)
-            else:
-                be = s.get("billing", {}).get("email", "").strip()
-                if be:
-                    wrong_count += 1
+        for page in range(1, MAX_PAGES + 1):
+            try:
+                resp = requests.get(
+                    f"{self.base}/subscriptions",
+                    params={
+                        "billing_email": email,
+                        "per_page": PER_PAGE,
+                        "page": page,
+                    },
+                    auth=self.auth,
+                    timeout=TIMEOUT,
+                )
+            except requests.exceptions.Timeout:
+                log.warning(
+                    f"WC: billing_email page {page} timed out ({TIMEOUT}s) "
+                    f"for {email}"
+                )
+                break
+            except requests.exceptions.RequestException as e:
+                log.warning(f"WC: billing_email lookup error for {email}: {e}")
+                break
+
+            if not resp.ok:
+                log.warning(
+                    f"WC: billing_email lookup failed for {email}: "
+                    f"{resp.status_code}"
+                )
+                break
+
+            data = resp.json()
+            if not isinstance(data, list) or not data:
+                break  # no more results
+
+            for s in data:
+                if self._subscription_matches_email(s, email_lower):
+                    exact.append(s)
                 else:
-                    trusted_empty.append(s)
+                    be = s.get("billing", {}).get("email", "").strip()
+                    if be:
+                        wrong_count += 1
+                    else:
+                        trusted_empty.append(s)
 
-        # Log one summary warning for all mismatches (not 50 individual ones)
+            # If we already found exact matches, no need to paginate further
+            if exact:
+                break
+
+            # If page 1 has wrong-email results → filter is broken on this server.
+            # Keep paginating to find the right one, but cap at MAX_PAGES.
+            if wrong_count > 0 and page == 1:
+                filter_looks_broken = True
+                log.info(
+                    f"WC: billing_email filter looks broken for {email} "
+                    f"({wrong_count} wrong emails on page 1) — paginating "
+                    f"up to {MAX_PAGES} pages"
+                )
+
+            # If filter is NOT broken (all results are empty-email or exact),
+            # one page is enough.
+            if not filter_looks_broken:
+                break
+
+            # Stop paginating if this page was less than full (last page)
+            if len(data) < PER_PAGE:
+                break
+
+        # Log one summary warning for all mismatches
         if wrong_count:
             log.warning(
                 f"WC: billing_email query for {email} returned {wrong_count} "
-                f"sub(s) with wrong billing emails out of {len(data)} total "
-                "— server filter unreliable"
+                f"sub(s) with wrong billing emails — server filter unreliable"
             )
 
         if exact:
             log.info(
                 f"WC: billing_email found {len(exact)} exact match(es) for "
-                f"{email} (among {len(data)} total results)"
+                f"{email}"
             )
             return exact
 
@@ -469,9 +501,9 @@ class WooCommerceClient:
           1b. /customers?search=          (30s timeout, PayPal fallback)
           2a. customer meta_data → /subscriptions/{id}  (15s timeout)
           2b. /subscriptions?customer=    (90s timeout, MOST RELIABLE)
-          2c. /subscriptions?billing_email= (20s timeout, only if NO customer)
-          2d. /subscriptions?search=      (45s timeout, last resort)
-          Worst case: 15s + 30s + 90s + 45s = 180s (CF=3600s — plenty of room)
+          2c. /subscriptions?billing_email= (60s/page, up to 5 pages if filter broken)
+          2d. /subscriptions?search=      (120s timeout, per_page=100, last resort)
+          Worst case: 15s + 30s + 90s + 300s + 120s = 555s (CF=3600s — plenty of room)
 
         If subscription not found → returns "not_found" → bot asks customer
         for last 4 card digits → Stripe finds email → we try again.
@@ -626,19 +658,28 @@ class WooCommerceClient:
                 all_subs = billing_subs
             log.info(f"WC TIMING: step2c billing_email done in {time.time()-t2c:.1f}s (total {time.time()-wc_start:.1f}s)")
 
-        # ── Step 2d: /subscriptions?search= last resort (45s timeout) ──── #
+        # ── Step 2d: /subscriptions?search= last resort (120s timeout) ──── #
+        # Increased per_page (100) and timeout (120s) — the server is slow
+        # (200K+ subs, full-text search not indexed) and 45s/20 was not enough.
         if not all_subs:
             t2d = time.time()
+            _SEARCH_TIMEOUT = 120
+            _SEARCH_PER_PAGE = 100
             try:
                 log.info(
                     f"WC: all lookups failed for {email}, "
-                    "trying ?search= last resort (45s timeout)"
+                    f"trying ?search= last resort ({_SEARCH_TIMEOUT}s timeout, "
+                    f"per_page={_SEARCH_PER_PAGE})"
                 )
                 resp = requests.get(
                     f"{self.base}/subscriptions",
-                    params={"search": email, "per_page": 20, "status": "any"},
+                    params={
+                        "search": email,
+                        "per_page": _SEARCH_PER_PAGE,
+                        "status": "any",
+                    },
                     auth=self.auth,
-                    timeout=45,
+                    timeout=_SEARCH_TIMEOUT,
                 )
                 if resp.ok:
                     search_subs = resp.json()
@@ -671,7 +712,7 @@ class WooCommerceClient:
                     log.warning(f"WC: ?search= failed: {resp.status_code}")
             except requests.exceptions.Timeout:
                 log.warning(
-                    f"WC: ?search= TIMED OUT (45s) for {email} "
+                    f"WC: ?search= TIMED OUT ({_SEARCH_TIMEOUT}s) for {email} "
                     "— falling through to Stripe fallback"
                 )
             except requests.exceptions.RequestException as e:
