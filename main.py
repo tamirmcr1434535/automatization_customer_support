@@ -1153,14 +1153,26 @@ def _process(ticket_id: str) -> dict:
         # ── Stripe fallback for no_active_sub ─────────────────────────── #
         # WC found the customer but no active subscription. Try Stripe —
         # the sub might be managed in Stripe but not reflected in WC.
-        log.info(f"[{ticket_id}] No alt email worked → trying Stripe by email")
-        stripe_result = stripe_cli.cancel_subscription(email)
-        stripe_status = stripe_result.get("status", "")
+        # Try primary email first, then alt emails from ticket body/comments.
+        emails_to_try_stripe = [email] + _extract_emails(search_text, exclude=email)
+        stripe_result = None
+        stripe_status = ""
+        tried_stripe_email = email
+        for stripe_email in emails_to_try_stripe:
+            log.info(f"[{ticket_id}] No alt email in WC → trying Stripe by email: {stripe_email}")
+            stripe_result = stripe_cli.cancel_subscription(stripe_email)
+            stripe_status = stripe_result.get("status", "")
+            tried_stripe_email = stripe_email
+            if stripe_status not in ("not_found", "no_active_sub", "error"):
+                break  # found it
 
         if stripe_status not in ("not_found", "no_active_sub", "error"):
+            alt_note = ""
+            if tried_stripe_email != email:
+                alt_note = f" (via alt email {tried_stripe_email} found in ticket)"
             log.info(
                 f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
-                f"sub {stripe_result.get('subscription_id')} for {email}"
+                f"sub {stripe_result.get('subscription_id')} for {tried_stripe_email}"
             )
             cancel_result = {**stripe_result, "source": "stripe"}
             result["cancel_source"] = "stripe"
@@ -1169,7 +1181,7 @@ def _process(ticket_id: str) -> dict:
             zendesk.add_internal_note(
                 ticket_id,
                 f"🤖 Bot: found in WooCommerce but no active sub. "
-                f"Cancelled in Stripe directly "
+                f"Cancelled in Stripe directly{alt_note} "
                 f"(sub={stripe_result.get('subscription_id')}).",
             )
             return _finish_cancellation(
@@ -1226,15 +1238,27 @@ def _process(ticket_id: str) -> dict:
         # Stripe Customer.list(email=) is fast and reliable, and may find
         # the subscription even when WooCommerce billing_email lookup fails
         # (common when WC stores the email only in _billing_email post meta).
-        log.info(f"[{ticket_id}] WC not found → trying Stripe by email as fallback")
-        stripe_result = stripe_cli.cancel_subscription(email)
-        stripe_status = stripe_result.get("status", "")
+        # Try primary email first, then alt emails from ticket body/comments.
+        emails_to_try_stripe = [email] + _extract_emails(search_text, exclude=email)
+        stripe_result = None
+        stripe_status = ""
+        tried_stripe_email = email
+        for stripe_email in emails_to_try_stripe:
+            log.info(f"[{ticket_id}] WC not found → trying Stripe by email: {stripe_email}")
+            stripe_result = stripe_cli.cancel_subscription(stripe_email)
+            stripe_status = stripe_result.get("status", "")
+            tried_stripe_email = stripe_email
+            if stripe_status not in ("not_found", "no_active_sub", "error"):
+                break  # found it
 
         if stripe_status not in ("not_found", "no_active_sub", "error"):
             # ✅ Stripe found and cancelled the subscription
+            alt_note = ""
+            if tried_stripe_email != email:
+                alt_note = f" (via alt email {tried_stripe_email} found in ticket)"
             log.info(
                 f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
-                f"sub {stripe_result.get('subscription_id')} for {email}"
+                f"sub {stripe_result.get('subscription_id')} for {tried_stripe_email}"
             )
             cancel_result = {**stripe_result, "source": "stripe"}
             result["cancel_source"] = "stripe"
@@ -1243,7 +1267,7 @@ def _process(ticket_id: str) -> dict:
             zendesk.add_internal_note(
                 ticket_id,
                 f"🤖 Bot: not found in WooCommerce by email ({email}). "
-                f"Found and cancelled in Stripe directly "
+                f"Found and cancelled in Stripe directly{alt_note} "
                 f"(sub={stripe_result.get('subscription_id')}).",
             )
             return _finish_cancellation(
@@ -1251,7 +1275,7 @@ def _process(ticket_id: str) -> dict:
             )
 
         if stripe_status == "no_active_sub":
-            log.info(f"[{ticket_id}] Stripe: customer found but no active sub")
+            log.info(f"[{ticket_id}] Stripe: no active sub for any email tried")
 
         # Still not found → ask for last 4 card digits (step 1)
         log.info(f"[{ticket_id}] Not found by email → asking for last 4 card digits")
@@ -1635,7 +1659,7 @@ def _try_alt_emails(
             return _finish_cancellation(ticket_id, name, language, final_intent, alt_result, result)
         elif alt_status == "found_no_active_sub":
             log.info(f"[{ticket_id}] Alt email {alt_email} found but no active sub → try next")
-            return None
+            continue  # keep trying remaining alt emails
 
     return None
 
