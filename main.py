@@ -159,9 +159,13 @@ def _contains_cancel_signal(text: str) -> bool:
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
-# ── Shadow deduplication (Firestore-backed distributed lock) ─────────── #
+# ── Webhook deduplication (Firestore-backed distributed lock) ────────── #
 # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
 # change, status change, etc.). Each webhook is a separate HTTP request.
+#
+# CRITICAL: this dedup runs in ALL modes (production + shadow), not just
+# shadow. Without it, 3-5 concurrent webhooks all pass the tag-based
+# guards (because no tag is set yet) → duplicate replies + internal notes.
 #
 # In-memory dedup only works within a single Cloud Run instance.
 # Cloud Functions Gen 2 can spin up MULTIPLE instances → each has its
@@ -171,18 +175,22 @@ ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 #   - create() fails with ALREADY_EXISTS if another instance already claimed
 #   - Two-layer approach: in-memory fast path + Firestore distributed lock
 #   - Firestore TTL policy auto-deletes old entries (set in GCP Console)
+#   - Production uses shorter TTL (5 min) so card-digits re-processing works
 #
 # One-time Firestore TTL setup (run once in GCP Console or gcloud):
 #   gcloud firestore fields ttls update expire_at \
-#     --collection-group=shadow_dedup --enable-ttl
+#     --collection-group=webhook_dedup --enable-ttl
 
 import threading as _threading, time as _time
 from datetime import datetime, timedelta, timezone
 
 # Layer 1: in-memory cache (fast path, avoids Firestore call for same-instance dupes)
-_shadow_seen: dict[str, float] = {}   # ticket_id → timestamp
-_shadow_lock = _threading.Lock()
-_SHADOW_TTL  = 7200   # 2 hours
+_dedup_seen: dict[str, float] = {}   # ticket_id → timestamp
+_dedup_lock = _threading.Lock()
+# Shadow: 2h TTL (each ticket processed exactly once).
+# Production: 5min TTL (allows re-processing when customer replies later,
+# but blocks the 3-5 concurrent webhooks that arrive within seconds).
+_DEDUP_TTL = 7200 if SHADOW_MODE else 300
 
 # Layer 2: Firestore (distributed across all Cloud Run instances)
 _firestore_db = None
@@ -196,54 +204,94 @@ def _get_firestore_db():
     return _firestore_db
 
 
-def _shadow_dedup(ticket_id: str) -> bool:
+def _webhook_dedup(ticket_id: str) -> bool:
     """
     Return True if this ticket was already processed (duplicate).
     Two-layer dedup:
       1. In-memory dict — instant, handles same-instance dupes (no network call)
       2. Firestore create() — atomic distributed lock across all instances
+         For production: checks if existing doc is expired (manual TTL check)
     """
     now = _time.time()
     tid = str(ticket_id)
 
-    # ── Layer 1: in-memory (fast path) ──
-    with _shadow_lock:
-        if len(_shadow_seen) > 500:
-            stale = [k for k, v in _shadow_seen.items() if now - v > _SHADOW_TTL]
+    # ── Layer 1: in-memory (fast path, atomic check+claim under lock) ──
+    with _dedup_lock:
+        if len(_dedup_seen) > 500:
+            stale = [k for k, v in _dedup_seen.items() if now - v > _DEDUP_TTL]
             for k in stale:
-                del _shadow_seen[k]
-        if tid in _shadow_seen:
-            return True  # duplicate (same instance hit)
+                del _dedup_seen[k]
+        if tid in _dedup_seen and (now - _dedup_seen[tid]) < _DEDUP_TTL:
+            return True  # duplicate (same instance hit, within TTL)
 
     # ── Layer 2: Firestore (distributed lock) ──
     try:
         db = _get_firestore_db()
-        doc_ref = db.collection("shadow_dedup").document(tid)
+        doc_ref = db.collection("webhook_dedup").document(tid)
         # Atomic create — raises AlreadyExists if another instance claimed first
         doc_ref.create({
             "ticket_id": tid,
             "created_at": datetime.now(timezone.utc),
-            "expire_at": datetime.now(timezone.utc) + timedelta(hours=2),
+            "expire_at": datetime.now(timezone.utc) + timedelta(seconds=_DEDUP_TTL),
         })
         # Success — we are the first instance to claim this ticket
-        with _shadow_lock:
-            _shadow_seen[tid] = now
-        log.info(f"[{tid}] Shadow dedup: claimed in Firestore (first)")
+        with _dedup_lock:
+            _dedup_seen[tid] = now
+        log.info(f"[{tid}] Webhook dedup: claimed in Firestore (first)")
         return False
     except Exception as e:
         err_str = str(e)
         if "already exists" in err_str.lower() or "ALREADY_EXISTS" in err_str:
-            # Another instance already claimed — this is a duplicate
-            with _shadow_lock:
-                _shadow_seen[tid] = now  # cache for future fast-path
+            # Document exists — check if it's expired (Firestore TTL deletion
+            # can be delayed hours, so we check manually for production).
+            try:
+                doc = doc_ref.get()
+                if doc.exists:
+                    created_at = doc.to_dict().get("created_at")
+                    if created_at:
+                        age = (datetime.now(timezone.utc) - created_at).total_seconds()
+                        if age > _DEDUP_TTL:
+                            # Expired — reclaim (overwrite with new timestamp)
+                            doc_ref.set({
+                                "ticket_id": tid,
+                                "created_at": datetime.now(timezone.utc),
+                                "expire_at": datetime.now(timezone.utc) + timedelta(seconds=_DEDUP_TTL),
+                            })
+                            with _dedup_lock:
+                                _dedup_seen[tid] = now
+                            log.info(f"[{tid}] Webhook dedup: reclaimed expired doc ({age:.0f}s old)")
+                            return False
+            except Exception as inner_e:
+                log.warning(f"[{tid}] Firestore expiry check failed: {inner_e}")
+
+            # Not expired or check failed — it's a real duplicate
+            with _dedup_lock:
+                _dedup_seen[tid] = now  # cache for future fast-path
             return True
         # Firestore error (network, permissions, etc.) — fail open with in-memory only
         log.warning(f"[{tid}] Firestore dedup error, falling back to in-memory: {e}")
-        with _shadow_lock:
-            if tid in _shadow_seen:
+        with _dedup_lock:
+            if tid in _dedup_seen and (now - _dedup_seen[tid]) < _DEDUP_TTL:
                 return True
-            _shadow_seen[tid] = now
+            _dedup_seen[tid] = now
             return False
+
+
+def _dedup_clear(ticket_id: str):
+    """
+    Remove dedup lock so future webhooks can re-process this ticket.
+    Called for non-terminal states (e.g., awaiting_card_digits) where
+    the ticket needs to be re-processed when the customer replies.
+    """
+    tid = str(ticket_id)
+    with _dedup_lock:
+        _dedup_seen.pop(tid, None)
+    try:
+        db = _get_firestore_db()
+        db.collection("webhook_dedup").document(tid).delete()
+        log.info(f"[{tid}] Dedup lock cleared (non-terminal state)")
+    except Exception as e:
+        log.warning(f"[{tid}] Failed to clear Firestore dedup: {e}")
 
 
 # ── Clients ──────────────────────────────────────────────────────────── #
@@ -378,7 +426,7 @@ def zendesk_webhook(request):
 
     log.info(f"[{ticket_id}] Webhook received")
 
-    # ── SHADOW_MODE: in-memory deduplication ─────────────────────────── #
+    # ── Webhook deduplication (ALL modes) ─────────────────────────────── #
     # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
     # change, status change — EACH triggers a new webhook).
     # Zendesk tags do NOT work as a lock:
@@ -386,12 +434,12 @@ def zendesk_webhook(request):
     #   - get_ticket_tags has eventual consistency (stale reads)
     #   - Multiple Cloud Function instances read tags concurrently
     #
-    # Fix: in-memory Python set. Atomic check+claim under a thread lock.
-    # Works within a single Cloud Run instance (handles 95%+ of dupes).
-    # No Zendesk API calls = no new webhooks triggered.
-    if SHADOW_MODE and _shadow_dedup(ticket_id):
-        log.info(f"[{ticket_id}] Shadow: duplicate (in-memory) — skip")
-        return json.dumps({"ticket_id": ticket_id, "status": "skipped_shadow_duplicate"}), 200, {"Content-Type": "application/json"}
+    # Fix: Two-layer dedup (in-memory + Firestore distributed lock).
+    # Runs in ALL modes — production was missing dedup entirely, causing
+    # 3-5 duplicate replies + internal notes per ticket.
+    if _webhook_dedup(ticket_id):
+        log.info(f"[{ticket_id}] Duplicate webhook — skip")
+        return json.dumps({"ticket_id": ticket_id, "status": "skipped_duplicate"}), 200, {"Content-Type": "application/json"}
 
     try:
         result = _process(ticket_id)
@@ -406,6 +454,23 @@ def zendesk_webhook(request):
             )
         except Exception:
             log.exception(f"[{ticket_id}] Failed to send Slack error alert")
+
+    # ── Clear dedup lock for non-terminal states ─────────────────────── #
+    # States that expect the customer to reply later (card digits, pending)
+    # need the dedup lock removed so the next webhook can re-process.
+    # Terminal states (success, bot_handled, manual_review) keep the lock
+    # as an extra anti-spam layer on top of tag-based guards.
+    _NON_TERMINAL_STATUSES = {
+        "awaiting_card_digits",
+        "awaiting_card_digits_retry",
+        "skipped_pending_awaiting_reply",
+        "waiting_for_customer_reply",
+        "skipped_no_test_tag",              # TEST_MODE skip — not a real processing
+        "skipped_agent_already_replied",    # agent handling — might change
+        "error",                            # error — allow retry
+    }
+    if result.get("status") in _NON_TERMINAL_STATUSES:
+        _dedup_clear(ticket_id)
 
     # ── SHADOW_MODE: enrich → log → Slack ────────────────────────────── #
     # Every ticket gets full classification + detailed BQ log so we can
