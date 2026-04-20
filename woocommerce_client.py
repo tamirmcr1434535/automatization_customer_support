@@ -610,8 +610,12 @@ class WooCommerceClient:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
                 log.info(f"WC TIMING: step2b ?customer= done in {time.time()-t2b:.1f}s (total {time.time()-wc_start:.1f}s)")
 
-        # ── Step 2c: /subscriptions?billing_email= (ONLY without customer, 10s) ── #
-        if not all_subs and not customer:
+        # ── Step 2c: /subscriptions?billing_email= (20s timeout) ─────── #
+        # Previously only ran when no customer was found, but Stripe Multi
+        # Sync can create subscriptions that are NOT linked to the WC
+        # customer_id. In that case ?customer= returns 0 results, yet
+        # ?billing_email= finds the subscription by its billing email.
+        if not all_subs:
             t2c = time.time()
             billing_subs = self._find_subs_by_billing_email(email)
             if billing_subs:
