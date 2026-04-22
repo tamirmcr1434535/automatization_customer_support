@@ -162,6 +162,38 @@ _FALLBACK = {
 }
 
 
+def _parse_claude_json(raw_text: str, log) -> dict | None:
+    """Extract and parse the JSON object from Claude's response.
+
+    Returns the parsed dict on success, or None if the response contains
+    no parseable JSON (e.g. truncated, preamble only, malformed).
+    Always logs the raw text at debug / the offending substring at error
+    so operators can diagnose what Claude actually returned.
+    """
+    start_idx = raw_text.find('{')
+    end_idx   = raw_text.rfind('}')
+
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        log.error(
+            f"classify_ticket: Claude response has no JSON brackets — "
+            f"raw={raw_text[:500]!r}"
+        )
+        return None
+
+    clean_json_str = raw_text[start_idx:end_idx + 1]
+    try:
+        return json.loads(clean_json_str)
+    except json.JSONDecodeError as e:
+        # Truncated or malformed JSON — most common cause is max_tokens
+        # being too small, which cuts the JSON mid-field. Log the raw
+        # text so we can tell apart truncation from genuine bad output.
+        log.error(
+            f"classify_ticket: JSON decode error ({e}) — "
+            f"cleaned={clean_json_str[:500]!r}, raw_len={len(raw_text)}"
+        )
+        return None
+
+
 def classify_ticket(subject: str, body: str) -> dict:
     import logging, time
     log = logging.getLogger("classifier")
@@ -177,62 +209,78 @@ def classify_ticket(subject: str, body: str) -> dict:
         _notify_api_failure(error_msg)
         return {**_FALLBACK, "reasoning": "API key not configured — classifier disabled"}
 
-    # Retry up to 3 times on 529 overloaded; immediate fail on other errors.
+    user_content = f"{PROMPT}\n\nSubject: {subject}\n\nBody:\n{body[:1500]}"
+
+    # Up to 3 API-level attempts (retries 529 overloaded).
+    # On parse success: return immediately.
+    # On parse FAILURE: retry once with a larger max_tokens budget, in case
+    #   the first attempt was truncated. 200 tokens was the historical
+    #   value — far too small for JP/KR reasoning strings — and caused
+    #   "parse error — classifier fallback" on otherwise obvious tickets
+    #   (e.g. "解約をすぐしたいのですが、解約方法を教えて下さい").
+    _PARSE_BUDGETS = [500, 900]  # first try 500; if parse fails, retry with 900
+
     last_err = None
-    for attempt in range(3):
-        try:
-            response = _client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=200,
-                messages=[{
-                    "role": "user",
-                    "content": f"{PROMPT}\n\nSubject: {subject}\n\nBody:\n{body[:1500]}"
-                }]
-            )
-            last_err = None
-            break  # success
-        except Exception as e:
-            last_err = e
-            # 529 = Anthropic overloaded — worth retrying after a short pause
-            status = getattr(e, "status_code", None)
-            if status == 529 and attempt < 2:
-                wait = 3 * (attempt + 1)  # 3s, 6s
-                log.warning(
-                    f"classify_ticket: Anthropic overloaded (529), "
-                    f"retry {attempt + 1}/2 in {wait}s…"
+    for parse_attempt, max_tokens in enumerate(_PARSE_BUDGETS):
+        # Inner API retry loop (handles 529 overloaded)
+        response = None
+        for api_attempt in range(3):
+            try:
+                response = _client.messages.create(
+                    model="claude-sonnet-4-6",
+                    max_tokens=max_tokens,
+                    messages=[{"role": "user", "content": user_content}],
                 )
-                time.sleep(wait)
-                continue
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                status = getattr(e, "status_code", None)
+                if status == 529 and api_attempt < 2:
+                    wait = 3 * (api_attempt + 1)
+                    log.warning(
+                        f"classify_ticket: Anthropic overloaded (529), "
+                        f"retry {api_attempt + 1}/2 in {wait}s…"
+                    )
+                    time.sleep(wait)
+                    continue
+                error_msg = f"Claude API error (status={status}): {e}"
+                log.error(f"classify_ticket API error: {e}")
+                _notify_api_failure(error_msg)
+                return {**_FALLBACK, "reasoning": f"API error: {e}"}
 
-            # Any other error (auth, network, etc.) — fail immediately
-            # FIX-A: send Slack alert on API errors
-            error_msg = f"Claude API error (status={status}): {e}"
-            log.error(f"classify_ticket API error: {e}")
+        if response is None:
+            # all API retries exhausted on this parse attempt
+            error_msg = f"Anthropic overloaded after all retries: {last_err}"
+            log.error(f"classify_ticket: all API retries exhausted — {last_err}")
             _notify_api_failure(error_msg)
-            return {**_FALLBACK, "reasoning": f"API error: {e}"}
+            return {**_FALLBACK, "reasoning": f"overloaded after retries: {last_err}"}
 
-    if last_err is not None:
-        error_msg = f"Anthropic overloaded after all retries: {last_err}"
-        log.error(f"classify_ticket: all retries exhausted — {last_err}")
-        _notify_api_failure(error_msg)
-        return {**_FALLBACK, "reasoning": f"overloaded after retries: {last_err}"}
+        raw_text = response.content[0].text
+        stop_reason = getattr(response, "stop_reason", "unknown")
 
-    raw_text = response.content[0].text
+        # If Claude hit max_tokens the JSON is almost certainly truncated;
+        # skip the parse attempt and go straight to retry with larger budget.
+        if stop_reason == "max_tokens" and parse_attempt < len(_PARSE_BUDGETS) - 1:
+            log.warning(
+                f"classify_ticket: Claude hit max_tokens={max_tokens} "
+                f"(stop_reason={stop_reason}) — retrying with larger budget. "
+                f"raw_len={len(raw_text)}"
+            )
+            continue
 
-    start_idx = raw_text.find('{')
-    end_idx   = raw_text.rfind('}')
+        result = _parse_claude_json(raw_text, log)
+        if result is not None:
+            return result
 
-    result = None
-    if start_idx != -1 and end_idx != -1:
-        clean_json_str = raw_text[start_idx:end_idx + 1]
-        try:
-            result = json.loads(clean_json_str)
-        except json.JSONDecodeError as e:
-            print(f"JSON Decode Error on cleaned string: {clean_json_str}")
-    else:
-        print(f"Claude returned invalid response without JSON brackets: {raw_text}")
+        # Parse failed — if we have another budget to try, retry with it.
+        if parse_attempt < len(_PARSE_BUDGETS) - 1:
+            log.warning(
+                f"classify_ticket: parse failed at max_tokens={max_tokens}, "
+                f"stop_reason={stop_reason}, retrying with bigger budget"
+            )
+            continue
 
-    if result is None:
-        return {**_FALLBACK, "reasoning": "parse error — classifier fallback"}
-
-    return result
+    # All parse attempts failed → fallback to UNKNOWN. Safety net in
+    # main.py still has a shot at rescuing the ticket via keyword match.
+    return {**_FALLBACK, "reasoning": "parse error — classifier fallback"}

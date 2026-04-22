@@ -609,7 +609,18 @@ class WooCommerceClient:
     # ================================================================== #
 
     def _cancel_sub_by_id(self, subscription_id: int) -> dict:
-        """PUT status=cancelled for a single subscription."""
+        """PUT status=cancelled for a single subscription.
+
+        Uses _request_with_retry (1 retry on timeout, doubling timeout).
+        Base timeout 60s — iqbooster.org PUTs have been observed taking
+        30-70s during peak load; 20s was too aggressive and caused every
+        slow-server moment to bubble up as api_error.
+
+        On failure the returned dict includes typed error info so callers
+        can distinguish timeout/auth/api errors and surface the real HTTP
+        detail to operators (the previous code collapsed everything into
+        a bare "error" status that hid the root cause).
+        """
         if self.dry_run:
             log.info(f"[DRY] WC cancel subscription #{subscription_id}")
             return {
@@ -619,21 +630,75 @@ class WooCommerceClient:
             }
 
         try:
-            resp = requests.put(
+            resp = _request_with_retry(
+                "PUT",
                 f"{self.base}/subscriptions/{subscription_id}",
                 json={"status": "cancelled"},
                 auth=self.auth,
-                timeout=20,
+                timeout=60,
+                max_retries=1,
             )
+        except requests.exceptions.Timeout as e:
+            log.error(f"WC cancel TIMED OUT for #{subscription_id}: {e}")
+            return {
+                "status": "error",
+                "subscription_id": subscription_id,
+                "cancelled": False,
+                "error": f"PUT timeout: {e}"[:300],
+                "error_kind": "timeout_error",
+                "error_detail": f"PUT /subscriptions/{subscription_id} timed out: {e}"[:300],
+                "error_step": "put_cancel",
+            }
         except requests.exceptions.RequestException as e:
             log.error(f"WC cancel network error for #{subscription_id}: {e}")
-            return {"status": "error", "subscription_id": subscription_id,
-                    "cancelled": False, "error": str(e)}
+            return {
+                "status": "error",
+                "subscription_id": subscription_id,
+                "cancelled": False,
+                "error": str(e)[:300],
+                "error_kind": "api_error",
+                "error_detail": f"PUT /subscriptions/{subscription_id} network: {e}"[:300],
+                "error_step": "put_cancel",
+            }
 
         if not resp.ok:
-            log.error(f"WC cancel failed #{subscription_id}: {resp.status_code}")
-            return {"status": "error", "subscription_id": subscription_id,
-                    "cancelled": False, "error": resp.text[:300]}
+            err = _error_kind_from_response(resp) or ("api_error", f"{resp.status_code}")
+            err_kind, _ = err
+            detail = f"PUT /subscriptions/{subscription_id} → {resp.status_code} {resp.reason or ''}: {(resp.text or '')[:250]}"
+            log.error(f"WC cancel failed #{subscription_id}: {detail}")
+            return {
+                "status": "error",
+                "subscription_id": subscription_id,
+                "cancelled": False,
+                "error": (resp.text or "")[:300],
+                "error_kind": err_kind,
+                "error_detail": detail[:300],
+                "error_step": "put_cancel",
+            }
+
+        # Sanity check the response body says the subscription is now cancelled.
+        try:
+            body = resp.json()
+            actual_status = body.get("status", "")
+            if actual_status and actual_status != "cancelled":
+                log.warning(
+                    f"WC cancel #{subscription_id}: PUT 200 but returned status="
+                    f"{actual_status!r} — WC did not actually cancel"
+                )
+                return {
+                    "status": "error",
+                    "subscription_id": subscription_id,
+                    "cancelled": False,
+                    "error": f"WC returned status={actual_status!r} after PUT",
+                    "error_kind": "api_error",
+                    "error_detail": (
+                        f"PUT /subscriptions/{subscription_id} returned 200 but "
+                        f"sub status is {actual_status!r}, not 'cancelled'"
+                    )[:300],
+                    "error_step": "put_cancel",
+                }
+        except Exception:
+            pass  # body unparseable → trust 2xx as success
 
         log.info(f"WC: cancelled subscription #{subscription_id}")
         return {"status": "cancelled", "subscription_id": subscription_id,
@@ -1033,9 +1098,13 @@ class WooCommerceClient:
                 else "subscription_cancelled"
             )
         else:
-            status_label = cancel.get("status", "error")
+            # Cancel failed — surface the typed error kind so callers can
+            # distinguish "WC was down" from "lookup was clean but sub
+            # genuinely does not exist". Falls back to legacy "error" only
+            # when _cancel_sub_by_id did not produce a typed kind.
+            status_label = cancel.get("error_kind") or cancel.get("status", "error")
 
-        return {
+        result = {
             **base_result,
             "status": status_label,
             "cancelled": cancel["cancelled"],
@@ -1045,3 +1114,14 @@ class WooCommerceClient:
             "order_count": order_count,
             "error": cancel.get("error"),
         }
+
+        # When the PUT itself failed, propagate the detailed error info
+        # (real HTTP status + body) so main.py can render it in the
+        # per-ticket Slack report instead of the opaque "legacy status: error".
+        if not cancel["cancelled"] and not self.dry_run:
+            if cancel.get("error_detail"):
+                result["error_detail"] = cancel["error_detail"]
+            if cancel.get("error_step"):
+                result["error_step"] = cancel["error_step"]
+
+        return result
