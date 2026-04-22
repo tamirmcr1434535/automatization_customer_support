@@ -536,15 +536,10 @@ def zendesk_webhook(request):
         result = _process(ticket_id)
     except Exception as e:
         log.exception(f"[{ticket_id}] Unhandled error: {e}")
+        # The per-ticket report below renders status=error + the exception
+        # message in a dedicated section, so no separate Slack alert is
+        # needed here.
         result = {"ticket_id": ticket_id, "status": "error", "error": str(e)}
-        try:
-            slack.notify_error(
-                ticket_id=ticket_id,
-                error_msg=str(e),
-                zendesk_subdomain=ZENDESK_SUBDOMAIN,
-            )
-        except Exception:
-            log.exception(f"[{ticket_id}] Failed to send Slack error alert")
 
     # ── Clear dedup lock for non-terminal states ─────────────────────── #
     # States that expect the customer to reply later need the dedup lock
@@ -760,13 +755,8 @@ def _process(ticket_id: str) -> dict:
         )
         zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         result["status"] = "skipped_followup"
-        slack_sent = slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent="FOLLOWUP",
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-        result["slack_sent"] = slack_sent
+        result["intent"] = "FOLLOWUP"
+        result["reason"] = "Follow-up to a previous request — agent already handled or will handle this thread"
         log_result(result)
         return result
 
@@ -780,13 +770,7 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         result["intent"] = "REFUND_REQUEST"
         result["status"] = "skipped_refund_request"
-        slack_sent = slack.notify_refund_skip(
-            ticket_id=ticket_id,
-            email=email,
-            intent="REFUND_REQUEST",
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-        result["slack_sent"] = slack_sent
+        result["reason"] = "Refund keyword detected in subject — refund disputes require a human"
         log_result(result)
         return result
 
@@ -825,13 +809,11 @@ def _process(ticket_id: str) -> dict:
 
         zendesk.add_tag(ticket_id, "bot_spam_guard")  # blocks other webhook re-fires
         result["status"] = "skipped_spam_detected"
-        slack_sent = slack.notify_spam_detected(
-            ticket_id=ticket_id,
-            email=email,
-            reply_count=bot_reply_count,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        result["reply_count"] = bot_reply_count
+        result["reason"] = (
+            f"Bot has already posted {bot_reply_count} replies to this ticket — "
+            "possible webhook loop, stopping and escalating"
         )
-        result["slack_sent"] = slack_sent
         log_result(result)
         return result
 
@@ -1067,14 +1049,10 @@ def _process(ticket_id: str) -> dict:
         intent = "REFUND_REQUEST"
         result["intent"] = intent
         result["status"] = "skipped_refund_request"
-        zendesk.add_tag(ticket_id, "bot_handled")
-        slack_sent = slack.notify_refund_skip(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        result["reason"] = (
+            f"Refund keywords detected in body ({_refund_context}) — human must handle any refund"
         )
-        result["slack_sent"] = slack_sent
+        zendesk.add_tag(ticket_id, "bot_handled")
         log_result(result)
         return result
 
@@ -1093,12 +1071,8 @@ def _process(ticket_id: str) -> dict:
     if intent in _PURE_DISPUTE_INTENTS:
         log.info(f"[{ticket_id}] {intent} — skipping (active payment dispute, human must handle)")
         result["status"] = "skipped_refund_request"
+        result["reason"] = f"{intent} — active payment dispute, human must handle"
         zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
-        slack_sent = slack.notify_refund_skip(
-            ticket_id=ticket_id, email=email,
-            intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-        result["slack_sent"] = slack_sent
         log_result(result)
         return result
 
@@ -1109,12 +1083,8 @@ def _process(ticket_id: str) -> dict:
             f"[{ticket_id}] {intent} — refund intent, always escalate to human"
         )
         result["status"] = "skipped_refund_request"
+        result["reason"] = f"{intent} — refund intents always go to a human"
         zendesk.add_tag(ticket_id, "bot_handled")
-        slack_sent = slack.notify_refund_skip(
-            ticket_id=ticket_id, email=email,
-            intent=intent, zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-        result["slack_sent"] = slack_sent
         log_result(result)
         return result
 
@@ -1161,16 +1131,10 @@ def _process(ticket_id: str) -> dict:
             f"data deletion per privacy policy.",
         )
         zendesk.set_open(ticket_id)
-        slack_sent = slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent="DELETE_ACCOUNT",
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
         result.update({
             "status": "escalated_delete_account",
             "action": "escalated_to_agent_delete_account",
-            "slack_sent": slack_sent,
+            "reason": "Customer requests account/data deletion — handled per privacy policy",
         })
         log_result(result)
         return result
@@ -1193,16 +1157,11 @@ def _process(ticket_id: str) -> dict:
             f"Please review this ticket manually."
         )
         zendesk.set_open(ticket_id)
-        slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            reason=(
-                f"UNKNOWN intent after all safety nets — "
-                f"confidence={confidence:.0%}, "
-                f"reasoning: {classification.get('reasoning', 'N/A')}"
-            ),
-        )
         result["status"] = "escalated_unknown"
+        result["reason"] = (
+            f"UNKNOWN intent after all safety nets — confidence={confidence:.0%}, "
+            f"reasoning: {classification.get('reasoning', 'N/A')}"
+        )
         log_result(result)
         return result
 
@@ -1252,14 +1211,13 @@ def _process(ticket_id: str) -> dict:
             f"Please review and handle this ticket manually.",
         )
         zendesk.set_open(ticket_id)
-        slack_sent = slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
         result["status"] = "escalated_low_confidence"
-        result["slack_sent"] = slack_sent
+        result["reason"] = (
+            f"Confidence {confidence:.0%} below 80% threshold. "
+            f"Potential intent: {intent}. "
+            f"Reasoning: {classification.get('reasoning', 'N/A')}"
+            + (f". Keywords: {', '.join(_keyword_hint_parts)}" if _keyword_hint_parts else "")
+        )
         log_result(result)
         return result
 
@@ -1310,21 +1268,12 @@ def _process(ticket_id: str) -> dict:
             "Please locate the subscription manually and handle this ticket.",
         )
         zendesk.set_open(ticket_id)
-        slack_sent = slack.notify_wc_lookup_failed(
-            ticket_id=ticket_id,
-            email=email,
-            error_kind=error_kind,
-            error_detail=error_detail,
-            error_step=error_step,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
         result.update({
             "status": "wc_lookup_error",
             "action": "slack_alerted_wc_error",
             "error_kind": error_kind,
             "error_detail": error_detail[:300],
             "error_step": error_step,
-            "slack_sent": slack_sent,
         })
         log_result(result)
         return result
@@ -1403,16 +1352,13 @@ def _process(ticket_id: str) -> dict:
             "Please review and handle manually.",
         )
         zendesk.set_open(ticket_id)
-        slack_sent = slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
         result.update({
             "status": "manual_review_required",
             "action": "slack_alerted_no_active_sub",
-            "slack_sent": slack_sent,
+            "reason": (
+                f"Customer found in {found_in} but has NO active subscription. "
+                "Already cancelled, or registered under a different email/payment method."
+            ),
         })
         log_result(result)
         return result
@@ -1498,16 +1444,13 @@ def _process(ticket_id: str) -> dict:
             "Could not locate subscription. Please find and cancel manually.",
         )
         zendesk.set_open(ticket_id)
-        slack_sent = slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
         result.update({
             "status": "escalated_not_found",
             "action": "slack_alerted_not_found",
-            "slack_sent": slack_sent,
+            "reason": (
+                f"Customer email ({email}) not found in WooCommerce or Stripe. "
+                "All lookup paths exhausted."
+            ),
         })
         log_result(result)
         return result
@@ -1573,17 +1516,11 @@ def _escalate_legacy_card_digits_ticket(
         "this ticket.",
     )
     zendesk.set_open(ticket_id)
-    slack_sent = slack.notify_manual_review(
-        ticket_id=ticket_id,
-        email=email,
-        reason=f"Legacy card-digits ticket (tags={matched}) — manual review",
-        zendesk_subdomain=ZENDESK_SUBDOMAIN,
-    )
     result.update({
         "status": "escalated_legacy_card_digits",
         "action": "slack_alerted_legacy_card_digits",
         "legacy_tags": matched,
-        "slack_sent": slack_sent,
+        "reason": f"Legacy card-digits ticket (tags={matched}) — card-digits flow retired, human review required",
     })
     log_result(result)
     return result
@@ -1728,17 +1665,14 @@ def _finish_cancellation(
             f"Renewal subscription (>= {MAX_BOT_ORDERS} orders) — requires manual review.",
         )
         zendesk.set_open(ticket_id)
-        slack_sent = slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=email,
-            intent=intent,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
         result.update({
             "status": "manual_review_required",
             "action": "skipped_renewal_too_many_orders",
             "order_count": order_count,
-            "slack_sent": slack_sent,
+            "reason": (
+                f"Subscription has {order_count} orders (>= {MAX_BOT_ORDERS} threshold) — "
+                "renewal subscription, bot does not auto-cancel, human review required."
+            ),
         })
         log_result(result)
         return result
@@ -1768,13 +1702,9 @@ def _finish_cancellation(
             f"Please reply to the customer manually to confirm cancellation.",
         )
         zendesk.set_open(ticket_id)
-        slack.notify_manual_review(
-            ticket_id=ticket_id,
-            email=result.get("email", "unknown"),
-            reason=f"Reply validation failed: {reason}",
-        )
         result["status"] = "manual_review_required"
         result["validation_fail_reason"] = reason
+        result["reason"] = f"Generated reply failed validation: {reason}"
         log_result(result)
         return result
 
