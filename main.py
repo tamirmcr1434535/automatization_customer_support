@@ -1792,11 +1792,17 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "error_step": woo_result.get("error_step", ""),
         }
 
-    # Legacy timeout/error statuses — treat same as typed errors
+    # Legacy timeout/error statuses — treat same as typed errors, but
+    # preserve whatever detail the WC client attached to the result
+    # (real HTTP status, response body) so operators can see the actual
+    # failure in Slack instead of a bare "legacy status: error".
     if woo_status in ("timeout", "error"):
+        real_detail = woo_result.get("error_detail") or woo_result.get("error") or ""
+        real_step = woo_result.get("error_step") or "put_cancel"
         log.error(
-            f"[{ticket_id}] WooCommerce legacy {woo_status} status — "
-            "escalating as wc_lookup_error, no customer reply"
+            f"[{ticket_id}] WooCommerce legacy {woo_status} status "
+            f"(step={real_step}): {str(real_detail)[:300]} — escalating as "
+            "wc_lookup_error, no customer reply"
         )
         return {
             "status": "wc_lookup_error",
@@ -1804,8 +1810,11 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "cancelled": False,
             "source": "woocommerce",
             "error_kind": "api_error",
-            "error_detail": f"legacy status: {woo_status}",
-            "error_step": "unknown",
+            "error_detail": (
+                str(real_detail) if real_detail
+                else f"legacy status: {woo_status} (no further detail from WC client)"
+            ),
+            "error_step": real_step,
         }
 
     # woo_status == "not_found" — WC said "no such email anywhere" cleanly
