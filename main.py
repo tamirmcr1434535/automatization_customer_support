@@ -171,6 +171,53 @@ def _contains_cancel_signal(text: str) -> bool:
 
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
+# ── Zendesk "Topic" custom field ──────────────────────────────────────── #
+# Set ONLY on successful bot cancellations, so the Topic dropdown in the
+# Zendesk UI reflects what the bot actually did (Trial Cancellation or
+# Sub Cancellation). Escalations, errors, refunds, renewal reviews etc.
+# deliberately leave the field alone — a human will fill it in.
+#
+# To write the field via the API we need:
+#   - the custom field id (numeric; look it up in Zendesk Admin → Ticket Fields)
+#   - the field *tag* for the dropdown option the agent sees in the UI
+# Both are configured via env vars so we don't hard-code account-specific ids.
+# ZENDESK_TOPIC_FIELD_ID is REQUIRED; if unset, topic updates are no-ops.
+_ZENDESK_TOPIC_FIELD_ID = os.getenv("ZENDESK_TOPIC_FIELD_ID", "").strip()
+
+_TOPIC_BY_INTENT: dict[str, str] = {
+    "TRIAL_CANCELLATION": os.getenv(
+        "ZENDESK_TOPIC_TRIAL_CANCELLATION", "trial_cancellation",
+    ),
+    "SUB_CANCELLATION": os.getenv(
+        "ZENDESK_TOPIC_SUB_CANCELLATION", "sub_cancellation",
+    ),
+}
+
+
+def _set_topic_for_intent(ticket_id: str, intent: str) -> None:
+    """
+    Set the Zendesk Topic custom field after a successful cancellation.
+
+    Only called from the success branch of `_finish_cancellation`, so it only
+    fires when the bot actually cancelled the subscription with high
+    confidence. Escalation / error / refund paths must NOT call this — we
+    don't want the bot deciding the Topic when a human is taking over.
+
+    Silently skipped if ZENDESK_TOPIC_FIELD_ID is not configured or if the
+    intent isn't one of the two mapped cancellation intents. Never raises —
+    topic is a reporting aid, not part of the cancellation guarantee.
+    """
+    if not _ZENDESK_TOPIC_FIELD_ID:
+        return
+    value = _TOPIC_BY_INTENT.get(intent)
+    if not value:
+        return
+    try:
+        zendesk.set_custom_field(ticket_id, int(_ZENDESK_TOPIC_FIELD_ID), value)
+        log.info(f"[{ticket_id}] Topic set to '{value}' (intent={intent})")
+    except Exception as e:
+        log.warning(f"[{ticket_id}] Failed to set topic for intent {intent}: {e}")
+
 # ── Webhook deduplication (Firestore-backed distributed lock) ────────── #
 # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
 # change, status change, etc.). Each webhook is a separate HTTP request.
@@ -1248,6 +1295,31 @@ def _process(ticket_id: str) -> dict:
             f"{error_detail[:200]} — escalating to Slack, no customer reply"
         )
 
+        # ── Override intent with WC ground truth when available ────────── #
+        # The text classifier guesses TRIAL vs SUB from the customer's words;
+        # WooCommerce order count is the source of truth. If the sub lookup
+        # succeeded before the PUT failed (typical auth_error on write), use
+        # those fields to label the ticket correctly — a customer with 5
+        # orders is NOT a trial cancellation no matter what the text said.
+        wc_sub_type = cancel_result.get("subscription_type")
+        wc_order_count = cancel_result.get("order_count")
+        wc_sub_id = cancel_result.get("subscription_id")
+        if wc_sub_type or wc_order_count is not None:
+            resolved_intent = _resolve_intent(intent, cancel_result)
+            if (
+                wc_order_count is not None
+                and wc_order_count >= MAX_BOT_ORDERS
+            ):
+                resolved_intent = "SUB_RENEWAL_CANCELLATION"
+            if resolved_intent != intent:
+                log.info(
+                    f"[{ticket_id}] Overriding intent {intent} → "
+                    f"{resolved_intent} based on WC data "
+                    f"(sub_type={wc_sub_type}, orders={wc_order_count})"
+                )
+                intent = resolved_intent
+                result["intent"] = intent
+
         # Race condition guard — another parallel webhook may have already escalated
         current_tags = zendesk.get_ticket_tags(ticket_id)
         if "bot_handled" in current_tags:
@@ -1259,11 +1331,25 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_tag(ticket_id, f"wc_{error_kind}")
+        if intent == "SUB_RENEWAL_CANCELLATION":
+            zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
+
+        sub_info_note = ""
+        if wc_sub_id is not None or wc_sub_type or wc_order_count is not None:
+            sub_info_note = (
+                "\nSubscription located before write failed: "
+                f"#{wc_sub_id} "
+                f"(type={wc_sub_type or 'unknown'}, "
+                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}).\n"
+                f"Bot-resolved intent: {intent}.\n"
+            )
+
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: WooCommerce lookup FAILED for {email}.\n"
             f"Error: {error_kind} at step `{error_step}`\n"
-            f"Detail: {error_detail[:300]}\n\n"
+            f"Detail: {error_detail[:300]}\n"
+            f"{sub_info_note}\n"
             "Bot did NOT reply to the customer. "
             "Please locate the subscription manually and handle this ticket.",
         )
@@ -1274,6 +1360,9 @@ def _process(ticket_id: str) -> dict:
             "error_kind": error_kind,
             "error_detail": error_detail[:300],
             "error_step": error_step,
+            "subscription_type": wc_sub_type or "",
+            "subscription_id": wc_sub_id,
+            "order_count": wc_order_count,
         })
         log_result(result)
         return result
@@ -1717,6 +1806,7 @@ def _finish_cancellation(
     zendesk.post_reply(ticket_id, reply_text)
     zendesk.add_tag(ticket_id, cancel_tag)
     zendesk.add_tag(ticket_id, "ai_bot_success")
+    _set_topic_for_intent(ticket_id, intent)
     zendesk.solve_ticket(ticket_id)
 
     result.update({
@@ -1776,6 +1866,12 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     # Typed WC errors (auth/timeout/api) — the bot does NOT know whether the
     # customer has a subscription. Do NOT reply to the customer. Escalate
     # immediately so a human can take over.
+    #
+    # If WC DID locate the subscription before the PUT failed (auth_error on
+    # write but read was fine), woo.cancel_subscription already populated
+    # subscription_type, subscription_id, order_count. Preserve them so the
+    # caller can use WC data (not the text classifier) to label the ticket
+    # correctly (e.g. renewal with 5 orders should NOT be TRIAL_CANCELLATION).
     if woo_status in ("auth_error", "timeout_error", "api_error"):
         log.error(
             f"[{ticket_id}] WooCommerce {woo_status}: "
@@ -1790,6 +1886,10 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "error_kind": woo_status,
             "error_detail": woo_result.get("error_detail", ""),
             "error_step": woo_result.get("error_step", ""),
+            "subscription_type": woo_result.get("subscription_type"),
+            "subscription_id": woo_result.get("subscription_id"),
+            "order_count": woo_result.get("order_count"),
+            "plan": woo_result.get("plan"),
         }
 
     # Legacy timeout/error statuses — treat same as typed errors, but
@@ -1815,6 +1915,10 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
                 else f"legacy status: {woo_status} (no further detail from WC client)"
             ),
             "error_step": real_step,
+            "subscription_type": woo_result.get("subscription_type"),
+            "subscription_id": woo_result.get("subscription_id"),
+            "order_count": woo_result.get("order_count"),
+            "plan": woo_result.get("plan"),
         }
 
     # woo_status == "not_found" — WC said "no such email anywhere" cleanly

@@ -144,14 +144,20 @@ Return ONLY raw valid JSON:
 {
   "intent": "...",
   "confidence": 0.0,
-  "language": "<ISO 639-1: EN, JP, KR, DE, FR, ZH, ES, PT, IT, RU, ID, NL, UK>",
+  "language": "<ISO 639-1: EN, JP, KR, DE, FR, ZH, ES, PT, IT, RU, ID, NL, UK, VI, TH>",
   "chargeback_risk": false,
   "reasoning": "one line"
 }
 
 Language codes: EN=English, JP=Japanese, KR=Korean, DE=German, FR=French,
 ZH=Chinese, ES=Spanish, PT=Portuguese, RU=Russian, IT=Italian,
-ID=Indonesian, NL=Dutch, UK=Ukrainian."""
+ID=Indonesian, NL=Dutch, UK=Ukrainian, VI=Vietnamese, TH=Thai.
+
+If the customer text is in a language not listed above, pick the code for the
+CLOSEST supported language the customer is writing in (fall back to EN only as
+a last resort). NEVER return EN for text written in Vietnamese, Thai, or any
+other listed language — the bot uses this code to translate its reply back to
+the customer, so wrong codes mean wrong-language replies."""
 
 _FALLBACK = {
     "intent": "UNKNOWN",

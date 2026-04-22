@@ -219,6 +219,25 @@ class ZendeskClient:
             }},
         )
 
+    def set_custom_field(self, ticket_id: str, field_id: int, value: str):
+        """
+        Set a single ticket custom field (e.g. the "Topic" dropdown).
+
+        Zendesk merges custom_fields by id, so passing a single entry does
+        NOT wipe other fields on the ticket.
+        """
+        if self.dry_run:
+            log.info(
+                f"[DRY] custom_field {field_id}={value!r} → #{ticket_id}"
+            )
+            return
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
+            json={"ticket": {"custom_fields": [
+                {"id": int(field_id), "value": value},
+            ]}},
+        )
+
     def add_tag(self, ticket_id: str, tag: str):
         if self.dry_run and not self.shadow_mode:
             log.info(f"[DRY] tag '{tag}' → #{ticket_id}")
