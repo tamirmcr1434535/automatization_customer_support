@@ -1,0 +1,20 @@
+# Python bytecode cache (regenerated on every run, never commit)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Pytest artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local env files (never commit secrets)
+.env
+.env.local
