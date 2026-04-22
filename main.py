@@ -1799,7 +1799,7 @@ def _finish_cancellation(
 
     cancel_tag = {
         "TRIAL_CANCELLATION": "trial_cancellation",
-        "SUB_CANCELLATION": "subscription_cancelled",
+        "SUB_CANCELLATION": "sub_cancellation",
     }.get(intent, "cancelled")
 
     zendesk.add_tag(ticket_id, "bot_handled") # first — blocks any re-entry from webhook re-fires
