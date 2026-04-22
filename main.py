@@ -664,6 +664,7 @@ _SHADOW_STATUS_TO_TAG = {
     "wc_lookup_error":              "shadow_would_escalate_wc_error",
     "escalated_legacy_card_digits": "shadow_would_escalate_legacy",
     "skipped_agent_already_replied":"shadow_agent_handling",
+    "skipped_merge_candidate":      "shadow_merge_candidate",
     "skipped_spam_detected":        "shadow_spam",
     "error":                        "shadow_error",
 }
@@ -831,6 +832,44 @@ def _process(ticket_id: str) -> dict:
         )
         result["status"] = "skipped_agent_already_replied"
         return result
+
+    # 2c-bis. Merge-candidate guard.
+    # If the customer already has ANOTHER active (new/open/pending/hold)
+    # ticket within the last 14 days, this new one is almost certainly a
+    # follow-up that a human will merge into the existing thread (cf.
+    # #103787 → merged into #103735). If the bot tags / adds notes /
+    # escalates, those writes land on a ticket that is about to disappear
+    # into the parent, confuse agents, and steal merge authorship from
+    # Volodymyr et al. — so we stay completely hands-off here: NO tags,
+    # NO internal notes, NO reply. Just the one-per-ticket Slack report
+    # emitted by the webhook handler, which now carries the sibling ids.
+    if email:
+        active_siblings = zendesk.find_active_tickets_for_email(
+            email, exclude_ticket_id=ticket_id, days=14,
+        )
+        if active_siblings:
+            sibling_ids = [str(t.get("id")) for t in active_siblings if t.get("id")]
+            sibling_subjects = [
+                (t.get("subject") or "")[:80] for t in active_siblings
+            ]
+            log.info(
+                f"[{ticket_id}] Not first ticket from {email} — "
+                f"{len(sibling_ids)} other active ticket(s) open: "
+                f"{', '.join('#' + s for s in sibling_ids)}. "
+                "Skipping bot action so humans can merge."
+            )
+            result["status"] = "skipped_merge_candidate"
+            result["intent"] = "MERGE_CANDIDATE"
+            result["active_siblings"] = sibling_ids
+            result["reason"] = (
+                f"Not the first ticket from {email}. Other active: "
+                + ", ".join(f"#{sid}" for sid in sibling_ids)
+                + ". Bot stayed hands-off — please merge manually."
+            )
+            if sibling_subjects:
+                result["sibling_subjects"] = sibling_subjects
+            log_result(result)
+            return result
 
     # 2d. Spam detection — if bot already replied 2+ times, stop and alert.
     # Tag guard prevents duplicate Slack alerts when Zendesk fires webhook twice
