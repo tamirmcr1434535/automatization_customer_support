@@ -331,12 +331,16 @@ slack = SlackClient(
     target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
     dry_run=DRY_RUN,  # In SHADOW_MODE: dry_run=True suppresses alerts inside _process
 )
-# Separate live Slack client for shadow reports only (used in webhook handler)
-_shadow_slack = SlackClient(
+# Always-live Slack client used exclusively for the per-ticket post-process
+# report emitted at the end of the webhook handler. It is live in BOTH
+# shadow and prod so operators can watch every ticket decision in real time
+# (the point of shadow is observation; we mirror that in prod during
+# rollout so issues are caught immediately).
+_report_slack = SlackClient(
     bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
     target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
-    dry_run=not SHADOW_MODE,  # Live only when SHADOW_MODE is on
-) if SHADOW_MODE else None
+    dry_run=False,
+)
 
 # ── FIX-A: Wire Slack alert callbacks for classifier + reply_generator ── #
 # A live Slack client specifically for API failure alerts (always live, not dry_run).
@@ -556,12 +560,17 @@ def zendesk_webhook(request):
     if result.get("status") in _NON_TERMINAL_STATUSES:
         _dedup_clear(ticket_id)
 
-    # ── Enrich + log (symmetric for shadow AND prod) ─────────────────── #
-    # Every ticket — whether _process ran to completion or exited early
-    # — gets classified if intent is missing, then logged once to BQ.
-    # Previously this only ran in shadow mode, which meant prod BQ rows
-    # for early-exit tickets lacked intent/confidence, making it impossible
-    # to compare shadow vs prod behaviour per-ticket.
+    # ── Enrich + log + Slack report (symmetric for shadow AND prod) ─── #
+    # Every ticket — whether _process ran to completion or exited early —
+    # gets classified if intent is missing, then logged once to BQ, and
+    # one Slack report per ticket is always emitted (shadow and prod).
+    #
+    # The per-ticket Slack report is intentionally always-on during the
+    # prod rollout so operators can watch every bot decision live. This
+    # mirrors the shadow-mode visibility we relied on before. It is
+    # independent of the per-decision escalation alerts (refund skip,
+    # wc_lookup_error, spam_detected) which continue to fire as before.
+    #
     # NOTE: NO Zendesk tag writes here — each add_tag triggers a new
     # webhook, which caused the infinite duplication loop.
     _SKIP_POST_PROCESS = {"skipped_already_handled", "skipped_merged"}
@@ -569,11 +578,11 @@ def zendesk_webhook(request):
         # 1. Enrich: classify tickets that hit early exits (before classifier)
         _enrich_result_if_missing(ticket_id, result)
 
-        # 2. Shadow-specific bookkeeping
-        if SHADOW_MODE:
-            shadow_tag = _shadow_tag_for_status(result.get("status", ""))
-            result["shadow_mode"] = True
-            result["shadow_decision"] = shadow_tag.replace("shadow_", "")
+        # 2. Always record the run mode on the result so BQ rows can be
+        # filtered by `shadow_mode` regardless of the branch that set them.
+        shadow_tag = _shadow_tag_for_status(result.get("status", ""))
+        result["shadow_mode"] = SHADOW_MODE
+        result["shadow_decision"] = shadow_tag.replace("shadow_", "")
 
         # 3. Log enriched result to BQ (authoritative entry, prod + shadow)
         try:
@@ -581,16 +590,16 @@ def zendesk_webhook(request):
         except Exception:
             log.exception(f"[{ticket_id}] BQ log failed")
 
-        # 4. Shadow: send ONE Slack report per ticket
-        if SHADOW_MODE:
-            try:
-                _shadow_slack.notify_shadow_result(
-                    ticket_id=ticket_id,
-                    result=result,
-                    zendesk_subdomain=ZENDESK_SUBDOMAIN,
-                )
-            except Exception:
-                log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
+        # 4. Send ONE Slack report per ticket (prod + shadow).
+        try:
+            _report_slack.notify_ticket_result(
+                ticket_id=ticket_id,
+                result=result,
+                zendesk_subdomain=ZENDESK_SUBDOMAIN,
+                shadow=SHADOW_MODE,
+            )
+        except Exception:
+            log.exception(f"[{ticket_id}] Failed to send per-ticket Slack report")
 
         # NOTE: no zendesk.add_tag here — tags trigger new webhooks!
 

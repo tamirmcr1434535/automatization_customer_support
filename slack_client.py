@@ -303,13 +303,21 @@ class SlackClient:
             log.error(f"Slack: error alert FAILED for ticket #{ticket_id}")
         return sent
 
-    def notify_shadow_result(
+    def notify_ticket_result(
         self,
         ticket_id: str,
         result: dict,
         zendesk_subdomain: str,
+        shadow: bool = False,
     ) -> bool:
-        """SHADOW_MODE: report what the bot WOULD do for a live ticket (no writes happened)."""
+        """Per-ticket post-process report, emitted once per ticket in
+        BOTH shadow and live (prod) modes.
+
+        `shadow=True`  → labels the report as SHADOW and uses "Would do"
+                         phrasing (the bot did not actually act).
+        `shadow=False` → labels the report as LIVE and uses "Did" phrasing
+                         (the bot's action already happened).
+        """
         ticket_url = (
             f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
         )
@@ -346,15 +354,23 @@ class SlackClient:
         reply = result.get("reply_text", "")
         reply_preview = (reply[:120] + "…") if len(reply) > 120 else reply
 
+        mode_label = "SHADOW" if shadow else "LIVE"
+        action_label = "Would do" if shadow else "Did"
+        header_title = (
+            f"{emoji} Shadow Mode — Ticket #{ticket_id}"
+            if shadow
+            else f"{emoji} Live — Ticket #{ticket_id}"
+        )
+
         text = (
-            f"{emoji} *SHADOW* | <{ticket_url}|#{ticket_id}> "
+            f"{emoji} *{mode_label}* | <{ticket_url}|#{ticket_id}> "
             f"| `{email}` | {intent} → {status}"
         )
         fields = [
             {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
             {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
             {"type": "mrkdwn", "text": f"*Intent:*\n{intent} ({conf_s})"},
-            {"type": "mrkdwn", "text": f"*Would do:*\n{status}"},
+            {"type": "mrkdwn", "text": f"*{action_label}:*\n{status}"},
             {"type": "mrkdwn", "text": f"*Language:*\n{lang}"},
             {"type": "mrkdwn", "text": f"*Source:*\n{source}"},
         ]
@@ -364,7 +380,7 @@ class SlackClient:
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"{emoji} Shadow Mode — Ticket #{ticket_id}"},
+                "text": {"type": "plain_text", "text": header_title},
             },
             {"type": "section", "fields": fields[:8]},  # Slack max 8 fields per section
         ]
@@ -382,9 +398,9 @@ class SlackClient:
 
         sent = self._post(text, blocks)
         if sent:
-            log.info(f"Slack: shadow report SENT for ticket #{ticket_id} → {status}")
+            log.info(f"Slack: {mode_label.lower()} report SENT for ticket #{ticket_id} → {status}")
         else:
-            log.error(f"Slack: shadow report FAILED for ticket #{ticket_id}")
+            log.error(f"Slack: {mode_label.lower()} report FAILED for ticket #{ticket_id}")
         return sent
 
     def notify_spam_detected(
