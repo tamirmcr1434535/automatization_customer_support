@@ -158,16 +158,28 @@ class SlackClient:
         self,
         ticket_id: str,
         email: str,
-        intent: str,
-        zendesk_subdomain: str,
+        zendesk_subdomain: str = "",
+        intent: str = "",
+        reason: str = "",
     ) -> bool:
-        """Alert: customer found but no active subscription — needs manual review."""
+        """Alert: ticket needs manual review.
+
+        Callers provide either `intent` (classified intent, e.g. DELETE_ACCOUNT)
+        or `reason` (free-form string). Either is fine; both render into the
+        Slack block. Keeping them both optional with defaults ensures
+        pre-existing callers that pass `reason=...` do not crash.
+        """
         ticket_url = (
             f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
+            if zendesk_subdomain else f"#{ticket_id}"
         )
+        intent_display = intent.replace('_', ' ').title() if intent else "—"
+        reason_display = reason or "Customer found but has no active subscription"
+        header_suffix = intent_display if intent else "manual review"
+
         text = (
             f"⚠️ *Manual Review Required* | Ticket <{ticket_url}|#{ticket_id}> "
-            f"| `{email}` | {intent.replace('_', ' ').title()}"
+            f"| `{email}` | {header_suffix}"
         )
         blocks = [
             {
@@ -179,8 +191,8 @@ class SlackClient:
                 "fields": [
                     {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
                     {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
-                    {"type": "mrkdwn", "text": f"*Intent:*\n{intent.replace('_', ' ').title()}"},
-                    {"type": "mrkdwn", "text": "*Reason:*\nCustomer found but has no active subscription"},
+                    {"type": "mrkdwn", "text": f"*Intent:*\n{intent_display}"},
+                    {"type": "mrkdwn", "text": f"*Reason:*\n{reason_display[:300]}"},
                 ],
             },
             {
@@ -200,51 +212,6 @@ class SlackClient:
             log.info(f"Slack: manual_review alert SENT for ticket #{ticket_id}")
         else:
             log.error(f"Slack: manual_review alert FAILED for ticket #{ticket_id}")
-        return sent
-
-    def notify_not_found(
-        self,
-        ticket_id: str,
-        email: str,
-        zendesk_subdomain: str,
-    ) -> bool:
-        """Alert: customer not found after all lookup attempts — ticket closed."""
-        ticket_url = (
-            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
-        )
-        text = (
-            f"❌ *Customer Not Found — Ticket Closed* | "
-            f"<{ticket_url}|#{ticket_id}> | `{email}`"
-        )
-        blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "❌ Customer Not Found — Ticket Closed"},
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
-                    {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
-                ],
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "Bot exhausted all lookup options (email → alt emails → card digits). "
-                        "Ticket closed automatically. May need manual follow-up."
-                    ),
-                },
-            },
-            {"type": "divider"},
-        ]
-        sent = self._post(text, blocks)
-        if sent:
-            log.info(f"Slack: not_found alert SENT for ticket #{ticket_id}")
-        else:
-            log.error(f"Slack: not_found alert FAILED for ticket #{ticket_id}")
         return sent
 
     def notify_refund_skip(
@@ -361,15 +328,16 @@ class SlackClient:
             "success": "✅",
             "manual_review_required": "⚠️",
             "escalated_delete_account": "🗑️",
+            "escalated_legacy_card_digits": "🗂️",
+            "wc_lookup_error": "🟠",
+            "escalated_not_found": "⛔",
             "skipped_refund_request": "💰",
-            "awaiting_card_digits": "💳",
             "skipped_not_handled": "⏭️",
             "escalated_low_confidence": "🔻",
             "skipped_followup": "↩️",
             "skipped_agent_already_replied": "🧑‍💼",
             "skipped_spam_detected": "🔁",
             "skipped_closed": "🔒",
-            "skipped_pending_awaiting_reply": "⏳",
             "error": "🔴",
         }
         emoji = emoji_map.get(status, "👁️")
@@ -417,104 +385,6 @@ class SlackClient:
             log.info(f"Slack: shadow report SENT for ticket #{ticket_id} → {status}")
         else:
             log.error(f"Slack: shadow report FAILED for ticket #{ticket_id}")
-        return sent
-
-    def notify_card_digits_asked(
-        self,
-        ticket_id: str,
-        email: str,
-        zendesk_subdomain: str,
-        is_retry: bool = False,
-    ) -> bool:
-        """Alert: bot asked customer for last 4 card digits (account not found by email)."""
-        ticket_url = (
-            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
-        )
-        step = "Retry — Asked Again" if is_retry else "First Ask"
-        text = (
-            f"💳 *Card Digits Requested ({step})* | "
-            f"Ticket <{ticket_url}|#{ticket_id}> | `{email}`"
-        )
-        blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"💳 Card Digits Requested — {step}"},
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
-                    {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
-                    {"type": "mrkdwn", "text": f"*Step:*\n{step}"},
-                ],
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "Customer not found by email. Bot asked for last 4 card digits. "
-                        "Ticket is pending — waiting for customer reply."
-                    ) if not is_retry else (
-                        "First card digit attempt failed. Bot asked customer to double-check "
-                        "and provide correct digits. Ticket is pending."
-                    ),
-                },
-            },
-            {"type": "divider"},
-        ]
-        sent = self._post(text, blocks)
-        if sent:
-            log.info(f"Slack: card_digits_asked ({step}) alert SENT for ticket #{ticket_id}")
-        else:
-            log.error(f"Slack: card_digits_asked ({step}) alert FAILED for ticket #{ticket_id}")
-        return sent
-
-    def notify_card_digits_timeout(
-        self,
-        ticket_id: str,
-        email: str,
-        days: int,
-        zendesk_subdomain: str,
-    ) -> bool:
-        """Alert: customer never replied with card digits — ticket closed after timeout."""
-        ticket_url = (
-            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
-        )
-        text = (
-            f"⏰ *Card Digits Timeout ({days}d) — Ticket Closed* | "
-            f"<{ticket_url}|#{ticket_id}> | `{email}`"
-        )
-        blocks = [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": f"⏰ Card Digits Timeout — Closed After {days} Days"},
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
-                    {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
-                    {"type": "mrkdwn", "text": f"*Waited:*\n{days} days"},
-                ],
-            },
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": (
-                        "Bot asked for last 4 card digits but customer never replied. "
-                        "Ticket was closed automatically. May need manual follow-up."
-                    ),
-                },
-            },
-            {"type": "divider"},
-        ]
-        sent = self._post(text, blocks)
-        if sent:
-            log.info(f"Slack: card_digits_timeout alert SENT for ticket #{ticket_id}")
-        else:
-            log.error(f"Slack: card_digits_timeout alert FAILED for ticket #{ticket_id}")
         return sent
 
     def notify_spam_detected(

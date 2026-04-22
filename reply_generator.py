@@ -74,54 +74,6 @@ def _master_sub_cancel() -> str:
         "additional assistance, please don't hesitate to contact us. We're happy to help!"
     )
 
-def _master_ask_digits() -> str:
-    return (
-        "Hello,\n\n"
-        "Thank you for your email. Currently, we cannot locate your account using the email "
-        "you are contacting us from. To assist us in resolving this matter promptly, could "
-        "you kindly provide the following details:\n"
-        "• The email address registered with your account (in case you used another email)\n"
-        "• If you used a Credit Card, the last 4 digits of the card\n"
-        "• If you used PayPal, the PayPal username associated with the payment\n"
-        "• The date and time of the transaction\n"
-        "• A screenshot of the receipt from your bank app or bank statement (if available)\n\n"
-        "Once we have this information, we will check the issue further and get back to you "
-        "as quickly as possible. Looking forward to your cooperation and reply."
-    )
-
-def _master_ask_digits_retry() -> str:
-    return (
-        "Hello,\n\n"
-        "Thank you for your email. Unfortunately, we were unable to locate an account matching "
-        "the card digits you provided. Could you kindly double-check and provide:\n"
-        "• The correct last 4 digits of the card used when signing up\n"
-        "• Or your registered email address if different from this ticket's email\n"
-        "• Or a screenshot of the receipt showing the charge\n\n"
-        "Please note that if we don't hear back within 2 days, this ticket will be "
-        "automatically closed."
-    )
-
-def _master_not_found() -> str:
-    return (
-        "Hello,\n\n"
-        "Thank you for your patience. Despite searching thoroughly using your email address "
-        "and the payment details you provided, we were unable to locate an active account "
-        "in our system.\n\n"
-        "If you believe you used a different email address or payment method when signing up, "
-        "please don't hesitate to contact us again with that information and we will be happy "
-        "to help. This ticket is now being closed."
-    )
-
-def _master_timeout() -> str:
-    return (
-        "Hello,\n\n"
-        "We haven't heard back from you with the information we requested to locate your "
-        "account. As a result, this ticket is being closed automatically.\n\n"
-        "If you still need assistance, please don't hesitate to open a new ticket or reply "
-        "here — we'll be happy to help."
-    )
-
-
 # ── Translation system prompt ──────────────────────────────────────────── #
 
 _TRANSLATE_SYSTEM = f"""You are a professional translator for {BRAND_NAME} customer support.
@@ -274,21 +226,3 @@ def generate_reply(intent: str, language: str, customer_name: str, cancel_result
     return _translate(master, language)
 
 
-def generate_ask_card_digits_reply(language: str, customer_name: str) -> str:
-    """First request: account not found — ask for payment details."""
-    return _translate(_master_ask_digits(), language)
-
-
-def generate_ask_card_digits_retry_reply(language: str, customer_name: str) -> str:
-    """Second request: provided digits didn't match — ask again."""
-    return _translate(_master_ask_digits_retry(), language)
-
-
-def generate_not_found_reply(language: str, customer_name: str) -> str:
-    """Final close: not found after all attempts."""
-    return _translate(_master_not_found(), language)
-
-
-def generate_timeout_reply(language: str, customer_name: str) -> str:
-    """Timeout close: customer didn't reply within AWAITING_CARD_DAYS days."""
-    return _translate(_master_timeout(), language)

@@ -1,27 +1,30 @@
 """
 Zendesk Cancellation Bot — Google Cloud Function (Gen 2)
 =========================================================
-Cancellation flow:
+Cancellation flow (TRIAL_CANCELLATION / SUB_CANCELLATION only):
  1. Check by Zendesk email → WooCommerce cancel
-    └─ Found → cancel in WC → done ✅
- 2. WC: not found / timeout / error
+    └─ Found → cancel in WC → reply confirming cancellation ✅
+ 2. WC: not found (clean miss, no lookup errors)
     → extract any emails mentioned in ticket body → try each one in WC
-    └─ Found by alt email → cancel in WC → done ✅
+    └─ Found by alt email → cancel in WC → reply ✅
  3. Still not found in WC → Stripe fallback by email
-    └─ Stripe found and cancelled → done ✅
- 4. Still not found → ask for last 4 card digits (tag: awaiting_card_digits)
-    └─ 7 days no reply → Zendesk Automation closes ticket
-    └─ Customer replied with last4:
-       ├─ Stripe: find email by last4 → WC: cancel with that email → done ✅
-       └─ Not found → ask for correct digits (tag: awaiting_card_digits_retry)
-          └─ 2 days no reply → Zendesk Automation closes ticket
-          └─ Customer replied:
-             ├─ Stripe: find email by last4 → WC: cancel with that email → done ✅
-             └─ Not found → close ticket
+    └─ Stripe found and cancelled → reply ✅
+ 4. Still not found anywhere → Slack escalation only (NO customer reply).
+ 5. WC lookup error (auth / timeout / 5xx) → Slack escalation only.
+ 6. All other intents (REFUND, UNKNOWN, DELETE_ACCOUNT, …) → bot does NOT touch
+    the ticket (tag + Slack at most; never a public reply).
 
-NOTE: WooCommerce is the primary cancellation target. Stripe is used as:
-      (a) email-based fallback when WC lookup fails (step 3)
-      (b) email-lookup tool via card last4 digits (step 4)
+Guarantee: the bot ONLY sends a public reply when a subscription was
+actually located and cancelled. Every error and every not-found path
+escalates silently to Slack so a human takes over.
+
+The legacy "ask for last 4 card digits" fallback has been retired —
+any ticket still carrying the old awaiting_card_digits* tags is now
+silently escalated to Slack instead of re-entering the card-digits
+loop.
+
+NOTE: WooCommerce is the primary cancellation target. Stripe is used as
+an email-based fallback when WC cannot find the subscription.
 
 FIX-C: Added API health check at startup; UNKNOWN escalation instead of skip;
        confidence gate before _finish_cancellation; validate_reply before sending.
@@ -41,10 +44,6 @@ from stripe_client import StripeClient
 from slack_client import SlackClient
 from reply_generator import (
     generate_reply,
-    generate_ask_card_digits_reply,
-    generate_ask_card_digits_retry_reply,
-    generate_not_found_reply,
-    generate_timeout_reply,
     validate_reply,
 )
 from bq_logger import log_result as _bq_log_result
@@ -108,14 +107,19 @@ if SHADOW_MODE:
     DRY_RUN   = True
     TEST_MODE = False
     logging.info("🔍 SHADOW_MODE enabled — processing all tickets, no writes, Slack reports ON")
-# How many days to wait for card/payment info before auto-closing the ticket.
-# Controlled via env var so it can be changed without a code deploy.
-AWAITING_CARD_DAYS = int(os.getenv("AWAITING_CARD_DAYS", "7"))
-
 HANDLED_INTENTS = {
     "TRIAL_CANCELLATION",
     "SUB_CANCELLATION",
 }
+
+# Tags set by the retired card-digits flow. A ticket carrying any of these
+# is an old-pipeline leftover — we escalate it to a human instead of
+# re-entering the flow, which would have sent a public reply to the customer.
+_LEGACY_CARD_DIGITS_TAGS = frozenset({
+    "awaiting_card_digits",
+    "awaiting_card_digits_retry",
+    "card_digits_timeout",
+})
 
 # Max order count for bot to handle. Subscriptions with >= this many orders
 # are renewals that require manual review (refund assessment, etc.).
@@ -288,8 +292,9 @@ def _webhook_dedup(ticket_id: str) -> bool:
 def _dedup_clear(ticket_id: str):
     """
     Remove dedup lock so future webhooks can re-process this ticket.
-    Called for non-terminal states (e.g., awaiting_card_digits) where
-    the ticket needs to be re-processed when the customer replies.
+    Called for non-terminal states where the bot intentionally deferred
+    (e.g. TEST_MODE skip, agent currently handling) and the next webhook
+    for the same ticket should get a fresh processing pass.
     """
     tid = str(ticket_id)
     with _dedup_lock:
@@ -543,10 +548,6 @@ def zendesk_webhook(request):
     # Terminal states (success, bot_handled, manual_review, error) keep
     # the lock as an extra anti-spam layer.
     _NON_TERMINAL_STATUSES = {
-        "awaiting_card_digits",             # legacy — old tickets still in pipeline
-        "awaiting_card_digits_retry",       # legacy
-        "skipped_pending_awaiting_reply",
-        "waiting_for_customer_reply",
         "skipped_no_test_tag",              # TEST_MODE skip — not a real processing
         "skipped_agent_already_replied",    # agent handling — might change
         # NOTE: "error" intentionally NOT here — clearing dedup on error
@@ -608,14 +609,11 @@ _SHADOW_STATUS_TO_TAG = {
     "skipped_not_handled":          "shadow_would_skip",
     "skipped_followup":             "shadow_would_skip",
     "skipped_closed":               "shadow_would_skip",
-    "awaiting_card_digits":         "shadow_would_ask_card",     # legacy
-    "awaiting_card_digits_retry":   "shadow_would_ask_card",     # legacy
     "escalated_not_found":          "shadow_would_escalate",
     "wc_lookup_error":              "shadow_would_escalate_wc_error",
+    "escalated_legacy_card_digits": "shadow_would_escalate_legacy",
     "skipped_agent_already_replied":"shadow_agent_handling",
     "skipped_spam_detected":        "shadow_spam",
-    "not_found_closed":             "shadow_would_escalate",
-    "closed_no_response":           "shadow_would_timeout",
     "error":                        "shadow_error",
 }
 
@@ -1112,27 +1110,24 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # ── LEGACY CARD DIGITS CLEANUP ──────────────────────────────────── #
-    # Card digits flow has been removed. If old tickets still have these
-    # tags from before the change, skip them silently (don't re-process).
-    # The timeout handler is kept so Zendesk Automation can still close
-    # stale tickets that were already in the card-digits pipeline.
-    if "card_digits_timeout" in tags:
-        return _handle_card_digits_timeout(ticket_id, name, language, result)
-
-    if "awaiting_card_digits_retry" in tags or "awaiting_card_digits" in tags:
-        if ticket_status == "pending":
+    # ── Legacy card-digits tickets — hard escalate, NO customer reply ──── #
+    # The old "ask for last 4 card digits" flow has been retired. Any ticket
+    # still carrying these tags is an old-pipeline leftover. We do NOT re-enter
+    # the card-digits loop (which could send a public reply); we tag the
+    # ticket for manual review and Slack-alert a human.
+    #
+    # Non-cancellation intents get silently skipped (no tags, no Slack) so
+    # unrelated re-openings of old tickets don't generate noise.
+    if any(t in _LEGACY_CARD_DIGITS_TAGS for t in tags):
+        if intent not in HANDLED_INTENTS:
             log.info(
-                f"[{ticket_id}] Legacy card-digits tag present, ticket pending "
-                "— skipping (waiting for customer or timeout automation)"
+                f"[{ticket_id}] Legacy card-digits tag + non-cancel intent "
+                f"({intent}) — silent skip"
             )
-            result["status"] = "skipped_pending_awaiting_reply"
+            result["status"] = "skipped_not_handled"
+            log_result(result)
             return result
-        # Customer replied to an old card-digits ask → try to process it
-        # using the legacy handler (honour promises already made to customers)
-        tag_is_retry = "awaiting_card_digits_retry" in tags
-        return _handle_card_digits(
-            ticket_id, email, name, language, result, is_retry=tag_is_retry
-        )
+        return _escalate_legacy_card_digits_ticket(ticket_id, email, tags, result)
 
     # ── NORMAL CANCELLATION FLOW ──────────────────────────────────────── #
 
@@ -1526,252 +1521,61 @@ def _process(ticket_id: str) -> dict:
 
 # ── Card digits handler ───────────────────────────────────────────────── #
 
-def _handle_card_digits(
+def _escalate_legacy_card_digits_ticket(
     ticket_id: str,
     email: str,
-    name: str,
-    language: str,
-    result: dict,
-    is_retry: bool,
-) -> dict:
-    """
-    Process customer's reply that should contain last 4 card digits.
-    is_retry=False → first attempt (came from awaiting_card_digits)
-    is_retry=True → second attempt (came from awaiting_card_digits_retry)
-    """
-    step = "retry" if is_retry else "first"
-    log.info(f"[{ticket_id}] Card lookup ({step}) — reading last customer comment")
-
-    last_comment = zendesk.get_last_customer_comment(ticket_id)
-    if not last_comment:
-        log.warning(f"[{ticket_id}] No customer comment found yet — waiting")
-        result["status"] = "waiting_for_customer_reply"
-        return result
-
-    # Extract 4 consecutive digits
-    match = re.search(r'\b(\d{4})\b', last_comment)
-    if not match:
-        log.info(f"[{ticket_id}] No 4-digit sequence in reply")
-        # Treat as if digits were wrong — ask again or close
-        return _digits_not_found(ticket_id, name, language, result, is_retry)
-
-    last4 = match.group(1)
-    log.info(f"[{ticket_id}] Extracted last4={last4} — looking up email in Stripe")
-
-    # Step 1: Use Stripe only to find the customer's email by card last4.
-    # Stripe is NOT used for cancellation — WooCommerce is always the cancel target.
-    email_from_stripe = stripe_cli.find_email_by_last4(last4)
-    if email_from_stripe:
-        email_from_stripe = _normalize_email(email_from_stripe)
-
-    if email_from_stripe:
-        log.info(
-            f"[{ticket_id}] Stripe found email {email_from_stripe!r} for card last4={last4} "
-            "— cancelling in WooCommerce"
-        )
-
-        # Step 2: Cancel in WooCommerce using the email we found via Stripe
-        woo_result = woo.cancel_subscription(email_from_stripe)
-        woo_status = woo_result.get("status", "")
-
-        if woo_status not in ("not_found", "no_active_sub", "timeout", "error"):
-            # ✅ WC found and cancelled (or dry_run / already_cancelled)
-            cancel_result = {**woo_result, "source": "stripe_last4_woocommerce"}
-            result["cancel_source"] = "stripe_last4_woocommerce"
-            result["email"] = email_from_stripe  # update to the email that worked
-
-            # Clean up card-lookup tags
-            zendesk.remove_tag(ticket_id, "awaiting_card_digits")
-            zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
-
-            # Resolve trial vs sub from actual WC data
-            final_intent = _resolve_intent(result.get("intent", "SUB_CANCELLATION"), cancel_result)
-            result["intent"] = final_intent
-
-            log.info(
-                f"[{ticket_id}] ✅ Found by card last4={last4} via Stripe → "
-                f"WC cancelled — intent={final_intent}"
-            )
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: primary email not found. "
-                f"Located subscription in WooCommerce via Stripe card lookup (last4={last4}). "
-                f"Email: {email_from_stripe}",
-            )
-            return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result
-            )
-
-        # Stripe found the email but WC still has no subscription for it → digits not found path
-        log.info(
-            f"[{ticket_id}] Stripe found email {email_from_stripe!r} but WC returned "
-            f"{woo_status!r} — treating as not found"
-        )
-
-    # ❌ Email not found in Stripe, or WC had nothing for that email
-    return _digits_not_found(ticket_id, name, language, result, is_retry)
-
-
-def _digits_not_found(
-    ticket_id: str,
-    name: str,
-    language: str,
-    result: dict,
-    is_retry: bool,
-) -> dict:
-    """Called when Stripe search by last4 found nothing."""
-
-    if not is_retry:
-        # First failure: ask for correct digits one more time (2-day window)
-        log.info(f"[{ticket_id}] Digits not found (first attempt) → asking for correct ones")
-
-        reply_text = generate_ask_card_digits_retry_reply(
-            language=language, customer_name=name
-        )
-
-        # FIX-A: Validate reply before sending to customer
-        is_valid, reason = validate_reply(reply_text, language)
-        if not is_valid:
-            log.error(f"[{ticket_id}] digits_retry reply failed validation ({reason})")
-            zendesk.add_tag(ticket_id, "bot_handled")
-            zendesk.add_tag(ticket_id, "needs_manual_review")
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: digits retry reply failed validation ({reason}). "
-                f"Please follow up with the customer manually.",
-            )
-            zendesk.set_open(ticket_id)
-            slack.notify_manual_review(
-                ticket_id=ticket_id, email=result.get("email", "unknown"),
-                reason=f"digits_retry reply validation failed: {reason}",
-            )
-            result["status"] = "manual_review_required"
-            result["validation_fail_reason"] = reason
-            log_result(result)
-            return result
-
-        # Tags BEFORE reply — same race-condition fix as in the initial ask:
-        # swap state first so any duplicate webhook call routes to the retry handler.
-        zendesk.remove_tag(ticket_id, "awaiting_card_digits")
-        zendesk.add_tag(ticket_id, "awaiting_card_digits_retry")
-        # Keep ticket Pending so trigger fires only on customer reply
-        zendesk.post_reply_and_set_pending(ticket_id, reply_text)
-        zendesk.add_internal_note(
-            ticket_id,
-            "🤖 Bot: card digits not found in Stripe. "
-            "Asked customer for correct digits. Waiting up to 2 days.",
-        )
-
-        # Slack alert: first digit attempt failed, asked again
-        slack_sent = slack.notify_card_digits_asked(
-            ticket_id=ticket_id, email=email,
-            zendesk_subdomain=ZENDESK_SUBDOMAIN, is_retry=True,
-        )
-
-        result.update({
-            "status": "awaiting_card_digits_retry",
-            "action": "asked_for_correct_digits",
-            "reply_text": reply_text,
-            "slack_sent": slack_sent,
-        })
-        log_result(result)
-        return result # ticket set to Pending — awaiting customer reply
-
-    else:
-        # Second failure: close ticket
-        log.info(f"[{ticket_id}] Digits not found (retry) → closing ticket")
-
-        reply_text = generate_not_found_reply(language=language, customer_name=name)
-
-        # FIX-A: Validate reply before sending to customer
-        is_valid, reason = validate_reply(reply_text, language)
-        if not is_valid:
-            log.error(f"[{ticket_id}] not_found reply failed validation ({reason})")
-            zendesk.add_tag(ticket_id, "bot_handled")
-            zendesk.add_tag(ticket_id, "needs_manual_review")
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: not_found reply failed validation ({reason}). "
-                f"Please close ticket manually.",
-            )
-            zendesk.set_open(ticket_id)
-            slack.notify_manual_review(
-                ticket_id=ticket_id, email=result.get("email", "unknown"),
-                reason=f"not_found reply validation failed: {reason}",
-            )
-            result["status"] = "manual_review_required"
-            result["validation_fail_reason"] = reason
-            log_result(result)
-            return result
-
-        zendesk.post_reply(ticket_id, reply_text)
-        zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
-        zendesk.add_tag(ticket_id, "not_found_closed")
-        zendesk.add_tag(ticket_id, "bot_handled")
-        zendesk.add_tag(ticket_id, "ai_bot_failed")
-        zendesk.solve_ticket(ticket_id)
-
-        # Slack alert so the team knows this customer slipped through
-        slack.notify_not_found(
-            ticket_id=ticket_id,
-            email=result.get("email", "unknown"),
-            zendesk_subdomain=ZENDESK_SUBDOMAIN,
-        )
-
-        result.update({
-            "status": "not_found_closed",
-            "action": "closed_not_relevant",
-            "reply_text": reply_text,
-        })
-        log.info(f"[{ticket_id}] ❌ Closed as not relevant after 2 failed attempts")
-        log_result(result)
-        return result
-
-
-# ── Card digits timeout ───────────────────────────────────────────────── #
-
-def _handle_card_digits_timeout(
-    ticket_id: str,
-    name: str,
-    language: str,
+    tags: list,
     result: dict,
 ) -> dict:
     """
-    Called by the Zendesk Automation after AWAITING_CARD_DAYS days of no reply.
-    The automation adds tag 'card_digits_timeout', which triggers this webhook call.
-    Sends a sorry-we-didn't-hear-from-you message and closes the ticket.
+    The card-digits flow has been retired. Any ticket still tagged with
+    `awaiting_card_digits`, `awaiting_card_digits_retry`, or
+    `card_digits_timeout` is an old-pipeline leftover.
+
+    We do NOT re-enter the old flow (which would send a public reply).
+    Instead we tag for manual review, strip the legacy tags so the ticket
+    does not re-loop through this path, and Slack-alert a human.
     """
-    log.info(
-        f"[{ticket_id}] No reply in {AWAITING_CARD_DAYS}d (card_digits_timeout) → closing"
+    matched = sorted(t for t in tags if t in _LEGACY_CARD_DIGITS_TAGS)
+    log.warning(
+        f"[{ticket_id}] Legacy card-digits ticket (tags={matched}) — "
+        "escalating to Slack, NO customer reply"
     )
 
-    reply_text = generate_timeout_reply(language=language, customer_name=name)
-    zendesk.post_reply(ticket_id, reply_text)
+    # Race condition guard: if a parallel webhook already escalated, skip.
+    current_tags = zendesk.get_ticket_tags(ticket_id)
+    if "bot_handled" in current_tags:
+        log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+        result["status"] = "skipped_race_condition"
+        return result
 
-    # Clean up all awaiting tags
-    zendesk.remove_tag(ticket_id, "awaiting_card_digits")
-    zendesk.remove_tag(ticket_id, "awaiting_card_digits_retry")
-    zendesk.remove_tag(ticket_id, "card_digits_timeout")
-    zendesk.add_tag(ticket_id, "closed_no_response")
     zendesk.add_tag(ticket_id, "bot_handled")
+    zendesk.add_tag(ticket_id, "needs_manual_review")
     zendesk.add_tag(ticket_id, "ai_bot_failed")
-    zendesk.solve_ticket(ticket_id)
+    zendesk.add_tag(ticket_id, "legacy_card_digits")
+    for t in _LEGACY_CARD_DIGITS_TAGS:
+        zendesk.remove_tag(ticket_id, t)
 
-    # Slack alert: customer never replied with card digits
-    slack_sent = slack.notify_card_digits_timeout(
+    zendesk.add_internal_note(
+        ticket_id,
+        f"🤖 Bot: legacy card-digits ticket (tags={matched}).\n"
+        "The card-digits flow has been retired. Bot did NOT reply to the "
+        "customer. Please locate the subscription manually and handle "
+        "this ticket.",
+    )
+    zendesk.set_open(ticket_id)
+    slack_sent = slack.notify_manual_review(
         ticket_id=ticket_id,
-        email=result.get("email", "unknown"),
-        days=AWAITING_CARD_DAYS,
+        email=email,
+        reason=f"Legacy card-digits ticket (tags={matched}) — manual review",
         zendesk_subdomain=ZENDESK_SUBDOMAIN,
     )
-
     result.update({
-        "status": "closed_no_response",
-        "action": f"timeout_closed_{AWAITING_CARD_DAYS}d",
-        "reply_text": reply_text,
+        "status": "escalated_legacy_card_digits",
+        "action": "slack_alerted_legacy_card_digits",
+        "legacy_tags": matched,
         "slack_sent": slack_sent,
     })
-    log.info(f"[{ticket_id}] ⏰ Closed — no response within {AWAITING_CARD_DAYS} days")
     log_result(result)
     return result
 
