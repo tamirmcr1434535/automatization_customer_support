@@ -89,6 +89,8 @@ Rules:
   • KR: formal 존댓말 (〜드립니다)
   • DE: formal Sie-form
   • FR: formal vous-form
+  • VI: polite Vietnamese (Kính gửi Quý khách, xin cảm ơn Quý khách)
+  • TH: formal Thai (ใช้คำว่า ท่าน, ขอบพระคุณ)
   • Other: match a formal customer support tone
 - Do NOT add any sign-off, signature, or "Best regards" — the email footer handles that
 - Output ONLY the translated text, nothing else"""
