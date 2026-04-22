@@ -563,3 +563,120 @@ class SlackClient:
         else:
             log.error(f"Slack: spam alert FAILED for ticket #{ticket_id}")
         return sent
+
+    def notify_wc_lookup_failed(
+        self,
+        ticket_id: str,
+        email: str,
+        error_kind: str,
+        error_detail: str,
+        error_step: str,
+        zendesk_subdomain: str,
+    ) -> bool:
+        """Alert: WooCommerce lookup failed (auth/timeout/api error) — the bot
+        could NOT determine whether the customer has a subscription.
+
+        The customer receives no reply; a human must take over.
+        """
+        ticket_url = (
+            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
+        )
+        human_kind = {
+            "auth_error":    "WC auth error (401/403)",
+            "timeout_error": "WC timeout",
+            "api_error":     "WC API error",
+        }.get(error_kind, error_kind)
+        text = (
+            f"⚠️ *WooCommerce lookup failed* | Ticket <{ticket_url}|#{ticket_id}> "
+            f"| `{human_kind}` | `{email}`"
+        )
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"⚠️ WooCommerce lookup failed — {human_kind}"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Ticket:*\n<{ticket_url}|#{ticket_id}>"},
+                    {"type": "mrkdwn", "text": f"*Email:*\n`{email}`"},
+                    {"type": "mrkdwn", "text": f"*Error:*\n`{error_kind}`"},
+                    {"type": "mrkdwn", "text": f"*Step:*\n`{error_step or '—'}`"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Detail:*\n```{(error_detail or '—')[:300]}```",
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Bot did NOT reply to the customer. "
+                        "Please locate the subscription manually and handle this ticket."
+                    ),
+                },
+            },
+            {"type": "divider"},
+        ]
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: WC lookup alert SENT for ticket #{ticket_id} ({error_kind})")
+        else:
+            log.error(f"Slack: WC lookup alert FAILED for ticket #{ticket_id}")
+        return sent
+
+    def notify_startup_failure(
+        self,
+        service: str,
+        error_kind: str,
+        error_detail: str,
+    ) -> bool:
+        """Alert: bot failed startup health check — deploy is broken, no tickets
+        will be processed until ops fixes credentials / connectivity.
+        """
+        text = (
+            f"🚨 *Startup health check FAILED* — `{service}` `{error_kind}`. "
+            "Bot is NOT processing tickets."
+        )
+        blocks = [
+            {
+                "type": "header",
+                "text": {"type": "plain_text", "text": f"🚨 Startup health check FAILED — {service}"},
+            },
+            {
+                "type": "section",
+                "fields": [
+                    {"type": "mrkdwn", "text": f"*Service:*\n`{service}`"},
+                    {"type": "mrkdwn", "text": f"*Error:*\n`{error_kind}`"},
+                ],
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Detail:*\n```{(error_detail or '—')[:400]}```",
+                },
+            },
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": (
+                        "Deploy is broken. Bot will exit and no tickets will be "
+                        "processed. Check credentials and redeploy."
+                    ),
+                },
+            },
+            {"type": "divider"},
+        ]
+        sent = self._post(text, blocks)
+        if sent:
+            log.info(f"Slack: startup failure alert SENT ({service}/{error_kind})")
+        else:
+            log.error(f"Slack: startup failure alert FAILED ({service}/{error_kind})")
+        return sent
