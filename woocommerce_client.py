@@ -39,6 +39,37 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("woocommerce")
 
+
+def _request_with_retry(method, url, *, max_retries=1, timeout, **kwargs):
+    """
+    HTTP request with automatic retry on timeout/network errors.
+    On retry, timeout is doubled to give the slow server more time.
+    Returns the response, or raises the last exception if all retries fail.
+    """
+    last_exc = None
+    for attempt in range(1 + max_retries):
+        current_timeout = timeout * (2 ** attempt)  # double on each retry
+        try:
+            resp = requests.request(
+                method, url, timeout=current_timeout, **kwargs
+            )
+            return resp
+        except requests.exceptions.Timeout as e:
+            last_exc = e
+            log.warning(
+                f"WC: request timed out ({current_timeout}s) → "
+                f"{'retrying' if attempt < max_retries else 'giving up'}: "
+                f"{method} {url}"
+            )
+        except requests.exceptions.RequestException as e:
+            last_exc = e
+            log.warning(
+                f"WC: request error → "
+                f"{'retrying' if attempt < max_retries else 'giving up'}: "
+                f"{method} {url}: {e}"
+            )
+    raise last_exc
+
 ACTIVE_STATUSES = {"active", "pending-cancel", "on-hold", "pending"}
 
 
@@ -67,7 +98,8 @@ class WooCommerceClient:
         Uses ?email= (fast, indexed). Tries ?role=all first; if the server
         rejects it (4xx), falls back to no role filter.
         If ?role=all returns 200 OK with empty results → email simply doesn't
-        exist, no point retrying without role.  Timeout: 15s (server can be slow).
+        exist, no point retrying without role.
+        Timeout: 30s base + 1 retry at 60s (server regularly takes 15-30s).
         """
         t0 = time.time()
         for i, params in enumerate([
@@ -75,11 +107,13 @@ class WooCommerceClient:
             {"email": email, "per_page": 1},
         ]):
             try:
-                resp = requests.get(
+                resp = _request_with_retry(
+                    "GET",
                     f"{self.base}/customers",
                     params=params,
                     auth=self.auth,
-                    timeout=15,
+                    timeout=30,
+                    max_retries=1,
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC customer lookup error for {email}: {e}")
@@ -207,12 +241,14 @@ class WooCommerceClient:
         return None
 
     def _get_subscription_by_id(self, subscription_id: int) -> dict | None:
-        """Direct single-subscription lookup by ID. Usually fast (~0.3s), 15s timeout."""
+        """Direct single-subscription lookup by ID. Usually fast (~0.3s), 20s timeout + retry."""
         try:
-            resp = requests.get(
+            resp = _request_with_retry(
+                "GET",
                 f"{self.base}/subscriptions/{subscription_id}",
                 auth=self.auth,
-                timeout=15,
+                timeout=20,
+                max_retries=1,
             )
         except requests.exceptions.RequestException as e:
             log.warning(f"WC: direct sub lookup error for #{subscription_id}: {e}")
@@ -242,7 +278,8 @@ class WooCommerceClient:
 
         for page in range(1, MAX_PAGES + 1):
             try:
-                resp = requests.get(
+                resp = _request_with_retry(
+                    "GET",
                     f"{self.base}/subscriptions",
                     params={
                         "billing_email": email,
@@ -251,6 +288,7 @@ class WooCommerceClient:
                     },
                     auth=self.auth,
                     timeout=TIMEOUT,
+                    max_retries=1,
                 )
             except requests.exceptions.Timeout:
                 log.warning(
@@ -539,11 +577,13 @@ class WooCommerceClient:
         if not customer:
             t1b = time.time()
             try:
-                resp = requests.get(
+                resp = _request_with_retry(
+                    "GET",
                     f"{self.base}/customers",
                     params={"search": email, "per_page": 5},
                     auth=self.auth,
                     timeout=30,
+                    max_retries=1,
                 )
                 if resp.ok:
                     data = resp.json()
@@ -607,13 +647,15 @@ class WooCommerceClient:
                 t2b = time.time()
                 try:
                     log.info(
-                        f"WC: trying ?customer={customer_id} (90s timeout)"
+                        f"WC: trying ?customer={customer_id} (90s timeout + retry)"
                     )
-                    resp = requests.get(
+                    resp = _request_with_retry(
+                        "GET",
                         f"{self.base}/subscriptions",
                         params={"customer": customer_id, "per_page": 10, "status": "any"},
                         auth=self.auth,
                         timeout=90,
+                        max_retries=1,
                     )
                     if resp.ok:
                         customer_subs = resp.json()
@@ -671,7 +713,8 @@ class WooCommerceClient:
                     f"trying ?search= last resort ({_SEARCH_TIMEOUT}s timeout, "
                     f"per_page={_SEARCH_PER_PAGE})"
                 )
-                resp = requests.get(
+                resp = _request_with_retry(
+                    "GET",
                     f"{self.base}/subscriptions",
                     params={
                         "search": email,
@@ -680,6 +723,7 @@ class WooCommerceClient:
                     },
                     auth=self.auth,
                     timeout=_SEARCH_TIMEOUT,
+                    max_retries=1,
                 )
                 if resp.ok:
                     search_subs = resp.json()
