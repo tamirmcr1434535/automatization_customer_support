@@ -314,6 +314,59 @@ class ZendeskClient:
         # Exclude the current ticket so we don't skip it on re-delivery
         return any(str(r.get("id")) != str(exclude_ticket_id) for r in results)
 
+    def find_active_tickets_for_email(
+        self,
+        email: str,
+        exclude_ticket_id: str = "",
+        days: int = 14,
+    ) -> list[dict]:
+        """
+        Return tickets from the same requester that are still ACTIVE
+        (status < solved, i.e. new / open / pending / hold) within the
+        last `days` days, excluding `exclude_ticket_id`.
+
+        Used by `_process` as a merge-candidate guard: if the customer
+        already has an active ticket, this new ticket is almost certainly
+        a follow-up that a human will merge. The bot must stay hands-off
+        so its tags / internal notes don't land on a ticket about to be
+        merged away (which confuses agents and wastes their time).
+
+        Always performs a real API call even in dry_run — read-only, safe.
+        Returns [] on any API error (fail-open: bot continues as normal).
+        """
+        if not email:
+            return []
+        from datetime import datetime, timezone, timedelta
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=days)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        query = (
+            f"type:ticket requester:{email} "
+            f"status<solved created>{cutoff}"
+        )
+        try:
+            resp = requests.get(
+                f"{self.base}/search.json",
+                params={"query": query, "per_page": 30},
+                auth=self.auth,
+                timeout=10,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(f"Merge-candidate search error for {email}: {e}")
+            return []
+
+        if not resp.ok:
+            log.warning(
+                f"Merge-candidate search failed for {email} "
+                f"({resp.status_code}) — fail-open"
+            )
+            return []
+
+        exclude = str(exclude_ticket_id)
+        results = resp.json().get("results", [])
+        return [t for t in results if str(t.get("id")) != exclude]
+
     def add_internal_note(self, ticket_id: str, note: str):
         if self.dry_run:
             log.info(f"[DRY] note → #{ticket_id}: {note[:80]}")
