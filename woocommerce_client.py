@@ -70,6 +70,59 @@ def _request_with_retry(method, url, *, max_retries=1, timeout, **kwargs):
             )
     raise last_exc
 
+
+def _error_kind_from_response(resp) -> tuple[str, str] | None:
+    """
+    Classify an HTTP response as an error, if it is one.
+
+    Returns (kind, detail) where kind is one of:
+      - "auth_error"    (401, 403)
+      - "api_error"     (>= 500 or other non-2xx)
+
+    Returns None for OK (2xx) responses.
+    """
+    if resp is None:
+        return None
+    if resp.ok:
+        return None
+    detail = f"{resp.status_code} {resp.reason or ''}".strip()
+    if resp.status_code in (401, 403):
+        return ("auth_error", detail)
+    if resp.status_code == 404:
+        return None  # treat 404 as "not found", not as an error
+    return ("api_error", detail)
+
+
+def _error_kind_from_exception(exc) -> tuple[str, str]:
+    """
+    Classify a requests exception.
+
+    Returns (kind, detail) where kind is one of:
+      - "timeout_error"  (requests.Timeout)
+      - "api_error"      (other RequestException / network)
+    """
+    if isinstance(exc, requests.exceptions.Timeout):
+        return ("timeout_error", f"timeout: {exc}"[:200])
+    return ("api_error", f"network: {exc}"[:200])
+
+
+def _worst_error_kind(errors: list[dict]) -> str | None:
+    """
+    Pick the most severe error kind from a list of lookup errors.
+
+    Priority: auth_error > timeout_error > api_error.
+    auth_error means credentials are broken — highest severity because the
+    bot cannot function at all until ops fixes it.
+    """
+    if not errors:
+        return None
+    kinds = {e.get("kind") for e in errors}
+    for k in ("auth_error", "timeout_error", "api_error"):
+        if k in kinds:
+            return k
+    return None
+
+
 ACTIVE_STATUSES = {"active", "pending-cancel", "on-hold", "pending"}
 
 
@@ -88,10 +141,45 @@ class WooCommerceClient:
             log.info("WooCommerceClient: DRY_RUN — no writes")
 
     # ================================================================== #
+    #  Health check — used at startup to fail fast on bad credentials     #
+    # ================================================================== #
+
+    def health_check(self) -> dict:
+        """
+        Quick connectivity + credentials check.
+
+        Makes a single GET /customers?per_page=1 call with a short timeout.
+        Returns a dict:
+          {"ok": True,  "status": "ok",            "detail": "200 OK"}
+          {"ok": False, "status": "auth_error",    "detail": "401 Unauthorized"}
+          {"ok": False, "status": "timeout_error", "detail": "timeout: ..."}
+          {"ok": False, "status": "api_error",     "detail": "500 ..." or "network: ..."}
+        """
+        try:
+            resp = requests.get(
+                f"{self.base}/customers",
+                params={"per_page": 1},
+                auth=self.auth,
+                timeout=30,
+            )
+        except requests.exceptions.Timeout as e:
+            return {"ok": False, "status": "timeout_error",
+                    "detail": f"timeout: {e}"[:200]}
+        except requests.exceptions.RequestException as e:
+            return {"ok": False, "status": "api_error",
+                    "detail": f"network: {e}"[:200]}
+
+        err = _error_kind_from_response(resp)
+        if err:
+            kind, detail = err
+            return {"ok": False, "status": kind, "detail": detail}
+        return {"ok": True, "status": "ok", "detail": f"{resp.status_code} {resp.reason or ''}".strip()}
+
+    # ================================================================== #
     #  READ — customer lookup                                            #
     # ================================================================== #
 
-    def get_customer_by_email(self, email: str) -> dict | None:
+    def get_customer_by_email(self, email: str, _errors: list | None = None) -> dict | None:
         """
         Return the first WooCommerce customer matching *email* (exact), or None.
 
@@ -117,15 +205,29 @@ class WooCommerceClient:
                 )
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC customer lookup error for {email}: {e}")
+                if _errors is not None:
+                    kind, detail = _error_kind_from_exception(e)
+                    _errors.append({"step": "customer_email", "kind": kind, "detail": detail})
                 continue
 
-            if resp.status_code == 401:
-                log.error("WooCommerce 401 Unauthorized — check consumer key/secret")
+            if resp.status_code == 401 or resp.status_code == 403:
+                log.error(f"WooCommerce {resp.status_code} Unauthorized — check consumer key/secret")
+                if _errors is not None:
+                    _errors.append({
+                        "step": "customer_email",
+                        "kind": "auth_error",
+                        "detail": f"{resp.status_code} {resp.reason or ''}".strip(),
+                    })
                 return None
             if resp.status_code == 404:
                 continue
             if not resp.ok:
                 log.warning(f"WC customer lookup {resp.status_code} for {email}")
+                if _errors is not None:
+                    err = _error_kind_from_response(resp)
+                    if err:
+                        kind, detail = err
+                        _errors.append({"step": "customer_email", "kind": kind, "detail": detail})
                 continue
 
             data = resp.json()
@@ -258,7 +360,7 @@ class WooCommerceClient:
             return None
         return resp.json()
 
-    def _find_subs_by_billing_email(self, email: str) -> list[dict]:
+    def _find_subs_by_billing_email(self, email: str, _errors: list | None = None) -> list[dict]:
         """
         Search subscriptions by ?billing_email= with pagination.
 
@@ -290,14 +392,20 @@ class WooCommerceClient:
                     timeout=TIMEOUT,
                     max_retries=1,
                 )
-            except requests.exceptions.Timeout:
+            except requests.exceptions.Timeout as e:
                 log.warning(
                     f"WC: billing_email page {page} timed out ({TIMEOUT}s) "
                     f"for {email}"
                 )
+                if _errors is not None:
+                    kind, detail = _error_kind_from_exception(e)
+                    _errors.append({"step": "billing_email", "kind": kind, "detail": detail})
                 break
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC: billing_email lookup error for {email}: {e}")
+                if _errors is not None:
+                    kind, detail = _error_kind_from_exception(e)
+                    _errors.append({"step": "billing_email", "kind": kind, "detail": detail})
                 break
 
             if not resp.ok:
@@ -305,6 +413,11 @@ class WooCommerceClient:
                     f"WC: billing_email lookup failed for {email}: "
                     f"{resp.status_code}"
                 )
+                if _errors is not None:
+                    err = _error_kind_from_response(resp)
+                    if err:
+                        kind, detail = err
+                        _errors.append({"step": "billing_email", "kind": kind, "detail": detail})
                 break
 
             data = resp.json()
@@ -548,6 +661,10 @@ class WooCommerceClient:
         """
         wc_start = time.time()
 
+        # Errors encountered during lookup — used at the end to distinguish
+        # "truly not found" from "not found because WC was broken".
+        errors: list[dict] = []
+
         base_result = {
             "email": email,
             "cancelled": False,
@@ -560,7 +677,7 @@ class WooCommerceClient:
         log.info(f"{'[DRY] ' if self.dry_run else ''}WC cancel_subscription START for email={email}")
 
         # ── Step 1: customer lookup (indexed, 15s timeout) ─────────────── #
-        customer = self.get_customer_by_email(email)
+        customer = self.get_customer_by_email(email, _errors=errors)
         step1_elapsed = time.time() - wc_start
         if customer:
             log.info(
@@ -611,10 +728,19 @@ class WooCommerceClient:
                                     f"WC: ?search= returned {len(data)} customers "
                                     f"for {email} but none matched exactly"
                                 )
-            except requests.exceptions.Timeout:
+                else:
+                    err = _error_kind_from_response(resp)
+                    if err:
+                        kind, detail = err
+                        errors.append({"step": "customer_search", "kind": kind, "detail": detail})
+            except requests.exceptions.Timeout as e:
                 log.warning(f"WC: customer ?search= timed out (30s) for {email}")
+                kind, detail = _error_kind_from_exception(e)
+                errors.append({"step": "customer_search", "kind": kind, "detail": detail})
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC: customer ?search= error for {email}: {e}")
+                kind, detail = _error_kind_from_exception(e)
+                errors.append({"step": "customer_search", "kind": kind, "detail": detail})
             log.info(f"WC TIMING: step1b customer?search= done in {time.time()-t1b:.1f}s")
 
         all_subs: list[dict] | None = None
@@ -676,12 +802,20 @@ class WooCommerceClient:
                             f"WC: ?customer={customer_id} failed: {resp.status_code} "
                             f"in {time.time()-t2b:.1f}s"
                         )
-                except requests.exceptions.Timeout:
+                        err = _error_kind_from_response(resp)
+                        if err:
+                            kind, detail = err
+                            errors.append({"step": "subs_by_customer", "kind": kind, "detail": detail})
+                except requests.exceptions.Timeout as e:
                     log.warning(
                         f"WC: ?customer={customer_id} TIMED OUT (90s) for {email}"
                     )
+                    kind, detail = _error_kind_from_exception(e)
+                    errors.append({"step": "subs_by_customer", "kind": kind, "detail": detail})
                 except requests.exceptions.RequestException as e:
                     log.warning(f"WC: ?customer={customer_id} error: {e}")
+                    kind, detail = _error_kind_from_exception(e)
+                    errors.append({"step": "subs_by_customer", "kind": kind, "detail": detail})
                 log.info(f"WC TIMING: step2b ?customer= done in {time.time()-t2b:.1f}s (total {time.time()-wc_start:.1f}s)")
 
         # ── Step 2c: /subscriptions?billing_email= (20s timeout) ─────── #
@@ -691,7 +825,7 @@ class WooCommerceClient:
         # ?billing_email= finds the subscription by its billing email.
         if not all_subs:
             t2c = time.time()
-            billing_subs = self._find_subs_by_billing_email(email)
+            billing_subs = self._find_subs_by_billing_email(email, _errors=errors)
             if billing_subs:
                 log.info(
                     f"WC: found {len(billing_subs)} sub(s) via billing_email "
@@ -754,17 +888,45 @@ class WooCommerceClient:
                         log.info(f"WC: ?search= returned 0 results for {email}")
                 else:
                     log.warning(f"WC: ?search= failed: {resp.status_code}")
-            except requests.exceptions.Timeout:
+                    err = _error_kind_from_response(resp)
+                    if err:
+                        kind, detail = err
+                        errors.append({"step": "subs_search", "kind": kind, "detail": detail})
+            except requests.exceptions.Timeout as e:
                 log.warning(
                     f"WC: ?search= TIMED OUT ({_SEARCH_TIMEOUT}s) for {email} "
                     "— falling through to Stripe fallback"
                 )
+                kind, detail = _error_kind_from_exception(e)
+                errors.append({"step": "subs_search", "kind": kind, "detail": detail})
             except requests.exceptions.RequestException as e:
                 log.warning(f"WC: ?search= error: {e}")
+                kind, detail = _error_kind_from_exception(e)
+                errors.append({"step": "subs_search", "kind": kind, "detail": detail})
             log.info(f"WC TIMING: step2d ?search= done in {time.time()-t2d:.1f}s (total {time.time()-wc_start:.1f}s)")
 
         if not all_subs:
             total = time.time() - wc_start
+
+            # If WC errored on any lookup step, distinguish between
+            # "truly not found" and "lookup failed — we don't actually know".
+            # This prevents the bot from escalating a real customer as if their
+            # email didn't exist when in fact WC was just broken.
+            worst = _worst_error_kind(errors)
+            if worst is not None:
+                first = next((e for e in errors if e.get("kind") == worst), errors[0])
+                log.error(
+                    f"WC RESULT: ERROR — {worst} during lookup for {email} "
+                    f"({len(errors)} error(s), first: {first}). total={total:.1f}s"
+                )
+                return {
+                    **base_result,
+                    "status": worst,  # auth_error | timeout_error | api_error
+                    "error_detail": first.get("detail", ""),
+                    "error_step": first.get("step", ""),
+                    "errors": errors,
+                }
+
             if customer:
                 log.warning(
                     f"WC RESULT: FAIL — customer found (id={customer['id']}) "

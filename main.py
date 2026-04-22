@@ -78,13 +78,21 @@ def _normalize_email(raw: str) -> str:
 
 def log_result(result: dict) -> None:
     """
-    Wrapper around bq_logger.log_result.
-    In SHADOW_MODE, skip logging inside _process — the webhook handler
-    will call _bq_log_result once with fully enriched data.
+    No-op.
+
+    BQ logging is centralized in the webhook handler, AFTER `_process`
+    returns and AFTER `_enrich_result_if_missing` fills in intent /
+    confidence / language for tickets that exited early (before the
+    classifier ran). This keeps BQ entries symmetric between shadow and
+    prod — every row has the same fields regardless of where `_process`
+    returned.
+
+    We keep `log_result(result)` calls at every terminal return inside
+    `_process` so the code still reads as "log then return", and so that
+    if the centralized logger ever needs per-path customization we have
+    the hooks in place.
     """
-    if SHADOW_MODE:
-        return  # shadow logging happens in webhook handler after enrichment
-    _bq_log_result(result)
+    return
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 log = logging.getLogger("bot")
@@ -339,6 +347,80 @@ _api_alert_sent: set[str] = set()
 _api_alert_lock = _threading.Lock()
 
 
+# ── Startup WooCommerce health check ─────────────────────────────────── #
+# Runs once on cold start. If WC credentials are broken (401/403), we
+# Slack-alert and exit hard — deploy becomes visibly broken so ops knows
+# immediately instead of every incoming ticket silently failing.
+# Timeouts / 5xx are logged but do NOT block startup (server is just slow).
+# Set SKIP_WC_HEALTHCHECK=true to bypass (useful for local tests).
+_WC_HEALTHCHECK_DONE = False
+
+def _run_wc_healthcheck_once() -> None:
+    global _WC_HEALTHCHECK_DONE
+    if _WC_HEALTHCHECK_DONE:
+        return
+    _WC_HEALTHCHECK_DONE = True
+
+    if os.getenv("SKIP_WC_HEALTHCHECK", "").lower() == "true":
+        log.info("WC health check: SKIP_WC_HEALTHCHECK=true — bypassed")
+        return
+
+    log.info("WC health check: GET /customers?per_page=1 ...")
+    hc = woo.health_check()
+    if hc.get("ok"):
+        log.info(f"WC health check: OK — {hc.get('detail')}")
+        return
+
+    kind = hc.get("status", "api_error")
+    detail = hc.get("detail", "")
+    if kind == "auth_error":
+        # Hard fail — credentials are broken. Alert and crash.
+        log.error(
+            f"WC health check: AUTH FAILED ({detail}) — bot cannot function. "
+            "Check WOO_CONSUMER_KEY / WOO_CONSUMER_SECRET / WOO_SITE_URL env vars."
+        )
+        try:
+            _alert_slack.notify_startup_failure(
+                service="WooCommerce",
+                error_kind=kind,
+                error_detail=(
+                    f"{detail}\n\n"
+                    f"site_url={os.getenv('WOO_SITE_URL', 'https://iqbooster.org')}"
+                ),
+            )
+        except Exception:
+            log.exception("WC health check: failed to send Slack alert")
+        # sys.exit here kills the Cloud Function cold-start. The platform
+        # will retry the next request on a fresh instance, but deploy logs
+        # make the failure loudly visible.
+        import sys as _sys
+        _sys.exit(1)
+    else:
+        # timeout / api_error — don't block startup, but record a warning
+        # and Slack-alert so ops knows WC is degraded.
+        log.warning(
+            f"WC health check: {kind} ({detail}) — WC is degraded but bot will "
+            "continue. Ticket lookups may return timeout_error / api_error."
+        )
+        try:
+            _alert_slack.notify_startup_failure(
+                service="WooCommerce",
+                error_kind=kind,
+                error_detail=f"{detail}\n\nBot continued startup (non-auth errors are not fatal).",
+            )
+        except Exception:
+            log.exception("WC health check: failed to send Slack alert (non-fatal)")
+
+
+# Run health check at import time (module load = cold start on Cloud Functions)
+try:
+    _run_wc_healthcheck_once()
+except SystemExit:
+    raise
+except Exception:
+    log.exception("WC health check: unexpected error (bot will continue)")
+
+
 def _send_api_failure_alert(error_msg: str):
     """
     FIX-A: Send a Slack alert when Claude API fails (classifier or reply_generator).
@@ -473,35 +555,41 @@ def zendesk_webhook(request):
     if result.get("status") in _NON_TERMINAL_STATUSES:
         _dedup_clear(ticket_id)
 
-    # ── SHADOW_MODE: enrich → log → Slack ────────────────────────────── #
-    # Every ticket gets full classification + detailed BQ log so we can
-    # review accuracy by querying: WHERE shadow_mode = TRUE
+    # ── Enrich + log (symmetric for shadow AND prod) ─────────────────── #
+    # Every ticket — whether _process ran to completion or exited early
+    # — gets classified if intent is missing, then logged once to BQ.
+    # Previously this only ran in shadow mode, which meant prod BQ rows
+    # for early-exit tickets lacked intent/confidence, making it impossible
+    # to compare shadow vs prod behaviour per-ticket.
     # NOTE: NO Zendesk tag writes here — each add_tag triggers a new
     # webhook, which caused the infinite duplication loop.
-    if SHADOW_MODE and result.get("status") not in (
-        "skipped_already_handled",
-        "skipped_merged",
-    ):
+    _SKIP_POST_PROCESS = {"skipped_already_handled", "skipped_merged"}
+    if result.get("status") not in _SKIP_POST_PROCESS:
         # 1. Enrich: classify tickets that hit early exits (before classifier)
-        _shadow_enrich_result(ticket_id, result)
+        _enrich_result_if_missing(ticket_id, result)
 
-        # 2. Add shadow-specific fields for BQ
-        shadow_tag = _shadow_tag_for_status(result.get("status", ""))
-        result["shadow_mode"] = True
-        result["shadow_decision"] = shadow_tag.replace("shadow_", "")
+        # 2. Shadow-specific bookkeeping
+        if SHADOW_MODE:
+            shadow_tag = _shadow_tag_for_status(result.get("status", ""))
+            result["shadow_mode"] = True
+            result["shadow_decision"] = shadow_tag.replace("shadow_", "")
 
-        # 3. Log enriched result to BQ (the authoritative shadow entry)
-        _bq_log_result(result)
-
-        # 4. Send ONE Slack report (via dedicated shadow Slack client)
+        # 3. Log enriched result to BQ (authoritative entry, prod + shadow)
         try:
-            _shadow_slack.notify_shadow_result(
-                ticket_id=ticket_id,
-                result=result,
-                zendesk_subdomain=ZENDESK_SUBDOMAIN,
-            )
+            _bq_log_result(result)
         except Exception:
-            log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
+            log.exception(f"[{ticket_id}] BQ log failed")
+
+        # 4. Shadow: send ONE Slack report per ticket
+        if SHADOW_MODE:
+            try:
+                _shadow_slack.notify_shadow_result(
+                    ticket_id=ticket_id,
+                    result=result,
+                    zendesk_subdomain=ZENDESK_SUBDOMAIN,
+                )
+            except Exception:
+                log.exception(f"[{ticket_id}] Failed to send shadow Slack report")
 
         # NOTE: no zendesk.add_tag here — tags trigger new webhooks!
 
@@ -523,6 +611,7 @@ _SHADOW_STATUS_TO_TAG = {
     "awaiting_card_digits":         "shadow_would_ask_card",     # legacy
     "awaiting_card_digits_retry":   "shadow_would_ask_card",     # legacy
     "escalated_not_found":          "shadow_would_escalate",
+    "wc_lookup_error":              "shadow_would_escalate_wc_error",
     "skipped_agent_already_replied":"shadow_agent_handling",
     "skipped_spam_detected":        "shadow_spam",
     "not_found_closed":             "shadow_would_escalate",
@@ -535,10 +624,17 @@ def _shadow_tag_for_status(status: str) -> str:
     return _SHADOW_STATUS_TO_TAG.get(status, "shadow_other")
 
 
-def _shadow_enrich_result(ticket_id: str, result: dict) -> None:
+def _enrich_result_if_missing(ticket_id: str, result: dict) -> None:
     """
-    SHADOW_MODE: if _process exited early (before classification), fetch the
-    ticket again and classify it so the BQ log has full data for every ticket.
+    If `_process` exited before the classifier ran (e.g. duplicate webhook,
+    follow-up, refund in subject, agent already replied), re-fetch the
+    ticket and classify it so the BQ log has intent / confidence / language
+    for every ticket.
+
+    Runs for BOTH shadow and prod — keeps BQ rows symmetric between the
+    two modes. Previously this only ran in shadow, which meant prod rows
+    for early-exit tickets lacked classification and could not be
+    compared against shadow rows for the same ticket.
     """
     if result.get("confidence") is not None:
         return  # already classified — nothing to enrich
@@ -1177,6 +1273,58 @@ def _process(ticket_id: str) -> dict:
         f"via {result['cancel_source']} | type={cancel_result.get('subscription_type')}"
     )
 
+    # 7-ERR. WooCommerce lookup errored out (auth / timeout / api_error).
+    # We CANNOT tell whether the customer has a subscription — do NOT reply
+    # to the customer and do NOT fall through to Stripe (which would hide
+    # the real cause). Escalate to Slack and stop.
+    if cancel_status == "wc_lookup_error":
+        error_kind   = cancel_result.get("error_kind", "api_error")
+        error_detail = cancel_result.get("error_detail", "")
+        error_step   = cancel_result.get("error_step", "")
+        log.error(
+            f"[{ticket_id}] WC lookup error ({error_kind} at {error_step}): "
+            f"{error_detail[:200]} — escalating to Slack, no customer reply"
+        )
+
+        # Race condition guard — another parallel webhook may have already escalated
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+            result["status"] = "skipped_race_condition"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_tag(ticket_id, f"wc_{error_kind}")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: WooCommerce lookup FAILED for {email}.\n"
+            f"Error: {error_kind} at step `{error_step}`\n"
+            f"Detail: {error_detail[:300]}\n\n"
+            "Bot did NOT reply to the customer. "
+            "Please locate the subscription manually and handle this ticket.",
+        )
+        zendesk.set_open(ticket_id)
+        slack_sent = slack.notify_wc_lookup_failed(
+            ticket_id=ticket_id,
+            email=email,
+            error_kind=error_kind,
+            error_detail=error_detail,
+            error_step=error_step,
+            zendesk_subdomain=ZENDESK_SUBDOMAIN,
+        )
+        result.update({
+            "status": "wc_lookup_error",
+            "action": "slack_alerted_wc_error",
+            "error_kind": error_kind,
+            "error_detail": error_detail[:300],
+            "error_step": error_step,
+            "slack_sent": slack_sent,
+        })
+        log_result(result)
+        return result
+
     # 7a. Customer found but no active subscription → try alt emails first, then Slack alert
     if cancel_status == "found_no_active_sub":
         found_in = cancel_result.get("found_in", "system")
@@ -1657,7 +1805,7 @@ def _try_alt_emails(
     for alt_email in alt_emails:
         alt_result = _cancel_by_email(alt_email, ticket_id)
         alt_status = alt_result.get("status", "")
-        if alt_status not in ("not_found_anywhere", "found_no_active_sub", "error"):
+        if alt_status not in ("not_found_anywhere", "found_no_active_sub", "error", "wc_lookup_error"):
             # ✅ Found by alternative email — cancel and close
             log.info(f"[{ticket_id}] ✅ Cancelled via alt email: {alt_email}")
             zendesk.add_internal_note(
@@ -1842,21 +1990,30 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     """
     WooCommerce-only cancellation by email.
 
-    Stripe is NOT used here — it is only used in the card-digits flow
-    (_handle_card_digits) to find an email by last4, then we come back to WC.
+    Stripe is NOT used here — it is only used as a fallback in the main
+    flow when WC returns `not_found` / `no_active_sub`.
 
     Returns one of:
-    - cancel result dict          — WC found and cancelled (or dry_run / already_cancelled)
-    - status="found_no_active_sub"— customer found in WC but no active subscription
-                                    → Slack alert / manual review
-    - status="not_found_anywhere" — not found or timeout / error in WC
-                                    → ask for last 4 card digits
+    - cancel result dict             — WC found and cancelled (or dry_run / already_cancelled)
+    - status="found_no_active_sub"   — customer found in WC but no active subscription
+                                       → Slack alert / manual review
+    - status="wc_lookup_error"       — WC lookup failed (auth/timeout/api error).
+                                       Bot CANNOT tell whether the sub exists.
+                                       Escalate to Slack immediately; no customer reply.
+    - status="not_found_anywhere"    — WC confirmed "no such email anywhere".
+                                       Fall through to Stripe fallback in caller.
     """
     woo_result = woo.cancel_subscription(email)
     woo_status = woo_result.get("status", "")
 
     # Successful WC outcome — return immediately
-    if woo_status not in ("not_found", "no_active_sub", "timeout", "error"):
+    _TERMINAL_MISS = {
+        "not_found", "no_active_sub",
+        "auth_error", "timeout_error", "api_error",
+        "timeout",  # legacy
+        "error",    # legacy
+    }
+    if woo_status not in _TERMINAL_MISS:
         return {**woo_result, "source": "woocommerce"}
 
     # Customer exists in WC but has no active subscription → manual review
@@ -1873,16 +2030,46 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "found_in": "WooCommerce",
         }
 
-    # not_found / timeout / error — ask customer for last 4 card digits
-    if woo_status == "timeout":
-        log.warning(
-            f"[{ticket_id}] WooCommerce timed out — asking customer for last 4 card digits"
+    # Typed WC errors (auth/timeout/api) — the bot does NOT know whether the
+    # customer has a subscription. Do NOT reply to the customer. Escalate
+    # immediately so a human can take over.
+    if woo_status in ("auth_error", "timeout_error", "api_error"):
+        log.error(
+            f"[{ticket_id}] WooCommerce {woo_status}: "
+            f"{woo_result.get('error_detail', '')[:200]} — escalating to Slack, "
+            "no customer reply"
         )
-    else:
-        log.info(
-            f"[{ticket_id}] WooCommerce: {woo_status} — asking customer for last 4 card digits"
-        )
+        return {
+            "status": "wc_lookup_error",
+            "email": email,
+            "cancelled": False,
+            "source": "woocommerce",
+            "error_kind": woo_status,
+            "error_detail": woo_result.get("error_detail", ""),
+            "error_step": woo_result.get("error_step", ""),
+        }
 
+    # Legacy timeout/error statuses — treat same as typed errors
+    if woo_status in ("timeout", "error"):
+        log.error(
+            f"[{ticket_id}] WooCommerce legacy {woo_status} status — "
+            "escalating as wc_lookup_error, no customer reply"
+        )
+        return {
+            "status": "wc_lookup_error",
+            "email": email,
+            "cancelled": False,
+            "source": "woocommerce",
+            "error_kind": "api_error",
+            "error_detail": f"legacy status: {woo_status}",
+            "error_step": "unknown",
+        }
+
+    # woo_status == "not_found" — WC said "no such email anywhere" cleanly
+    log.info(
+        f"[{ticket_id}] WooCommerce: not_found (no errors) — "
+        "falling through to Stripe fallback"
+    )
     return {
         "status": "not_found_anywhere",
         "email": email,
