@@ -177,12 +177,16 @@ ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 # Sub Cancellation). Escalations, errors, refunds, renewal reviews etc.
 # deliberately leave the field alone — a human will fill it in.
 #
-# To write the field via the API we need:
-#   - the custom field id (numeric; look it up in Zendesk Admin → Ticket Fields)
-#   - the field *tag* for the dropdown option the agent sees in the UI
-# Both are configured via env vars so we don't hard-code account-specific ids.
-# ZENDESK_TOPIC_FIELD_ID is REQUIRED; if unset, topic updates are no-ops.
-_ZENDESK_TOPIC_FIELD_ID = os.getenv("ZENDESK_TOPIC_FIELD_ID", "").strip()
+# The numeric field id and option tags for the iqbooster Zendesk are
+# baked in as defaults (confirmed via /api/v2/ticket_fields.json —
+# field_id=16656154392220, type=tagger, options include
+# "Trial Cancellation" → trial_cancellation and
+# "Sub Cancellation" → sub_cancellation). Env vars still override, so
+# a different Zendesk account can redirect to its own field without a
+# code change. Set ZENDESK_TOPIC_FIELD_ID="" explicitly to disable.
+_ZENDESK_TOPIC_FIELD_ID = os.getenv(
+    "ZENDESK_TOPIC_FIELD_ID", "16656154392220",
+).strip()
 
 _TOPIC_BY_INTENT: dict[str, str] = {
     "TRIAL_CANCELLATION": os.getenv(
