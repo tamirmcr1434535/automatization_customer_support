@@ -659,6 +659,7 @@ _SHADOW_STATUS_TO_TAG = {
     "manual_review_required":       "shadow_would_escalate",
     "escalated_low_confidence":     "shadow_would_escalate",
     "escalated_delete_account":     "shadow_would_escalate",
+    "escalated_explanation_question":"shadow_would_escalate",
     "skipped_refund_request":       "shadow_would_skip_refund",
     "escalated_unknown":            "shadow_would_escalate",     # FIX-C: new status
     "skipped_not_handled":          "shadow_would_skip",
@@ -1143,6 +1144,51 @@ def _process(ticket_id: str) -> dict:
             f"Refund keywords detected in body ({_refund_context}) — human must handle any refund"
         )
         zendesk.add_tag(ticket_id, "bot_handled")
+        log_result(result)
+        return result
+
+    # ── Explanation-question override ────────────────────────────────────── #
+    # Customer asks to cancel AND asks "what is this charge / payment?" —
+    # they don't recognise something they were charged (or nearly charged)
+    # for. Auto-cancelling is not enough: an agent must explain the charge
+    # before closing the ticket. Seen in real tickets like:
+    #   "I paid 199 yen — is it a subscription? If so, cancel it. Also
+    #    1990 yen was nearly debited, what is this?"
+    # The cancel part is clear, but "what is 1990 yen?" can't be answered
+    # by the bot.
+    if intent in HANDLED_INTENTS and _contains_explanation_question(_all_text_for_refund):
+        log.info(
+            f"[{ticket_id}] {intent}: customer asks explanation question about a "
+            f"charge → escalating to human (bot cannot identify the charge)"
+        )
+
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+            result["status"] = "skipped_race_condition"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: customer asks an explanation question about a charge "
+            f"(\"what is this?\" / \"что это?\" / \"これなに?\") alongside a "
+            f"{intent} request.\n\n"
+            f"Auto-cancelling would leave the customer's real question "
+            f"(\"what is this payment?\") unanswered. Please identify the "
+            f"charge(s) they are asking about and reply manually.",
+        )
+        zendesk.set_open(ticket_id)
+        result.update({
+            "status": "escalated_explanation_question",
+            "action": "escalated_to_agent_explanation_question",
+            "reason": (
+                "Customer asks 'what is this charge?' alongside cancel request — "
+                "a human must identify the charge before replying."
+            ),
+        })
         log_result(result)
         return result
 
@@ -2379,3 +2425,175 @@ def _contains_strong_refund_signal(text: str) -> bool:
         return True
 
     return False
+
+
+# ── Explanation question detection ─────────────────────────────────────── #
+#
+# Phrases customers use when they don't understand a charge and want someone
+# to explain it ("what is this?", "что это?", "これなに?"). When such a
+# question appears inside a TRIAL_CANCELLATION / SUB_CANCELLATION ticket,
+# the bot must NOT just auto-cancel and reply with a generic confirmation —
+# a human needs to explain the charge(s). The customer is asking about money
+# they don't recognise, and an auto-reply "your trial was cancelled" leaves
+# the real question unanswered.
+#
+# This is narrower than refund detection: the customer is not (yet) asking
+# for money back, just asking "what is this?". But the bot has no way to
+# answer that — only a human can identify the specific charge.
+_EXPLANATION_QUESTION_KEYWORDS = [
+    # Japanese — "what is this [charge/payment]?"
+    "これなに",          # what is this (casual)
+    "これ何",            # what is this
+    "これはなに",        # what is this (polite)
+    "これは何",          # what is this
+    "これって何",        # what is this (colloquial)
+    "これってなに",      # casual variant
+    "なんの料金",        # what fee
+    "何の料金",          # what fee
+    "なんの請求",        # what billing
+    "何の請求",          # what billing
+    "なんの引き落とし",  # what deduction
+    "何の引き落とし",    # what deduction
+    "なんの支払い",      # what payment
+    "何の支払い",        # what payment
+    "なんのお金",        # what money
+    "何のお金",          # what money
+    "なんの課金",        # what charge
+    "何の課金",          # what charge
+    # Ukrainian — "what is this?"
+    "що це таке",        # what is this (full phrase)
+    "що за",             # what kind of / what's with
+    # Russian — "what is this?"
+    "что это такое",     # what is this (full phrase)
+    "что это за",        # what kind of (this)
+    "что за ",           # what kind of (note trailing space to avoid false hits)
+    # English
+    "what is this charge",
+    "what is this payment",
+    "what is this fee",
+    "what is this for",
+    "what's this charge",
+    "what's this payment",
+    "what's this for",
+    "what are these charges",
+    "what are these payments",
+    "why am i being charged",
+    "why was i charged",
+    "why did you charge",
+    "why did i get charged",
+    # Korean
+    "이게 뭐",           # what is this
+    "이게뭐",            # no-space
+    "이건 뭐",           # what is this (variant)
+    "이건뭐",            # no-space
+    "이 결제는 뭐",      # what is this payment
+    "이 요금은 뭐",      # what is this fee
+    "이 돈은 뭐",        # what is this money
+    "이게 무슨",         # what kind of... is this
+    "무슨 돈",           # what money
+    "무슨 결제",         # what payment/charge
+    "무슨 요금",         # what fee
+    "왜 돈이",           # why is money [being taken]
+    # German
+    "was ist das für",          # what is this for
+    "was ist diese abbuchung",  # what is this debit
+    "was ist diese zahlung",    # what is this payment
+    "was soll diese abbuchung", # what is this debit meant to be
+    "was ist das für eine",     # what kind of [charge] is this
+    "wofür ist diese",          # what is this for
+    "wofür wurde",              # what was [I charged] for
+    "wofür bezahle ich",        # what am I paying for
+    "warum wurde ich",          # why was I [charged]
+    "warum habe ich bezahlt",   # why did I pay
+    "warum wurde mir",          # why was [money taken] from me
+    # Dutch
+    "wat is dit voor",          # what is this for
+    "wat is deze afschrijving", # what is this debit
+    "wat is deze betaling",     # what is this payment
+    "waar is deze betaling voor", # what is this payment for
+    "waarvoor is deze",         # what is this for
+    "waarvoor betaal ik",       # what am I paying for
+    "waarom ben ik",            # why am I
+    "waarom is er geld",        # why was money [taken]
+    # French
+    "qu'est-ce que c'est",      # what is it
+    "c'est quoi ce",            # what is this (charge)
+    "c'est quoi ça",            # what is that
+    "c'est pour quoi",          # what is this for
+    "pourquoi on m'a",          # why was I
+    "pourquoi j'ai été",        # why was I [charged]
+    "pourquoi ai-je été",       # polite variant
+    # Spanish
+    "qué es este cargo",        # what is this charge
+    "qué es este pago",         # what is this payment
+    "qué es este cobro",        # what is this charge (LATAM)
+    "qué es esto",              # what is this
+    "qué es eso",               # what is that
+    "por qué me cobraron",      # why was I charged
+    "por qué me cobran",        # why am I being charged
+    "por qué me han cobrado",   # why have I been charged (ES)
+    # Italian
+    "cos'è questo addebito",    # what is this charge
+    "cos'è questo pagamento",   # what is this payment
+    "cos'è questo",             # what is this
+    "che cos'è questo",         # polite variant
+    "perché mi avete addebitato", # why did you charge me
+    "perché sono stato addebitato", # why was I charged
+    # Portuguese
+    "o que é este",             # what is this
+    "o que é isso",             # what is this
+    "o que é essa cobrança",    # what is this charge
+    "por que fui cobrado",      # why was I charged (BR)
+    "porque fui cobrado",       # variant
+    "por que me cobraram",      # why did they charge me
+    # Chinese (ZH) — both simplified and traditional
+    "这是什么",                  # what is this (simplified)
+    "這是什麼",                  # what is this (traditional)
+    "这是什么费用",              # what is this fee
+    "這是什麼費用",              # what is this fee (traditional)
+    "什么扣款",                  # what is this deduction
+    "什麼扣款",                  # traditional
+    "为什么扣我",                # why was I charged
+    "為什麼扣我",                # traditional
+    "为什么收我",                # why charge me
+    "為什麼收我",                # traditional
+    "这笔是什么",                # what is this (amount)
+    "這筆是什麼",                # traditional
+    # Indonesian (ID)
+    "ini apa",                   # what is this
+    "apa ini",                   # what is this
+    "ini tagihan apa",           # what bill is this
+    "pembayaran apa ini",        # what payment is this
+    "kenapa saya dibayar",       # why was I charged (colloquial)
+    "kenapa saya ditagih",       # why was I billed
+    "mengapa saya ditagih",      # why was I billed (formal)
+    "biaya apa ini",             # what fee is this
+    # Vietnamese (VI)
+    "đây là gì",                 # what is this
+    "cái này là gì",             # what is this (colloquial)
+    "khoản này là gì",           # what amount is this
+    "phí gì",                    # what fee
+    "tại sao tôi bị",            # why was I [charged]
+    "vì sao tôi bị",             # why am I [being charged]
+    # Thai (TH)
+    "นี่คืออะไร",                # what is this
+    "อันนี้คืออะไร",             # what is this (colloquial)
+    "ค่าอะไร",                   # what fee
+    "ทำไมฉันถูก",                # why was I [charged]
+    "ทำไมฉันโดน",                # why did I get [charged]
+    "ทำไมถึงเก็บเงิน",           # why was money collected
+]
+
+
+def _contains_explanation_question(text: str) -> bool:
+    """
+    Return True if *text* contains a phrase asking "what is this charge?"
+    or "why was I charged?" — a request to explain a payment the customer
+    doesn't recognise.
+
+    Even when a ticket carries a cancel intent, the presence of such a
+    question means auto-cancelling is not enough: a human must explain
+    the unidentified charge before closing the ticket.
+    """
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _EXPLANATION_QUESTION_KEYWORDS)
