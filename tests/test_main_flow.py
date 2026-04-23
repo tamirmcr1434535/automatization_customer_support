@@ -101,6 +101,13 @@ def _setup_zd(mock_zd, ticket=None, agent_replied=False):
     mock_zd.get_ticket.return_value = ticket
     mock_zd.last_public_comment_is_from_agent.return_value = agent_replied
     mock_zd.get_all_customer_comments_text.return_value = ""
+    # No sibling tickets — avoid the merge-candidate guard kicking in
+    # and skipping every test with 'skipped_merge_candidate'.
+    mock_zd.find_active_tickets_for_email.return_value = []
+    # Spam-guard needs an int return, not a MagicMock.
+    mock_zd.count_bot_replies.return_value = 0
+    # Race-condition guards read current tags — return the ticket's own tags.
+    mock_zd.get_ticket_tags.return_value = list(ticket.get("tags", []))
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────── #
@@ -143,6 +150,52 @@ class TestProcess:
         assert result["status"] == "escalated_low_confidence"
         mock_zd.add_tag.assert_any_call("1003", "bot_low_confidence")
         mock_zd.add_internal_note.assert_called_once()
+
+    # D2. Cancellation + "what is this charge?" → escalate (bot can't explain)
+    #
+    # Real-case example: customer says "cancel my subscription, also what is
+    # this 1990 yen charge?" — the cancel part is clear, but the bot can't
+    # identify the unexplained charge. Must go to a human.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_explanation_question_escalated_jp(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約したい",
+            body=(
+                "199円払ったのですがこれはサブスクですか？もしそうなら解約してください。"
+                "あと一緒に1990円引き落とされそうになったんですけどこれなに?"
+            ),
+        ))
+        mock_zd.get_ticket_tags.return_value = ["automation_test"]
+        result = main._process("1010")
+        assert result["status"] == "escalated_explanation_question"
+        mock_zd.add_tag.assert_any_call("1010", "needs_manual_review")
+        mock_zd.set_open.assert_called_once_with("1010")
+        mock_zd.post_reply.assert_not_called()
+
+    # D3. Pure cancellation (no "what is this?" question) → still auto-cancels
+    # Guards against the escalation rule being too broad.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(language="JP"))
+    @patch.object(main, "zendesk")
+    def test_pure_cancellation_still_auto_cancels(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約について",
+            body=(
+                "結果を購入しましたが、もうキャンセルしたいです。"
+                "これ以上支払いをしないようにしたいので教えて下さい。"
+            ),
+        ))
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("1011")
+        assert result["status"] == "success"
 
     # E. WooCommerce handles trial
     @patch.object(main, "log_result")
