@@ -38,7 +38,7 @@ import logging
 import functions_framework
 
 from classifier import classify_ticket
-from zendesk_client import ZendeskClient
+from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
 from slack_client import SlackClient
@@ -585,6 +585,25 @@ def zendesk_webhook(request):
 
     try:
         result = _process(ticket_id)
+    except TicketNotWritableError as e:
+        # The ticket was merged or closed between the bot's initial fetch
+        # and a subsequent write (tag / note / reply / status change).
+        # This is a benign race — an agent merged the ticket out from
+        # under us. Skip cleanly instead of reporting "Exception: 422
+        # Client Error: Unprocessable Entity" in Slack.
+        log.info(
+            f"[{ticket_id}] Ticket was merged/closed mid-flight "
+            f"({e.method} {e.url} → 422) — skipping cleanly"
+        )
+        result = {
+            "ticket_id": ticket_id,
+            "status": "skipped_merged",
+            "reason": (
+                "Ticket was merged or closed by an agent between the "
+                "bot's initial fetch and a subsequent write — no action "
+                "needed from the bot."
+            ),
+        }
     except Exception as e:
         log.exception(f"[{ticket_id}] Unhandled error: {e}")
         # The per-ticket report below renders status=error + the exception

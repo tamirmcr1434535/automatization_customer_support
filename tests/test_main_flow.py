@@ -252,6 +252,39 @@ class TestProcess:
         assert result["status"] == "escalated_no_results_received"
         mock_zd.post_reply.assert_not_called()
 
+    # D6b. Ticket was merged mid-flight → webhook handler returns
+    # skipped_merged cleanly instead of surfacing a raw 422 as an error.
+    @patch.object(main, "log_result")
+    @patch.object(main, "_bq_log_result")
+    @patch.object(main, "_report_slack")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_merged_midflight_returns_skipped_merged(
+        self, mock_zd, mock_cls, mock_slack, mock_bq, mock_log
+    ):
+        from zendesk_client import TicketNotWritableError
+        _setup_zd(mock_zd)
+        # First write (add_tag) fails with 422 — ticket was merged just now.
+        mock_zd.add_tag.side_effect = TicketNotWritableError(
+            ticket_id="1016", method="POST",
+            url="https://wwiqtest.zendesk.com/api/v2/tickets/1016/tags.json",
+            detail="RecordInvalid: Ticket is closed",
+        )
+
+        fake_request = MagicMock()
+        fake_request.method = "POST"
+        fake_request.get_json.return_value = {"ticket_id": "1016"}
+
+        with patch.object(main, "_webhook_dedup", return_value=False):
+            body, status_code, _ = main.zendesk_webhook(fake_request)
+
+        import json as _json
+        payload = _json.loads(body)
+        assert status_code == 200
+        assert payload["status"] == "skipped_merged"
+        # Slack report must NOT fire for skipped_merged (in _SKIP_POST_PROCESS).
+        mock_slack.notify_ticket_result.assert_not_called()
+
     # D7. Successful cancel leaves an audit internal note on the ticket.
     @patch.object(main, "log_result")
     @patch.object(main, "validate_reply", return_value=(True, ""))
