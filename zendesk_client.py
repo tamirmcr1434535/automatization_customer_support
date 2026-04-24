@@ -8,6 +8,39 @@ log = logging.getLogger("zendesk")
 _MAX_RETRIES = 3
 _DEFAULT_RETRY_AFTER = 1  # seconds, if Retry-After header is missing
 
+# Write methods that mutate ticket state. A 422 on any of these almost
+# always means the ticket was merged / closed between our read and our
+# write — Zendesk rejects further mutations on a merged-away ticket with
+# 422 Unprocessable Entity.
+_WRITE_METHODS = {"POST", "PUT", "DELETE"}
+
+
+class TicketNotWritableError(Exception):
+    """
+    Raised when a write request (tag/note/reply/status) is rejected with
+    422 Unprocessable Entity. Almost always caused by a race: the ticket
+    was merged or closed by an agent (or a parallel workflow) between the
+    bot's initial fetch and the write. Caller should treat this as
+    "ticket disappeared under us" and skip cleanly rather than
+    surfacing it as a generic error.
+    """
+
+    def __init__(self, ticket_id: str, method: str, url: str, detail: str):
+        self.ticket_id = ticket_id
+        self.method = method
+        self.url = url
+        self.detail = detail
+        super().__init__(
+            f"Zendesk 422 on {method} {url} (ticket #{ticket_id}): {detail}"
+        )
+
+
+def _extract_ticket_id_from_url(url: str) -> str:
+    """Best-effort: pull the ticket id out of a /tickets/{id}/... URL."""
+    import re
+    m = re.search(r"/tickets/(\d+)", url)
+    return m.group(1) if m else ""
+
 
 class ZendeskClient:
     def __init__(self, subdomain, email, api_token, dry_run=True, shadow_mode=False):
@@ -38,6 +71,17 @@ class ZendeskClient:
             resp = requests.request(method, url, auth=self.auth, timeout=10, **kwargs)
 
             if resp.status_code != 429:
+                if resp.status_code == 422 and method.upper() in _WRITE_METHODS:
+                    # Ticket was merged/closed mid-flight — surface as a
+                    # typed exception so main.py can skip cleanly instead
+                    # of reporting a raw HTTPError to Slack.
+                    detail = (resp.text or "")[:300]
+                    raise TicketNotWritableError(
+                        ticket_id=_extract_ticket_id_from_url(url),
+                        method=method.upper(),
+                        url=url,
+                        detail=detail,
+                    )
                 if resp.status_code not in accept_statuses:
                     resp.raise_for_status()
                 return resp

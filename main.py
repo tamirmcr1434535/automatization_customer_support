@@ -38,7 +38,7 @@ import logging
 import functions_framework
 
 from classifier import classify_ticket
-from zendesk_client import ZendeskClient
+from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
 from slack_client import SlackClient
@@ -585,6 +585,25 @@ def zendesk_webhook(request):
 
     try:
         result = _process(ticket_id)
+    except TicketNotWritableError as e:
+        # The ticket was merged or closed between the bot's initial fetch
+        # and a subsequent write (tag / note / reply / status change).
+        # This is a benign race — an agent merged the ticket out from
+        # under us. Skip cleanly instead of reporting "Exception: 422
+        # Client Error: Unprocessable Entity" in Slack.
+        log.info(
+            f"[{ticket_id}] Ticket was merged/closed mid-flight "
+            f"({e.method} {e.url} → 422) — skipping cleanly"
+        )
+        result = {
+            "ticket_id": ticket_id,
+            "status": "skipped_merged",
+            "reason": (
+                "Ticket was merged or closed by an agent between the "
+                "bot's initial fetch and a subsequent write — no action "
+                "needed from the bot."
+            ),
+        }
     except Exception as e:
         log.exception(f"[{ticket_id}] Unhandled error: {e}")
         # The per-ticket report below renders status=error + the exception
@@ -619,7 +638,13 @@ def zendesk_webhook(request):
     #
     # NOTE: NO Zendesk tag writes here — each add_tag triggers a new
     # webhook, which caused the infinite duplication loop.
-    _SKIP_POST_PROCESS = {"skipped_already_handled", "skipped_merged"}
+    #
+    # `skipped_already_handled` stays silent — duplicate webhook, nothing
+    # new to report. `skipped_merged` used to be silent too, but operators
+    # asked for a visible card in Slack so they can see the bot recognised
+    # the merge (vs. it just vanishing from the stream), so it now runs
+    # the normal enrich + BQ + Slack path with the 🔀 emoji.
+    _SKIP_POST_PROCESS = {"skipped_already_handled"}
     if result.get("status") not in _SKIP_POST_PROCESS:
         # 1. Enrich: classify tickets that hit early exits (before classifier)
         _enrich_result_if_missing(ticket_id, result)
@@ -1466,29 +1491,34 @@ def _process(ticket_id: str) -> dict:
         if intent == "SUB_RENEWAL_CANCELLATION":
             zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
 
-        sub_info_note = ""
+        sub_info_human = ""
         if wc_sub_id is not None or wc_sub_type or wc_order_count is not None:
-            sub_info_note = (
-                "\nSubscription located before write failed: "
-                f"#{wc_sub_id} "
-                f"(type={wc_sub_type or 'unknown'}, "
-                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}).\n"
-                f"Bot-resolved intent: {intent}.\n"
+            sub_info_human = (
+                f"\n(Partial match before the error: subscription "
+                f"#{wc_sub_id}, type={wc_sub_type or 'unknown'}, "
+                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}.)"
             )
 
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: WooCommerce lookup FAILED for {email}.\n"
+            f"🤖 Bot did not find a subscription for this customer — this "
+            f"may simply mean the user does not have one. Please check "
+            f"manually.{sub_info_human}\n\n"
+            f"---\n"
+            f"For developer:\n"
+            f"WooCommerce lookup FAILED for {email}\n"
             f"Error: {error_kind} at step `{error_step}`\n"
-            f"Detail: {error_detail[:300]}\n"
-            f"{sub_info_note}\n"
-            "Bot did NOT reply to the customer. "
-            "Please locate the subscription manually and handle this ticket.",
+            f"Detail: {error_detail[:300]}",
         )
         zendesk.set_open(ticket_id)
         result.update({
             "status": "wc_lookup_error",
             "action": "slack_alerted_wc_error",
+            "reason": (
+                "Bot did not find a subscription for this customer — "
+                "this may simply mean the user does not have one. "
+                "Please check manually."
+            ),
             "error_kind": error_kind,
             "error_detail": error_detail[:300],
             "error_step": error_step,
@@ -1568,17 +1598,21 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: customer email ({email}) found in {found_in} but has NO active subscription. "
-            "Subscription may already be cancelled, or registered under a different email. "
-            "Please review and handle manually.",
+            f"🤖 Bot did not find a subscription for this customer — this "
+            f"may simply mean the user does not have one. Please check "
+            f"manually.\n\n"
+            f"---\n"
+            f"For developer:\n"
+            f"Customer email {email} found in {found_in}, no active subscription.",
         )
         zendesk.set_open(ticket_id)
         result.update({
             "status": "manual_review_required",
             "action": "slack_alerted_no_active_sub",
             "reason": (
-                f"Customer found in {found_in} but has NO active subscription. "
-                "Already cancelled, or registered under a different email/payment method."
+                "Bot did not find a subscription for this customer — "
+                "this may simply mean the user does not have one. "
+                "Please check manually."
             ),
         })
         log_result(result)
@@ -1661,16 +1695,23 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: customer email ({email}) not found in WooCommerce or Stripe. "
-            "Could not locate subscription. Please find and cancel manually.",
+            f"🤖 Bot did not find a subscription for this customer — this "
+            f"may simply mean the user does not have one. Please check "
+            f"manually.\n\n"
+            f"---\n"
+            f"For developer:\n"
+            f"Email {email} not found in WooCommerce or Stripe. "
+            f"All lookup paths exhausted (primary email, alt emails from ticket, "
+            f"Stripe fallback).",
         )
         zendesk.set_open(ticket_id)
         result.update({
             "status": "escalated_not_found",
             "action": "slack_alerted_not_found",
             "reason": (
-                f"Customer email ({email}) not found in WooCommerce or Stripe. "
-                "All lookup paths exhausted."
+                "Bot did not find a subscription for this customer — "
+                "this may simply mean the user does not have one. "
+                "Please check manually."
             ),
         })
         log_result(result)
