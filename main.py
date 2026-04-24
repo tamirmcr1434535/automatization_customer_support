@@ -1469,19 +1469,16 @@ def _process(ticket_id: str) -> dict:
         sub_info_human = ""
         if wc_sub_id is not None or wc_sub_type or wc_order_count is not None:
             sub_info_human = (
-                f"\nBot did partially find a subscription (#{wc_sub_id}, "
-                f"type={wc_sub_type or 'unknown'}, "
-                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}) "
-                f"before the error — you can start from there."
+                f"\n(Partial match before the error: subscription "
+                f"#{wc_sub_id}, type={wc_sub_type or 'unknown'}, "
+                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}.)"
             )
 
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot could not cancel this subscription automatically — "
-            f"the WooCommerce store did not respond correctly while the bot "
-            f"was looking up the customer's account.{sub_info_human}\n\n"
-            f"No reply was sent to the customer. Please locate the "
-            f"subscription manually and handle this ticket.\n\n"
+            f"🤖 Bot did not find a subscription for this customer — this "
+            f"may simply mean the user does not have one. Please check "
+            f"manually.{sub_info_human}\n\n"
             f"---\n"
             f"For developer:\n"
             f"WooCommerce lookup FAILED for {email}\n"
@@ -1571,11 +1568,9 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot found the customer's account but could not see any "
-            f"active subscription to cancel. The subscription may already "
-            f"have been cancelled, or the customer could have paid under a "
-            f"different email or payment method.\n\n"
-            f"Please review the account and handle this ticket manually.\n\n"
+            f"🤖 Bot did not find a subscription for this customer — this "
+            f"may simply mean the user does not have one. Please check "
+            f"manually.\n\n"
             f"---\n"
             f"For developer:\n"
             f"Customer email {email} found in {found_in}, no active subscription.",
@@ -1669,11 +1664,9 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot could not find a subscription for this customer in "
-            f"either WooCommerce or Stripe. The customer may have paid "
-            f"under a different email / payment method, or the subscription "
-            f"may have been cancelled before.\n\n"
-            f"Please find the subscription manually and handle this ticket.\n\n"
+            f"🤖 Bot did not find a subscription for this customer — this "
+            f"may simply mean the user does not have one. Please check "
+            f"manually.\n\n"
             f"---\n"
             f"For developer:\n"
             f"Email {email} not found in WooCommerce or Stripe. "
