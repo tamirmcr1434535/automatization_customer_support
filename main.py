@@ -660,6 +660,7 @@ _SHADOW_STATUS_TO_TAG = {
     "escalated_low_confidence":     "shadow_would_escalate",
     "escalated_delete_account":     "shadow_would_escalate",
     "escalated_explanation_question":"shadow_would_escalate",
+    "escalated_no_results_received":"shadow_would_escalate",
     "skipped_refund_request":       "shadow_would_skip_refund",
     "escalated_unknown":            "shadow_would_escalate",     # FIX-C: new status
     "skipped_not_handled":          "shadow_would_skip",
@@ -1187,6 +1188,48 @@ def _process(ticket_id: str) -> dict:
             "reason": (
                 "Customer asks 'what is this charge?' alongside cancel request — "
                 "a human must identify the charge before replying."
+            ),
+        })
+        log_result(result)
+        return result
+
+    # ── "No results received" override ──────────────────────────────────── #
+    # Customer says they haven't received their IQ test results / full
+    # report. Even when combined with "please cancel", the bot's generic
+    # cancellation reply leaves the missing-delivery complaint unanswered
+    # and often turns into a refund dispute later. Policy: any such
+    # phrasing → human must look at the account and explain/deliver
+    # before closing the ticket.
+    if intent in HANDLED_INTENTS and _contains_no_results_received_complaint(_all_text_for_refund):
+        log.info(
+            f"[{ticket_id}] {intent}: customer says they have not received "
+            f"their results → escalating to human (delivery complaint)"
+        )
+
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+            result["status"] = "skipped_race_condition"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: customer says they have not received their IQ test "
+            f"results / full report alongside a {intent} request.\n\n"
+            f"Auto-cancelling would ignore the missing-delivery complaint. "
+            f"Please check the account: was the result ever delivered, "
+            f"and reply to the customer manually before closing.",
+        )
+        zendesk.set_open(ticket_id)
+        result.update({
+            "status": "escalated_no_results_received",
+            "action": "escalated_to_agent_no_results_received",
+            "reason": (
+                "Customer says they have not received their results — "
+                "human must investigate delivery before replying."
             ),
         })
         log_result(result)
@@ -1896,6 +1939,27 @@ def _finish_cancellation(
     zendesk.add_tag(ticket_id, cancel_tag)
     zendesk.add_tag(ticket_id, "ai_bot_success")
     _set_topic_for_intent(ticket_id, intent)
+
+    # ── Audit note on success ────────────────────────────────────────── #
+    # Leave a trail on every auto-cancelled ticket so an agent reviewing
+    # it later can see at a glance what the bot did and why — same info
+    # the Slack report carries, persisted on the ticket itself. Added
+    # BEFORE solve so the note shows up on the closed ticket.
+    _confidence = result.get("confidence") or 0
+    _reasoning = result.get("reasoning") or "—"
+    _sub_id = cancel_result.get("subscription_id", "—")
+    _plan = cancel_result.get("plan") or "—"
+    _source = cancel_result.get("source") or result.get("cancel_source") or "—"
+    zendesk.add_internal_note(
+        ticket_id,
+        f"🤖 Bot auto-cancelled this ticket.\n"
+        f"Intent: {intent} (confidence: {_confidence:.0%})\n"
+        f"Language: {language}\n"
+        f"Source: {_source}\n"
+        f"Subscription: #{_sub_id} ({_plan})\n"
+        f"Reasoning: {_reasoning}",
+    )
+
     zendesk.solve_ticket(ticket_id)
 
     result.update({
@@ -2082,6 +2146,23 @@ _REFUND_KEYWORDS = [
     "詐欺", # fraud / scam
     "不正利用", # unauthorized / fraudulent use
     "無断で引き落とし", # "deducted without consent"
+    # Japanese — explicit "did not consent / did not agree" phrases.
+    # Real tickets: "フルレポート分1,990円は承諾しておりません" — customer
+    # accepted the small charge but refuses the larger one. Even when paired
+    # with a cancel verb, this is a charge dispute → human must handle.
+    "承諾しておりません",   # did not consent (polite keigo)
+    "承諾していません",     # did not consent
+    "承諾していない",       # did not consent (plain)
+    "承諾した覚えがない",   # don't recall consenting
+    "承諾した覚えはありません", # polite variant
+    "同意しておりません",   # did not agree (polite keigo)
+    "同意していません",     # did not agree
+    "同意していない",       # did not agree (plain)
+    "同意した覚えがない",   # don't recall agreeing
+    "同意した覚えはありません", # polite variant
+    "許可しておりません",   # did not authorize (polite)
+    "許可していません",     # did not authorize
+    "許可していない",       # did not authorize (plain)
     "知らない間に", # "without my knowledge" (charged)
     "登録した覚えがない", # "I don't recall signing up"
     "利用した覚えがない", # "I don't recall using it"
@@ -2319,6 +2400,15 @@ _STRONG_REFUND_SIGNALS = [
     "身に覚えの",           # I don't recognize this (charge)
     "身に覚えがない",       # variant
     "身に覚えがありません", # polite variant
+    # ── Japanese — explicit "did not consent / agree" phrases ──
+    "承諾しておりません",   # did not consent (polite keigo)
+    "承諾していません",     # did not consent
+    "承諾していない",       # did not consent (plain)
+    "同意しておりません",   # did not agree (polite keigo)
+    "同意していません",     # did not agree
+    "同意していない",       # did not agree (plain)
+    "許可しておりません",   # did not authorize (polite)
+    "許可していません",     # did not authorize
     # ── Japanese — unauthorized/auto-charge without consent ──
     "購読契約していないのに",  # "despite not having a subscription" + charged
     "契約していないのに",      # "despite not subscribing" (shorter)
@@ -2597,3 +2687,181 @@ def _contains_explanation_question(text: str) -> bool:
     """
     text_lower = text.lower()
     return any(kw in text_lower for kw in _EXPLANATION_QUESTION_KEYWORDS)
+
+
+# ── "No results received" detection ───────────────────────────────────── #
+#
+# Customers who say they haven't received their IQ test results / full
+# report — even when paired with "please cancel" — need a human to look
+# at the account. The bot's generic "your trial was cancelled" reply
+# ignores the missing-delivery complaint, and it may turn into a refund
+# dispute later. Policy: any "haven't received the result(s)" phrasing
+# on a cancellation ticket → escalate to human.
+_NO_RESULTS_RECEIVED_KEYWORDS = [
+    # ── Japanese ──
+    "結果を受け取っておらず",   # have not received the results (polite)
+    "結果を受け取っていない",   # have not received the results
+    "結果を受け取れていない",   # cannot/have not received the results
+    "結果を受け取れない",       # cannot receive the results
+    "結果を受け取ってない",     # colloquial
+    "結果をまだ受け取っていない", # still haven't received
+    "まだ結果を受け取って",      # still... receive results (partial, catches both negations)
+    "結果が届いていない",       # results haven't arrived
+    "結果が届いておりません",   # polite
+    "結果がまだ届いていない",   # still haven't arrived
+    "結果が届かない",           # results don't arrive
+    "結果をまだもらっていない", # still haven't got the results
+    "結果をもらっていない",     # haven't got the results
+    "結果を見ていない",         # haven't seen the results
+    "結果を見られない",         # cannot see the results
+    "結果が見られない",         # cannot see the results (variant)
+    "結果が見れない",           # cannot see (colloquial)
+    "結果を確認できていない",   # haven't been able to confirm the results
+    "結果を確認できない",       # cannot confirm the results
+    "結果が確認できない",       # cannot confirm the results (variant)
+    "レポートが届いていない",   # report hasn't arrived
+    "レポートを受け取っていない", # haven't received the report
+    "レポートをまだ受け取って", # still... receive report (partial)
+    "フルレポートが届かない",   # full report doesn't arrive
+    "フルレポートを受け取っていない", # haven't received full report
+    # ── English ──
+    "haven't received the results",
+    "haven't received the result",
+    "haven't received my results",
+    "haven't received results",
+    "have not received the results",
+    "have not received my results",
+    "have not received results",
+    "didn't receive the results",
+    "didn't receive results",
+    "didn't receive my results",
+    "did not receive the results",
+    "did not receive results",
+    "didn't get the results",
+    "didn't get my results",
+    "did not get the results",
+    "did not get my results",
+    "never received the results",
+    "never received my results",
+    "never got the results",
+    "no results yet",
+    "no results received",
+    "results not received",
+    "results haven't arrived",
+    "results have not arrived",
+    "results are not received",
+    "haven't received the report",
+    "haven't received my report",
+    "didn't receive the report",
+    "did not receive the report",
+    "never received the report",
+    "report not received",
+    "full report not received",
+    "haven't got my report",
+    # ── Ukrainian ──
+    "не отримав результат",     # haven't received result (masc)
+    "не отримала результат",    # haven't received result (fem)
+    "не отримав результати",    # plural
+    "не отримала результати",   # plural (fem)
+    "не отримав(ла) результат", # gendered form used in the real ticket
+    "результат не отрима",      # result not received (partial)
+    "результати не отрима",     # plural
+    "результатів не отрима",    # genitive plural
+    "не отримав звіт",          # haven't received report
+    "не отримала звіт",         # haven't received report (fem)
+    "не отримав(ла) звіт",      # gendered
+    "звіту не отрима",          # report not received (partial)
+    # ── Russian ──
+    "не получил результат",     # haven't received result (masc)
+    "не получила результат",    # haven't received result (fem)
+    "результат не получил",     # result not received
+    "результат не получен",     # result not received (passive)
+    "результаты не получил",    # haven't received results
+    "результаты не получен",    # results not received (passive)
+    "результатов не получил",   # genitive
+    "не получил отчет",         # haven't received report
+    "не получила отчет",        # fem variant
+    "отчет не получен",         # report not received
+    # ── Korean ──
+    "결과를 받지 못",            # didn't receive the results
+    "결과를 받지 않",            # didn't receive (variant)
+    "결과가 오지 않",            # results haven't come
+    "결과가 안 왔",              # results didn't come
+    "결과를 못 받",              # couldn't receive the results
+    "결과를 아직 못",            # still haven't [received] the results
+    "아직 결과를",               # still... results (partial)
+    "리포트를 받지 못",          # didn't receive report
+    "리포트가 오지 않",          # report hasn't arrived
+    # ── German ──
+    "keine ergebnisse erhalten",     # have not received any results
+    "ergebnisse nicht erhalten",     # results not received
+    "ergebnis nicht erhalten",       # result not received
+    "noch keine ergebnisse",         # still no results
+    "habe die ergebnisse nicht",     # I don't have the results
+    "bericht nicht erhalten",        # report not received
+    "noch keinen bericht",           # still no report
+    # ── French ──
+    "n'ai pas reçu les résultats",   # haven't received the results
+    "pas reçu les résultats",        # not received the results
+    "pas encore reçu les résultats", # not yet received the results
+    "n'ai pas reçu le rapport",      # haven't received the report
+    "pas reçu le rapport",           # not received the report
+    # ── Spanish ──
+    "no he recibido los resultados", # haven't received the results
+    "no recibí los resultados",      # didn't receive the results
+    "no recibí mis resultados",      # didn't receive my results
+    "no he recibido el resultado",   # haven't received the result
+    "no he recibido el informe",     # haven't received the report
+    "no recibí el informe",          # didn't receive the report
+    # ── Italian ──
+    "non ho ricevuto i risultati",   # haven't received the results
+    "non ho ricevuto il risultato",  # haven't received the result
+    "non ho ricevuto il report",     # haven't received the report
+    "non ho ricevuto il rapporto",   # alt report word
+    # ── Portuguese ──
+    "não recebi os resultados",      # didn't receive the results
+    "não recebi o resultado",        # didn't receive the result
+    "não recebi o relatório",        # didn't receive the report
+    "ainda não recebi os resultados", # still haven't received the results
+    # ── Dutch ──
+    "heb de resultaten niet ontvangen", # haven't received the results
+    "resultaten niet ontvangen",        # results not received
+    "nog geen resultaten",              # no results yet
+    "rapport niet ontvangen",           # report not received
+    # ── Chinese (simplified + traditional) ──
+    "还没收到结果",                    # haven't received the results yet
+    "還沒收到結果",                    # traditional
+    "没有收到结果",                    # didn't receive the results
+    "沒有收到結果",                    # traditional
+    "还未收到结果",                    # haven't received yet
+    "還未收到結果",                    # traditional
+    "没收到报告",                      # didn't receive report
+    "沒收到報告",                      # traditional
+    # ── Indonesian ──
+    "belum menerima hasil",          # haven't received the result
+    "tidak menerima hasil",          # didn't receive the result
+    "belum dapat hasil",             # haven't got the result
+    "belum terima hasil",            # haven't received (colloquial)
+    "belum menerima laporan",        # haven't received report
+    # ── Vietnamese ──
+    "chưa nhận được kết quả",        # haven't received the result
+    "không nhận được kết quả",       # didn't receive the result
+    "chưa nhận được báo cáo",        # haven't received report
+    # ── Thai ──
+    "ยังไม่ได้รับผล",                # haven't received result yet
+    "ไม่ได้รับผล",                   # didn't receive result
+    "ยังไม่ได้รับรายงาน",            # haven't received report yet
+]
+
+
+def _contains_no_results_received_complaint(text: str) -> bool:
+    """
+    Return True if *text* says the customer hasn't received their IQ test
+    results / full report.
+
+    Even when paired with a cancel verb, this is a delivery / product
+    complaint the bot can't resolve — someone has to look at the account
+    and see why the result was never delivered (or whether it actually was).
+    """
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _NO_RESULTS_RECEIVED_KEYWORDS)
