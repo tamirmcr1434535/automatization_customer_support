@@ -282,8 +282,13 @@ class TestProcess:
         payload = _json.loads(body)
         assert status_code == 200
         assert payload["status"] == "skipped_merged"
-        # Slack report must NOT fire for skipped_merged (in _SKIP_POST_PROCESS).
-        mock_slack.notify_ticket_result.assert_not_called()
+        # Slack card MUST fire for skipped_merged so operators can see the
+        # bot recognised the merge and skipped cleanly (rather than the
+        # ticket silently vanishing from the Slack stream).
+        mock_slack.notify_ticket_result.assert_called_once()
+        # And it must carry a human-readable reason, not the raw 422.
+        kwargs = mock_slack.notify_ticket_result.call_args.kwargs
+        assert "merged" in kwargs["result"].get("reason", "").lower()
 
     # D7. Successful cancel leaves an audit internal note on the ticket.
     @patch.object(main, "log_result")

@@ -638,7 +638,13 @@ def zendesk_webhook(request):
     #
     # NOTE: NO Zendesk tag writes here — each add_tag triggers a new
     # webhook, which caused the infinite duplication loop.
-    _SKIP_POST_PROCESS = {"skipped_already_handled", "skipped_merged"}
+    #
+    # `skipped_already_handled` stays silent — duplicate webhook, nothing
+    # new to report. `skipped_merged` used to be silent too, but operators
+    # asked for a visible card in Slack so they can see the bot recognised
+    # the merge (vs. it just vanishing from the stream), so it now runs
+    # the normal enrich + BQ + Slack path with the 🔀 emoji.
+    _SKIP_POST_PROCESS = {"skipped_already_handled"}
     if result.get("status") not in _SKIP_POST_PROCESS:
         # 1. Enrich: classify tickets that hit early exits (before classifier)
         _enrich_result_if_missing(ticket_id, result)

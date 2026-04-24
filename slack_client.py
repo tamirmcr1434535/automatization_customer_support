@@ -198,6 +198,7 @@ class SlackClient:
             "skipped_followup": "↩️",
             "skipped_agent_already_replied": "🧑‍💼",
             "skipped_merge_candidate": "🔗",
+            "skipped_merged": "🔀",
             "skipped_spam_detected": "🔁",
             "skipped_closed": "🔒",
             "error": "🔴",
