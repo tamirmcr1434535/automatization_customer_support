@@ -1508,6 +1508,11 @@ def _process(ticket_id: str) -> dict:
         result.update({
             "status": "wc_lookup_error",
             "action": "slack_alerted_wc_error",
+            "reason": (
+                "Bot did not find a subscription for this customer — "
+                "this may simply mean the user does not have one. "
+                "Please check manually."
+            ),
             "error_kind": error_kind,
             "error_detail": error_detail[:300],
             "error_step": error_step,
@@ -1599,8 +1604,9 @@ def _process(ticket_id: str) -> dict:
             "status": "manual_review_required",
             "action": "slack_alerted_no_active_sub",
             "reason": (
-                f"Customer found in {found_in} but has NO active subscription. "
-                "Already cancelled, or registered under a different email/payment method."
+                "Bot did not find a subscription for this customer — "
+                "this may simply mean the user does not have one. "
+                "Please check manually."
             ),
         })
         log_result(result)
@@ -1697,8 +1703,9 @@ def _process(ticket_id: str) -> dict:
             "status": "escalated_not_found",
             "action": "slack_alerted_not_found",
             "reason": (
-                f"Customer email ({email}) not found in WooCommerce or Stripe. "
-                "All lookup paths exhausted."
+                "Bot did not find a subscription for this customer — "
+                "this may simply mean the user does not have one. "
+                "Please check manually."
             ),
         })
         log_result(result)
