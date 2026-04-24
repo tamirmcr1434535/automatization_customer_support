@@ -1466,24 +1466,27 @@ def _process(ticket_id: str) -> dict:
         if intent == "SUB_RENEWAL_CANCELLATION":
             zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
 
-        sub_info_note = ""
+        sub_info_human = ""
         if wc_sub_id is not None or wc_sub_type or wc_order_count is not None:
-            sub_info_note = (
-                "\nSubscription located before write failed: "
-                f"#{wc_sub_id} "
-                f"(type={wc_sub_type or 'unknown'}, "
-                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}).\n"
-                f"Bot-resolved intent: {intent}.\n"
+            sub_info_human = (
+                f"\nBot did partially find a subscription (#{wc_sub_id}, "
+                f"type={wc_sub_type or 'unknown'}, "
+                f"orders={wc_order_count if wc_order_count is not None else 'unknown'}) "
+                f"before the error — you can start from there."
             )
 
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: WooCommerce lookup FAILED for {email}.\n"
+            f"🤖 Bot could not cancel this subscription automatically — "
+            f"the WooCommerce store did not respond correctly while the bot "
+            f"was looking up the customer's account.{sub_info_human}\n\n"
+            f"No reply was sent to the customer. Please locate the "
+            f"subscription manually and handle this ticket.\n\n"
+            f"---\n"
+            f"For developer:\n"
+            f"WooCommerce lookup FAILED for {email}\n"
             f"Error: {error_kind} at step `{error_step}`\n"
-            f"Detail: {error_detail[:300]}\n"
-            f"{sub_info_note}\n"
-            "Bot did NOT reply to the customer. "
-            "Please locate the subscription manually and handle this ticket.",
+            f"Detail: {error_detail[:300]}",
         )
         zendesk.set_open(ticket_id)
         result.update({
@@ -1568,9 +1571,14 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: customer email ({email}) found in {found_in} but has NO active subscription. "
-            "Subscription may already be cancelled, or registered under a different email. "
-            "Please review and handle manually.",
+            f"🤖 Bot found the customer's account but could not see any "
+            f"active subscription to cancel. The subscription may already "
+            f"have been cancelled, or the customer could have paid under a "
+            f"different email or payment method.\n\n"
+            f"Please review the account and handle this ticket manually.\n\n"
+            f"---\n"
+            f"For developer:\n"
+            f"Customer email {email} found in {found_in}, no active subscription.",
         )
         zendesk.set_open(ticket_id)
         result.update({
@@ -1661,8 +1669,16 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "ai_bot_failed")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: customer email ({email}) not found in WooCommerce or Stripe. "
-            "Could not locate subscription. Please find and cancel manually.",
+            f"🤖 Bot could not find a subscription for this customer in "
+            f"either WooCommerce or Stripe. The customer may have paid "
+            f"under a different email / payment method, or the subscription "
+            f"may have been cancelled before.\n\n"
+            f"Please find the subscription manually and handle this ticket.\n\n"
+            f"---\n"
+            f"For developer:\n"
+            f"Email {email} not found in WooCommerce or Stripe. "
+            f"All lookup paths exhausted (primary email, alt emails from ticket, "
+            f"Stripe fallback).",
         )
         zendesk.set_open(ticket_id)
         result.update({
