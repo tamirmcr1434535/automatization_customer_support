@@ -188,6 +188,7 @@ class SlackClient:
             "manual_review_required": "⚠️",
             "escalated_delete_account": "🗑️",
             "escalated_explanation_question": "❓",
+            "escalated_no_results_received": "📭",
             "escalated_legacy_card_digits": "🗂️",
             "wc_lookup_error": "🟠",
             "escalated_not_found": "⛔",

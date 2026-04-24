@@ -197,6 +197,82 @@ class TestProcess:
         result = main._process("1011")
         assert result["status"] == "success"
 
+    # D4. "I haven't received results" alongside cancel → escalate (JP)
+    # Real ticket shape: customer paid for the IQ test, didn't get results,
+    # asks to cancel. Bot can't know whether delivery actually failed.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_no_results_received_escalated_jp(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約したい",
+            body=(
+                "まだ結果を受け取っておらず、決済も完了しておりませんので、"
+                "キャンセルしてください"
+            ),
+        ))
+        result = main._process("1012")
+        assert result["status"] == "escalated_no_results_received"
+        mock_zd.add_tag.assert_any_call("1012", "needs_manual_review")
+        mock_zd.set_open.assert_called_once_with("1012")
+        mock_zd.post_reply.assert_not_called()
+
+    # D5. "I did not consent to the charge" → refund keyword override
+    # Real ticket: customer paid small charge voluntarily but refuses a
+    # larger charge with "承諾しておりません" (did not consent). Must go
+    # to a human as a refund/dispute ticket, not auto-cancel.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_did_not_consent_routed_to_refund(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約したい",
+            body=(
+                "IQテスト結果の199円は自らの意思でお支払いしましたが、"
+                "フルレポート分1,990円は承諾しておりません"
+            ),
+        ))
+        result = main._process("1013")
+        assert result["status"] == "skipped_refund_request"
+        mock_zd.post_reply.assert_not_called()
+
+    # D6. Ukrainian "я не отримав результат" → escalate
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification(language="UK"))
+    @patch.object(main, "zendesk")
+    def test_no_results_received_escalated_uk(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Скасуйте підписку",
+            body=(
+                "Я ще не отримав(ла) результат і оплата також не була "
+                "завершена, тому, будь ласка, скасуйте це."
+            ),
+        ))
+        result = main._process("1014")
+        assert result["status"] == "escalated_no_results_received"
+        mock_zd.post_reply.assert_not_called()
+
+    # D7. Successful cancel leaves an audit internal note on the ticket.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_success_posts_audit_internal_note(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd)
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("1015")
+        assert result["status"] == "success"
+        # An internal note must be posted even on the success path.
+        mock_zd.add_internal_note.assert_called_once()
+        args, _ = mock_zd.add_internal_note.call_args
+        note = args[1]
+        assert "Bot auto-cancelled" in note
+        assert "TRIAL_CANCELLATION" in note
+
     # E. WooCommerce handles trial
     @patch.object(main, "log_result")
     @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
