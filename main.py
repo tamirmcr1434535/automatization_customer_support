@@ -1078,18 +1078,24 @@ def _process(ticket_id: str) -> dict:
         has_delete = any(kw in full_text_lower for kw in _DELETE_ACCOUNT_KEYWORD_FALLBACK)
         has_refund = any(kw in full_text_lower for kw in _REFUND_KEYWORD_FALLBACK)
 
-        if has_cancel:
+        # ORDER MATTERS: refund > delete-account > cancel.
+        # Refund and delete-account both end in human escalation, while
+        # cancel auto-handles. Phrases like "계정 탈퇴 해주세요" contain the
+        # bare cancel signal "탈퇴" but the customer's actual intent is
+        # account deletion — must NOT auto-cancel + reply. Same for any
+        # ticket that mixes a refund word with a cancel word.
+        if has_refund:
             log.info(
-                f"[{ticket_id}] Classifier returned UNKNOWN but cancel signal found "
-                "→ overriding to TRIAL_CANCELLATION (safety net)"
+                f"[{ticket_id}] Classifier returned UNKNOWN but refund signal found "
+                "→ overriding to REFUND_REQUEST (safety net)"
             )
-            intent = "TRIAL_CANCELLATION"
+            intent = "REFUND_REQUEST"
             classification["intent"] = intent
             classification["reasoning"] = (
                 f"classifier fallback: UNKNOWN overridden — "
-                f"cancel keyword detected in body"
+                f"refund keyword detected in body"
             )
-        elif has_delete and not has_refund:
+        elif has_delete:
             log.info(
                 f"[{ticket_id}] Classifier returned UNKNOWN but delete-account signal found "
                 "→ overriding to DELETE_ACCOUNT (safety net)"
@@ -1100,16 +1106,16 @@ def _process(ticket_id: str) -> dict:
                 f"classifier fallback: UNKNOWN overridden — "
                 f"delete-account keyword detected in body"
             )
-        elif has_refund:
+        elif has_cancel:
             log.info(
-                f"[{ticket_id}] Classifier returned UNKNOWN but refund signal found "
-                "→ overriding to REFUND_REQUEST (safety net)"
+                f"[{ticket_id}] Classifier returned UNKNOWN but cancel signal found "
+                "→ overriding to TRIAL_CANCELLATION (safety net)"
             )
-            intent = "REFUND_REQUEST"
+            intent = "TRIAL_CANCELLATION"
             classification["intent"] = intent
             classification["reasoning"] = (
                 f"classifier fallback: UNKNOWN overridden — "
-                f"refund keyword detected in body"
+                f"cancel keyword detected in body"
             )
         elif email:
             # No signals in body — check sibling/merged tickets from same requester.
