@@ -102,6 +102,15 @@ DRY_RUN            = os.getenv("DRY_RUN", "true").lower() == "true"
 TEST_MODE          = os.getenv("TEST_MODE", "true").lower() == "true"
 TEST_TAG           = "automation_test"
 
+# When the merge-candidate guard finds an active sibling ticket from the
+# same requester, pause this many seconds before deciding what to do.
+# The pause gives the Zendesk-side merger time to fold this ticket into
+# the sibling thread; we then re-fetch and let the "merge" tag / closed
+# status short-circuit the skip path. Tickets WITHOUT siblings are not
+# delayed, so the typical single-ticket flow stays as fast as before.
+# Set to 0 to disable.
+MERGE_DELAY_SECONDS = int(os.getenv("MERGE_DELAY_SECONDS", "30"))
+
 # SHADOW_MODE: process ALL tickets, skip ALL writes, send Slack report per ticket.
 # Overrides: DRY_RUN=true (no writes), TEST_MODE=false (all tickets), Slack stays live.
 if SHADOW_MODE:
@@ -902,10 +911,46 @@ def _process(ticket_id: str) -> dict:
     # Volodymyr et al. — so we stay completely hands-off here: NO tags,
     # NO internal notes, NO reply. Just the one-per-ticket Slack report
     # emitted by the webhook handler, which now carries the sibling ids.
+    #
+    # When siblings exist we also pause MERGE_DELAY_SECONDS to let the
+    # Zendesk-side merger fold this ticket into the sibling thread, then
+    # re-fetch — if the merger acted, "merge" tag / closed status takes
+    # over and we report skipped_merged instead of skipped_merge_candidate.
     if email:
         active_siblings = zendesk.find_active_tickets_for_email(
             email, exclude_ticket_id=ticket_id, days=14,
         )
+
+        if active_siblings and MERGE_DELAY_SECONDS > 0:
+            sibling_ids_pre = [str(t.get("id")) for t in active_siblings if t.get("id")]
+            log.info(
+                f"[{ticket_id}] {len(sibling_ids_pre)} active sibling(s) "
+                f"({', '.join('#' + s for s in sibling_ids_pre)}) — "
+                f"waiting {MERGE_DELAY_SECONDS}s for merger to settle"
+            )
+            _time.sleep(MERGE_DELAY_SECONDS)
+            ticket_after = zendesk.get_ticket(ticket_id)
+            if ticket_after:
+                ticket = ticket_after
+                tags = ticket.get("tags", [])
+                ticket_status = ticket.get("status", "open")
+                if "merge" in tags:
+                    log.info(
+                        f"[{ticket_id}] Merger acted during wait — skipping (tag: merge)"
+                    )
+                    result["status"] = "skipped_merged"
+                    return result
+                if ticket_status == "closed":
+                    log.info(
+                        f"[{ticket_id}] Ticket closed during wait (likely merged)"
+                    )
+                    result["status"] = "skipped_closed"
+                    return result
+            # Merger may have resolved siblings instead of merging this one.
+            active_siblings = zendesk.find_active_tickets_for_email(
+                email, exclude_ticket_id=ticket_id, days=14,
+            )
+
         if active_siblings:
             sibling_ids = [str(t.get("id")) for t in active_siblings if t.get("id")]
             sibling_subjects = [
