@@ -102,6 +102,12 @@ DRY_RUN            = os.getenv("DRY_RUN", "true").lower() == "true"
 TEST_MODE          = os.getenv("TEST_MODE", "true").lower() == "true"
 TEST_TAG           = "automation_test"
 
+# Pause at the start of _process so the Zendesk-side merger has time to
+# consolidate duplicate tickets from the same requester before the bot
+# fetches and writes. Without this, the bot can win the race against the
+# merger, leaving two parallel threads with the same customer.
+MERGE_DELAY_SECONDS = int(os.getenv("MERGE_DELAY_SECONDS", "30"))
+
 # SHADOW_MODE: process ALL tickets, skip ALL writes, send Slack report per ticket.
 # Overrides: DRY_RUN=true (no writes), TEST_MODE=false (all tickets), Slack stays live.
 if SHADOW_MODE:
@@ -796,6 +802,16 @@ def _process(ticket_id: str) -> dict:
         "cancel_source": None,
         "email": None,
     }
+
+    # Give the Zendesk-side merger time to fold duplicate tickets from
+    # the same requester into a single thread before we fetch and write.
+    # The merge tag check below will then short-circuit any ticket that
+    # got merged during the wait.
+    if MERGE_DELAY_SECONDS > 0:
+        log.info(
+            f"[{ticket_id}] Waiting {MERGE_DELAY_SECONDS}s for merger to settle"
+        )
+        _time.sleep(MERGE_DELAY_SECONDS)
 
     # 1. Fetch ticket
     ticket = zendesk.get_ticket(ticket_id)
