@@ -45,6 +45,7 @@ from slack_client import SlackClient
 from reply_generator import (
     generate_reply,
     validate_reply,
+    english_fallback_reply,
 )
 from bq_logger import log_result as _bq_log_result
 
@@ -591,19 +592,44 @@ def zendesk_webhook(request):
         # This is a benign race — an agent merged the ticket out from
         # under us. Skip cleanly instead of reporting "Exception: 422
         # Client Error: Unprocessable Entity" in Slack.
-        log.info(
-            f"[{ticket_id}] Ticket was merged/closed mid-flight "
-            f"({e.method} {e.url} → 422) — skipping cleanly"
-        )
-        result = {
-            "ticket_id": ticket_id,
-            "status": "skipped_merged",
-            "reason": (
-                "Ticket was merged or closed by an agent between the "
-                "bot's initial fetch and a subsequent write — no action "
-                "needed from the bot."
-            ),
-        }
+        cancel_outcome = getattr(e, "cancel_outcome", None)
+        if cancel_outcome == "success":
+            # Subscription was already cancelled in WC before the merge —
+            # preserve that in the report so support sees "cancel succeeded,
+            # ticket merged" instead of a bare skip that hides the action.
+            log.info(
+                f"[{ticket_id}] Ticket was merged AFTER cancel succeeded "
+                f"({e.method} {e.url} → 422) — reporting partial success"
+            )
+            result = {
+                "ticket_id": ticket_id,
+                "status": "success_zendesk_failed",
+                "action": "cancelled_then_merged",
+                "cancel_outcome": "success",
+                "zendesk_outcome": "merged_mid_flight",
+                "zendesk_failed_at": getattr(e, "zendesk_step", "unknown"),
+                "subscription_id": getattr(e, "subscription_id", None),
+                "reason": (
+                    "Subscription was cancelled in WooCommerce, but the "
+                    "ticket was merged/closed before the bot could post the "
+                    "reply or close it. No bot retry needed; the cancel is "
+                    "already done."
+                ),
+            }
+        else:
+            log.info(
+                f"[{ticket_id}] Ticket was merged/closed mid-flight "
+                f"({e.method} {e.url} → 422) — skipping cleanly"
+            )
+            result = {
+                "ticket_id": ticket_id,
+                "status": "skipped_merged",
+                "reason": (
+                    "Ticket was merged or closed by an agent between the "
+                    "bot's initial fetch and a subsequent write — no action "
+                    "needed from the bot."
+                ),
+            }
     except Exception as e:
         log.exception(f"[{ticket_id}] Unhandled error: {e}")
         # The per-ticket report below renders status=error + the exception
@@ -681,6 +707,8 @@ def zendesk_webhook(request):
 
 _SHADOW_STATUS_TO_TAG = {
     "success":                      "shadow_would_cancel",
+    "success_zendesk_failed":       "shadow_would_cancel_zendesk_partial",
+    "success_en_fallback":          "shadow_would_cancel_en_fallback",
     "manual_review_required":       "shadow_would_escalate",
     "escalated_low_confidence":     "shadow_would_escalate",
     "escalated_delete_account":     "shadow_would_escalate",
@@ -1007,6 +1035,13 @@ def _process(ticket_id: str) -> dict:
             "konto löschen", "supprimer mon compte",
             "видалити акаунт", "удалить аккаунт",
             "account verwijderen",
+            # Spanish
+            "eliminar mi cuenta", "eliminar cuenta", "borrar mi cuenta",
+            "borrar cuenta", "cerrar mi cuenta", "cerrar cuenta",
+            "eliminar mi información", "eliminar mi informacion",
+            "eliminar mi información de pago", "eliminar mi informacion de pago",
+            "eliminar mis datos", "eliminar datos personales",
+            "borrar mis datos", "borrar mi información", "borrar mi informacion",
         ]
         _REFUND_KEYWORD_FALLBACK = [
             "refund", "返金", "払い戻し", "クーリングオフ", "お金を返して", "geld zurück",
@@ -1499,11 +1534,39 @@ def _process(ticket_id: str) -> dict:
                 f"orders={wc_order_count if wc_order_count is not None else 'unknown'}.)"
             )
 
+        # Pick the human-facing summary based on the actual failure mode.
+        # The previous wording ("did not find a subscription") was misleading
+        # for transient gateway errors (504/503/502) and timeouts — in those
+        # cases the bot never got an answer from WC at all. Saying "no sub"
+        # made support waste time treating a real customer as unknown.
+        if error_kind in ("transient_error", "timeout_error"):
+            human_summary = (
+                "🤖 WooCommerce was temporarily unreachable — the bot could not "
+                "determine whether this customer has a subscription. Please "
+                f"retry in a few minutes or check manually.{sub_info_human}"
+            )
+        elif error_kind == "auth_error":
+            human_summary = (
+                "🤖 WooCommerce credentials rejected the bot — the bot cannot "
+                "look up subscriptions until ops fixes the API keys. Please "
+                f"check manually.{sub_info_human}"
+            )
+        elif error_kind == "api_error":
+            human_summary = (
+                "🤖 WooCommerce returned an error during lookup — the bot "
+                "cannot tell whether this customer has a subscription. Please "
+                f"check manually.{sub_info_human}"
+            )
+        else:
+            human_summary = (
+                "🤖 Bot did not find a subscription for this customer — this "
+                "may simply mean the user does not have one. Please check "
+                f"manually.{sub_info_human}"
+            )
+
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot did not find a subscription for this customer — this "
-            f"may simply mean the user does not have one. Please check "
-            f"manually.{sub_info_human}\n\n"
+            f"{human_summary}\n\n"
             f"---\n"
             f"For developer:\n"
             f"WooCommerce lookup FAILED for {email}\n"
@@ -1514,11 +1577,7 @@ def _process(ticket_id: str) -> dict:
         result.update({
             "status": "wc_lookup_error",
             "action": "slack_alerted_wc_error",
-            "reason": (
-                "Bot did not find a subscription for this customer — "
-                "this may simply mean the user does not have one. "
-                "Please check manually."
-            ),
+            "reason": human_summary.replace("🤖 ", "").split("\n")[0],
             "error_kind": error_kind,
             "error_detail": error_detail[:300],
             "error_step": error_step,
@@ -1950,23 +2009,50 @@ def _finish_cancellation(
     # Catches hallucinations, prompt leakage, garbage output from Claude.
     is_valid, reason = validate_reply(reply_text, language)
     if not is_valid:
+        # The WC cancel has ALREADY happened — leaving the customer with no
+        # confirmation while tagging the ticket "ai_bot_failed" produces the
+        # exact "subscription cancelled but no message + failed tag" pattern
+        # that operators flagged. Fall back to the English master template
+        # (no Claude, no translation, hard-coded text) so the customer at
+        # least sees that their cancellation went through. An internal note
+        # still asks support to follow up in the customer's language.
         log.error(
-            f"[{ticket_id}] Reply failed validation ({reason}) — escalating to human"
+            f"[{ticket_id}] Reply failed validation ({reason}) → "
+            "sending English fallback so the customer is notified, then "
+            "flagging for manual follow-up in their language"
         )
+        fallback_text = english_fallback_reply(intent, cancel_result)
         zendesk.add_tag(ticket_id, "bot_handled")
-        zendesk.add_tag(ticket_id, "needs_manual_review")
-        zendesk.add_tag(ticket_id, "ai_bot_failed")
+        try:
+            zendesk.post_reply(ticket_id, fallback_text)
+            result["reply_posted"] = True
+            result["reply_was_fallback"] = True
+            zendesk.add_tag(ticket_id, "ai_bot_fallback_reply")
+        except Exception:
+            log.exception(
+                f"[{ticket_id}] EN fallback reply also failed to post"
+            )
+            zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: cancellation succeeded but generated reply failed validation.\n"
-            f"Reason: {reason}\n"
-            f"Language: {language}\n\n"
-            f"Please reply to the customer manually to confirm cancellation.",
+            f"🤖 Bot cancelled the subscription successfully, but the "
+            f"localised reply failed validation (reason: {reason}, "
+            f"language: {language}). The customer was sent the English "
+            f"master cancellation confirmation as a safe fallback. "
+            f"Please follow up with a localised reply in {language} if "
+            f"appropriate.",
         )
         zendesk.set_open(ticket_id)
-        result["status"] = "manual_review_required"
-        result["validation_fail_reason"] = reason
-        result["reason"] = f"Generated reply failed validation: {reason}"
+        result.update({
+            "status": "success_en_fallback",
+            "action": "cancelled_en_fallback_reply",
+            "validation_fail_reason": reason,
+            "cancel_outcome": "success",
+            "reason": (
+                f"Cancellation succeeded; localised reply failed validation "
+                f"({reason}). Sent EN master template as fallback."
+            ),
+        })
         log_result(result)
         return result
 
@@ -1975,38 +2061,111 @@ def _finish_cancellation(
         "SUB_CANCELLATION": "sub_cancellation",
     }.get(intent, "cancelled")
 
-    zendesk.add_tag(ticket_id, "bot_handled") # first — blocks any re-entry from webhook re-fires
-    zendesk.post_reply(ticket_id, reply_text)
-    zendesk.add_tag(ticket_id, cancel_tag)
-    zendesk.add_tag(ticket_id, "ai_bot_success")
-    _set_topic_for_intent(ticket_id, intent)
+    # By the time we reach this block the WC cancellation has ALREADY happened
+    # (cancel_result["cancelled"] is True). Track it explicitly so a downstream
+    # Zendesk write failure can no longer silently degrade the bot's recorded
+    # outcome to "error" / "1 reply, status failed" — Slack and BQ should still
+    # see the cancel as a success, with a separate flag for the Zendesk-side
+    # failure so ops knows to follow up on the ticket close.
+    result["cancel_outcome"] = "success"
+    result["subscription_id"] = cancel_result.get("subscription_id")
+    result["plan"] = cancel_result.get("plan")
+    result["cancel_source"] = (
+        cancel_result.get("source") or result.get("cancel_source")
+    )
 
-    # ── Audit note on success ────────────────────────────────────────── #
-    # Leave a trail on every auto-cancelled ticket so an agent reviewing
-    # it later can see at a glance what the bot did and why — same info
-    # the Slack report carries, persisted on the ticket itself. Added
-    # BEFORE solve so the note shows up on the closed ticket.
     _confidence = result.get("confidence") or 0
     _reasoning = result.get("reasoning") or "—"
     _sub_id = cancel_result.get("subscription_id", "—")
     _plan = cancel_result.get("plan") or "—"
     _source = cancel_result.get("source") or result.get("cancel_source") or "—"
-    zendesk.add_internal_note(
-        ticket_id,
+    audit_note = (
         f"🤖 Bot auto-cancelled this ticket.\n"
         f"Intent: {intent} (confidence: {_confidence:.0%})\n"
         f"Language: {language}\n"
         f"Source: {_source}\n"
         f"Subscription: #{_sub_id} ({_plan})\n"
-        f"Reasoning: {_reasoning}",
+        f"Reasoning: {_reasoning}"
     )
 
-    zendesk.solve_ticket(ticket_id)
+    zendesk_step = "add_tag:bot_handled"
+    try:
+        zendesk.add_tag(ticket_id, "bot_handled")  # first — blocks re-entry from webhook re-fires
+        zendesk_step = "post_reply"
+        zendesk.post_reply(ticket_id, reply_text)
+        result["reply_posted"] = True
+        zendesk_step = "add_tag:cancel_tag"
+        zendesk.add_tag(ticket_id, cancel_tag)
+        zendesk.add_tag(ticket_id, "ai_bot_success")
+        zendesk_step = "set_topic"
+        _set_topic_for_intent(ticket_id, intent)
+        # Audit note BEFORE solve so it shows up on the closed ticket.
+        zendesk_step = "add_internal_note"
+        zendesk.add_internal_note(ticket_id, audit_note)
+        zendesk_step = "solve_ticket"
+        zendesk.solve_ticket(ticket_id)
+    except TicketNotWritableError as e:
+        # Ticket got merged/closed by an agent in the middle of our writes.
+        # The cancel has already happened in WC — preserve that fact so the
+        # outer handler reports "merged after cancel" instead of erasing the
+        # cancellation from the audit trail.
+        log.info(
+            f"[{ticket_id}] Cancel succeeded but ticket was merged/closed "
+            f"during Zendesk write at step `{zendesk_step}` "
+            f"({e.method} {e.url} → 422). Re-raising for outer skip handler."
+        )
+        result["zendesk_outcome"] = "merged_mid_flight"
+        result["zendesk_failed_at"] = zendesk_step
+        # Attach cancel context to the exception so the outer handler can
+        # render "cancelled, then merged" rather than a bare skip.
+        e.cancel_outcome = "success"
+        e.zendesk_step = zendesk_step
+        e.subscription_id = cancel_result.get("subscription_id")
+        raise
+    except Exception as e:
+        # Zendesk write failed, but the cancellation IS already done in
+        # WooCommerce. Don't report this ticket as a generic "error" — that
+        # would lose the fact that we cancelled, and the customer would see
+        # an inconsistent picture (sub gone in WC, ticket says bot failed).
+        # Mark a partial-success status so support can finish the Zendesk
+        # side manually without re-cancelling.
+        log.exception(
+            f"[{ticket_id}] WC cancel succeeded but Zendesk write failed at "
+            f"step `{zendesk_step}`: {e}"
+        )
+        try:
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot cancelled the subscription in WooCommerce (sub "
+                f"#{_sub_id}, {_plan}), but the Zendesk write failed at "
+                f"step `{zendesk_step}`: {str(e)[:200]}.\n\n"
+                f"Please verify the subscription is cancelled and close the "
+                f"ticket manually. Do NOT re-trigger the bot — the cancel "
+                f"already went through.",
+            )
+        except Exception:
+            log.exception(f"[{ticket_id}] Could not even post fallback note")
+        try:
+            zendesk.add_tag(ticket_id, "bot_handled")
+            zendesk.add_tag(ticket_id, "needs_manual_review")
+        except Exception:
+            pass
+        result.update({
+            "status": "success_zendesk_failed",
+            "action": "cancelled_zendesk_write_failed",
+            "reply_text": reply_text,
+            "zendesk_outcome": "write_failed",
+            "zendesk_failed_at": zendesk_step,
+            "zendesk_error": str(e)[:300],
+        })
+        log_result(result)
+        return result
 
     result.update({
         "status": "success",
         "action": "cancelled_and_replied",
         "reply_text": reply_text,
+        "zendesk_outcome": "posted_and_closed",
     })
     log.info(f"[{ticket_id}] ✅ Done")
     log_result(result)
@@ -2030,13 +2189,19 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     - status="not_found_anywhere"    — WC confirmed "no such email anywhere".
                                        Fall through to Stripe fallback in caller.
     """
-    woo_result = woo.cancel_subscription(email)
+    # Pass the renewal threshold so WC skips the PUT entirely for
+    # subscriptions with too many orders. Previously this was gated AFTER
+    # the cancel, leaving customers with their sub cancelled in WC, no
+    # reply sent, and the ticket tagged "ai_bot_failed".
+    woo_result = woo.cancel_subscription(
+        email, max_auto_cancel_orders=MAX_BOT_ORDERS
+    )
     woo_status = woo_result.get("status", "")
 
     # Successful WC outcome — return immediately
     _TERMINAL_MISS = {
         "not_found", "no_active_sub",
-        "auth_error", "timeout_error", "api_error",
+        "auth_error", "timeout_error", "api_error", "transient_error",
         "timeout",  # legacy
         "error",    # legacy
     }
@@ -2066,7 +2231,7 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     # subscription_type, subscription_id, order_count. Preserve them so the
     # caller can use WC data (not the text classifier) to label the ticket
     # correctly (e.g. renewal with 5 orders should NOT be TRIAL_CANCELLATION).
-    if woo_status in ("auth_error", "timeout_error", "api_error"):
+    if woo_status in ("auth_error", "timeout_error", "api_error", "transient_error"):
         log.error(
             f"[{ticket_id}] WooCommerce {woo_status}: "
             f"{woo_result.get('error_detail', '')[:200]} — escalating to Slack, "
@@ -2336,6 +2501,28 @@ _REFUND_KEYWORDS = [
     "remboursement", "rembourser",
     # Spanish / Portuguese
     "reembolso",
+    "devolución",                # refund / return
+    "devolver",                  # to refund / return
+    "devolverme",                # refund me
+    "devuelvan",                 # refund (formal imperative)
+    "devuelvanme",               # refund me (formal imperative)
+    "cobro sin razón",           # charged without reason
+    "cobro sin razon",           # without accent variant
+    "cargo no autorizado",       # unauthorized charge
+    "cargo sin autorización",    # charge without authorization
+    "cargo sin autorizacion",    # without accent variant
+    "sin autorización",          # without authorization
+    "sin autorizacion",          # without accent variant
+    "sin mi autorización",       # without my authorization
+    "sin mi autorizacion",       # without accent variant
+    "sin autorizar",             # without authorizing
+    "cobro indebido",            # improper / undue charge
+    "cobro injustificado",       # unjustified charge
+    "me cobraron sin",           # they charged me without …
+    "me han cobrado sin",        # they have charged me without …
+    "no autoricé",               # I did not authorize
+    "no autorice",               # without accent variant
+    "no he autorizado",          # I have not authorized
     # Russian
     "возврат",
     # Italian
@@ -2517,7 +2704,25 @@ _STRONG_REFUND_SIGNALS = [
     "fraude",               # fraud
     # ── Spanish ──
     "reembolso",            # refund
+    "devolución",           # refund / return (ES)
+    "devuelvan",            # refund / return (formal imperative)
+    "devuélvanme",          # refund me (formal imperative)
+    "devuelvanme",          # without-accent variant
     "cargo no autorizado",  # unauthorized charge
+    "cobro no autorizado",  # unauthorized charge (LATAM)
+    "cobro sin razón",      # charged without reason
+    "cobro sin razon",      # without-accent variant
+    "cobro indebido",       # improper / undue charge
+    "cobro injustificado",  # unjustified charge
+    "sin autorización",     # without authorization
+    "sin autorizacion",     # without-accent variant
+    "sin mi autorización",  # without my authorization
+    "sin mi autorizacion",  # without-accent variant
+    "no autoricé",          # I did not authorize
+    "no autorice",          # without-accent variant
+    "me cobraron sin",      # they charged me without …
+    "me han cobrado sin",   # they have charged me without …
+    "estafa",               # scam (Spanish)
     "fraude",               # fraud
     # ── Norwegian/Swedish/Danish ──
     "penger tilbake",       # money back (NO)

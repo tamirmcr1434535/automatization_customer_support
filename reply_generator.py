@@ -228,3 +228,17 @@ def generate_reply(intent: str, language: str, customer_name: str, cancel_result
     return _translate(master, language)
 
 
+def english_fallback_reply(intent: str, cancel_result: dict) -> str:
+    """English master cancellation template — no Claude, no translation.
+
+    Use this when the localised reply failed validation but the WC cancel
+    already happened, so the customer would otherwise get no notification.
+    Better to send the English confirmation than to silently leave them
+    wondering whether their cancellation went through.
+    """
+    sub_type = cancel_result.get("subscription_type")
+    if sub_type == "trial" or intent == "TRIAL_CANCELLATION":
+        return _master_trial_cancel()
+    return _master_sub_cancel()
+
+

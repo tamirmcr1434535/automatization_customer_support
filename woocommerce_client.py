@@ -40,19 +40,37 @@ from datetime import datetime, timezone
 log = logging.getLogger("woocommerce")
 
 
+# HTTP statuses that come from the gateway / load balancer / CDN in front of
+# the WC server, not from WC itself. They are almost always transient — the
+# upstream was busy or briefly down. Worth a retry before giving up, since
+# the alternative is the bot telling support "no subscription found" when
+# really the lookup never reached WooCommerce.
+_TRANSIENT_HTTP_STATUSES = (502, 503, 504)
+
+
 def _request_with_retry(method, url, *, max_retries=1, timeout, **kwargs):
     """
-    HTTP request with automatic retry on timeout/network errors.
-    On retry, timeout is doubled to give the slow server more time.
-    Returns the response, or raises the last exception if all retries fail.
+    HTTP request with automatic retry on timeout / network errors / gateway
+    transient 5xx (502/503/504). On retry, timeout is doubled to give the
+    slow server more time. Returns the response (which may itself be a non-OK
+    transient response if all retries failed), or raises the last exception
+    if all retries failed with an exception.
     """
     last_exc = None
+    last_resp = None
     for attempt in range(1 + max_retries):
         current_timeout = timeout * (2 ** attempt)  # double on each retry
         try:
             resp = requests.request(
                 method, url, timeout=current_timeout, **kwargs
             )
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES and attempt < max_retries:
+                last_resp = resp
+                log.warning(
+                    f"WC: transient {resp.status_code} ({current_timeout}s) → "
+                    f"retrying: {method} {url}"
+                )
+                continue
             return resp
         except requests.exceptions.Timeout as e:
             last_exc = e
@@ -68,6 +86,10 @@ def _request_with_retry(method, url, *, max_retries=1, timeout, **kwargs):
                 f"{'retrying' if attempt < max_retries else 'giving up'}: "
                 f"{method} {url}: {e}"
             )
+    if last_resp is not None:
+        # All retries exhausted with transient HTTP status — return the last
+        # response so the caller can classify it via _error_kind_from_response.
+        return last_resp
     raise last_exc
 
 
@@ -76,10 +98,15 @@ def _error_kind_from_response(resp) -> tuple[str, str] | None:
     Classify an HTTP response as an error, if it is one.
 
     Returns (kind, detail) where kind is one of:
-      - "auth_error"    (401, 403)
-      - "api_error"     (>= 500 or other non-2xx)
+      - "auth_error"      (401, 403)
+      - "transient_error" (502, 503, 504 — gateway / load balancer)
+      - "api_error"       (other 5xx or non-2xx)
 
     Returns None for OK (2xx) responses.
+
+    The `transient_error` kind is distinct from `api_error` so the bot can
+    tell support "WC was temporarily unreachable, retry" instead of the
+    misleading "no subscription found" when the upstream gateway flaked.
     """
     if resp is None:
         return None
@@ -90,6 +117,8 @@ def _error_kind_from_response(resp) -> tuple[str, str] | None:
         return ("auth_error", detail)
     if resp.status_code == 404:
         return None  # treat 404 as "not found", not as an error
+    if resp.status_code in _TRANSIENT_HTTP_STATUSES:
+        return ("transient_error", detail)
     return ("api_error", detail)
 
 
@@ -110,14 +139,16 @@ def _worst_error_kind(errors: list[dict]) -> str | None:
     """
     Pick the most severe error kind from a list of lookup errors.
 
-    Priority: auth_error > timeout_error > api_error.
+    Priority: auth_error > api_error > timeout_error > transient_error.
     auth_error means credentials are broken — highest severity because the
-    bot cannot function at all until ops fixes it.
+    bot cannot function at all until ops fixes it. transient_error is the
+    least severe (gateway flake) so a single 504 in step 2b doesn't hide a
+    real timeout in step 2c.
     """
     if not errors:
         return None
     kinds = {e.get("kind") for e in errors}
-    for k in ("auth_error", "timeout_error", "api_error"):
+    for k in ("auth_error", "api_error", "timeout_error", "transient_error"):
         if k in kinds:
             return k
     return None
@@ -708,9 +739,21 @@ class WooCommerceClient:
     #  MAIN PUBLIC METHOD                                                #
     # ================================================================== #
 
-    def cancel_subscription(self, email: str) -> dict:
+    def cancel_subscription(
+        self,
+        email: str,
+        *,
+        max_auto_cancel_orders: int | None = None,
+    ) -> dict:
         """
         Find customer → find subscription → cancel.
+
+        If `max_auto_cancel_orders` is set and the matched subscription has
+        `order_count >= max_auto_cancel_orders`, the PUT cancel is SKIPPED and
+        the function returns status="renewal_too_many_orders" with the sub
+        metadata so the caller can escalate to a human. This prevents the
+        previous bug where a renewal would be silently cancelled in WC and
+        then tagged "ai_bot_failed" without ever notifying the customer.
 
         Lookup chain (CF timeout = 3600s, generous timeouts):
           1.  /customers?email=           (15s timeout, indexed but server can spike)
@@ -1080,6 +1123,32 @@ class WooCommerceClient:
         li = target.get("line_items") or []
         if li:
             plan = li[0].get("name", "")
+
+        # ── Step 4b: renewal gate (skip PUT for many-order subs) ──────── #
+        # If the caller set a threshold, refuse to auto-cancel renewal
+        # subscriptions and return metadata so they can escalate. This MUST
+        # run before _cancel_sub_by_id — gating after the PUT was the cause
+        # of "subscription cancelled in WC but ticket tagged ai_bot_failed
+        # with no customer reply" reports.
+        if (
+            max_auto_cancel_orders is not None
+            and order_count is not None
+            and order_count >= max_auto_cancel_orders
+        ):
+            log.info(
+                f"WC: sub #{target['id']} has {order_count} orders "
+                f"(>= {max_auto_cancel_orders}) — SKIPPING PUT, returning "
+                "renewal_too_many_orders for human review"
+            )
+            return {
+                **base_result,
+                "status": "renewal_too_many_orders",
+                "cancelled": False,
+                "subscription_type": sub_type,
+                "subscription_id": target["id"],
+                "plan": plan or "IQ Test Subscription",
+                "order_count": order_count,
+            }
 
         # ── Step 5: cancel ────────────────────────────────────────────── #
         cancel = self._cancel_sub_by_id(target["id"])

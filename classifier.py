@@ -49,6 +49,12 @@ A) REFUND signals (返金, 払い戻し, refund, money back, geld terug, Rücker
    → "I didn't sign up for this" + billing complaint = REFUND_REQUEST.
    → "自動で料金が引かれている" (auto-charged) = REFUND_REQUEST.
    → "覚えがない" (don't recall) + charge = REFUND_REQUEST.
+   → Spanish: "me cobraron sin razón" / "cobro sin razón" / "sin autorización"
+     / "cargo no autorizado" / "no autoricé este cobro" = REFUND_REQUEST.
+   → Spanish: "podrían cancelar los pagos" + "sin razón" / "no autoricé" / "eliminar
+     mi información de pago" = REFUND_REQUEST (charge dispute + data deletion request),
+     NOT TRIAL_CANCELLATION. The phrase "cancelar los pagos" alongside an unauthorized-
+     charge complaint means "reverse the charges", not just "stop the subscription".
    → If customer mentions RENEWAL charges specifically (自動更新, auto-renewal,
      2回目の請求, second charge, renewal charge) + refund → SUB_RENEWAL_REFUND.
 
@@ -72,10 +78,15 @@ B) CANCEL signals (解約, キャンセル, 退会, cancel, 취소, kündigen, o
      → REFUND_REQUEST if refund signals found.
 
 C) DELETE ACCOUNT signals (アカウント削除, delete my account, 계정 삭제,
-   Konto löschen, account verwijderen, видалити акаунт, remove my account):
+   Konto löschen, account verwijderen, видалити акаунт, remove my account,
+   eliminar mi cuenta, borrar mi cuenta, eliminar mi información de pago,
+   eliminar mis datos):
    → If ONLY account deletion with NO billing/subscription context → DELETE_ALL_DATA.
    → If delete account + billing/charges mentioned → TRIAL_CANCELLATION.
    → If delete account + refund request → REFUND_REQUEST.
+   → Spanish: "eliminar mi información de pago" / "borrar mis datos" alongside an
+     unauthorized-charge complaint → REFUND_REQUEST (not DELETE_ALL_DATA), because
+     the customer is disputing the charge and requesting their card be removed.
 
 D) BILLING COMPLAINT (mentions charges, payments, withdrawals, 출금, 결제, 과금,
    引き落とし, 請求, billing, Abbuchung) WITHOUT cancel/refund/delete words:
