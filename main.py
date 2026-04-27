@@ -1020,6 +1020,24 @@ def _process(ticket_id: str) -> dict:
     language   = classification["language"]
     confidence = classification["confidence"]
 
+    # 3a. Cancellation-verification questions ("I cancelled, did it work?"
+    # / "解約できていますか" / "취소가 되었나요") — route as a normal
+    # cancellation: look up the sub and reply. If the sub is already
+    # cancelled, the standard "your subscription has been cancelled"
+    # reply doubles as a verification confirmation. If the sub is
+    # somehow still active, the bot cancels it (which is what the
+    # customer thought they had already done). If WC has no record at
+    # all, the not_found_anywhere path escalates to a human (no card-
+    # digits prompt, since the legacy card-digits flow was retired).
+    if intent == "CANCELLATION_VERIFICATION":
+        log.info(
+            f"[{ticket_id}] CANCELLATION_VERIFICATION → handling as "
+            "TRIAL_CANCELLATION (verify-and-confirm flow)"
+        )
+        result["original_intent"] = "CANCELLATION_VERIFICATION"
+        result["is_verification_request"] = True
+        intent = "TRIAL_CANCELLATION"
+
     # 3b. Safety net: if classifier returned UNKNOWN but body contains clear cancel/refund
     # signals, override to prevent valid tickets from being silently skipped.
     # This catches edge cases where Claude misclassifies (e.g. image attachment noise,
@@ -1032,6 +1050,14 @@ def _process(ticket_id: str) -> dict:
             "アカウント削除", "アカウントの削除", "アカウントを削除",
             "アカウントを消して", "アカウントを消去",
             "계정 삭제", "계정삭제",
+            # Korean — 탈퇴 (withdrawal/leave) when paired with 계정/회원 means
+            # "delete account", not just "cancel subscription". The bare 탈퇴
+            # is in _CANCEL_SIGNALS, but these multi-word forms are stronger
+            # delete-account signals and should win.
+            "계정 탈퇴", "계정탈퇴",
+            "회원 탈퇴", "회원탈퇴",
+            "탈퇴해주세요", "탈퇴 해주세요",
+            "탈퇴하고 싶", "탈퇴하고싶",
             "konto löschen", "supprimer mon compte",
             "видалити акаунт", "удалить аккаунт",
             "account verwijderen",
@@ -2347,6 +2373,23 @@ _REFUND_KEYWORDS = [
     "身に覚えの", # "I don't recognise this charge" (身に覚えのない引き落とし)
     "身に覚えがない", # variant
     "勝手に引き落とし", # "deducted without consent"
+    "勝手にサブスク登録", # "subscription registered without consent" — 106350 pattern
+    "勝手にサブスクリプション登録", # full-katakana variant
+    "勝手に登録", # generic "registered without consent"
+    "勝手にサブスク", # "subscription [done] without consent"
+    "知らない間に登録", # "registered without my knowing"
+    "知らないうちに登録", # variant
+    "登録した覚えがない", # "don't recall registering"
+    "登録した覚えはありません", # polite variant
+    # "next month surprise charge" pattern (106911): customer is alarmed
+    # about an upcoming withdrawal they didn't expect AND asks "why? when?"
+    # — that combination is a refund-style dispute, not just a cancel.
+    "来月引き落とし", # "next month's withdrawal"
+    "引き落とさないでください", # "please don't withdraw"
+    "引き落とさないで下さい", # variant kanji
+    "なぜこうなった", # "why did this happen?"
+    "いつこうなった", # "when did this happen?"
+    "なぜ、いつ", # combined "why, when?" with charge complaint
     "不正請求", # "fraudulent/unauthorized charge"
     "不法請求", # "illegal billing/charge" — variant seen in real tickets
     "詐欺", # fraud / scam
@@ -2467,6 +2510,28 @@ _REFUND_KEYWORDS = [
     "widerrufen", # to withdraw/revoke
     "widerrufsrecht", # right of withdrawal
     "widerrufsfrist", # withdrawal period
+    # Vietnamese — refund / unauthorized charge
+    "hoàn tiền",                # refund
+    "hoàn lại",                 # return / refund
+    "hoàn lại tiền",            # refund money
+    "trả lại tiền",             # give back the money
+    "huỷ thanh toán",           # cancel the payment (= reverse the charge)
+    "hủy thanh toán",           # variant spelling
+    "huỷ giao dịch",            # cancel the transaction
+    "hủy giao dịch",            # variant spelling
+    "bị trừ thêm",              # was charged extra
+    "bị trừ tiền",              # money was deducted
+    "trừ tiền tự động",         # money deducted automatically
+    "tự ý trừ",                 # deducted unilaterally / without permission
+    "không đăng ký",            # didn't register / sign up
+    "không đăng kí",            # variant spelling
+    "chưa đăng ký",             # haven't registered
+    "chưa đăng kí",             # variant spelling
+    "tôi không đăng ký",        # I didn't sign up
+    "tôi không đăng kí",        # variant spelling
+    "không đồng ý",             # didn't agree / consent
+    "lừa đảo",                  # fraud / scam
+    # German
     "geld zurück", # money back
     "geld zurückfordern", # demand money back
     "betrug", # fraud ("Achtung Betrug" = attention fraud)
@@ -2649,6 +2714,27 @@ _STRONG_REFUND_SIGNALS = [
     "二重に引かれ",            # "double-charged"
     "二重請求",                # "double billing"
     "二重課金",                # "double charging"
+    # ── Japanese — unauthorized signup ("registered without my consent") ──
+    "勝手にサブスク登録",      # "subscription registered without consent"
+    "勝手にサブスクリプション登録", # full-katakana variant
+    "勝手に登録",              # "registered without consent" (general)
+    "勝手にサブスク",          # "subscription [done] without consent"
+    "知らない間に登録",        # "registered without my knowing"
+    "知らないうちに登録",      # variant
+    "登録した覚えがない",      # "don't recall registering"
+    "登録した覚えはありません", # polite variant
+    "サブスクになってる",      # "[I notice] I'm in a subscription" (surprise)
+    # ── Japanese — surprise about an upcoming/recurring charge ──
+    # "Why and when did this happen?" pattern alongside a charge complaint
+    # is a classic refund-dispute signal: customer didn't expect the charge
+    # and is asking how it came to be — they want their money back, not
+    # just to cancel going forward.
+    "なぜこうなった",          # "why did this happen"
+    "いつこうなった",          # "when did this happen"
+    "なぜ、いつ",              # combined "why, when" (charge complaint)
+    "来月引き落とし",          # "next month's withdrawal" (with complaint)
+    "引き落とさないでください", # "please don't withdraw" (= refund-style)
+    "引き落とさないで下さい",  # variant kanji
     # ── English ──
     "fraud",
     "fraudulent",
@@ -2731,6 +2817,21 @@ _STRONG_REFUND_SIGNALS = [
     "återbetalning",        # refund (SE)
     "tilbakebetaling",      # refund (NO)
     "tilbagebetaling",      # refund (DA)
+    # ── Vietnamese ──
+    "hoàn tiền",            # refund
+    "hoàn lại tiền",        # refund money
+    "trả lại tiền",         # give back the money
+    "huỷ thanh toán",       # cancel the payment (= reverse the charge)
+    "hủy thanh toán",       # variant spelling
+    "huỷ giao dịch",        # cancel the transaction
+    "hủy giao dịch",        # variant spelling
+    "bị trừ thêm",          # was charged extra (surprise)
+    "tự ý trừ",             # deducted without consent
+    "tôi không đăng ký",    # I didn't sign up
+    "tôi không đăng kí",    # variant spelling
+    "không đăng ký bất kì", # didn't sign up for anything
+    "không đăng kí bất kì", # variant
+    "lừa đảo",              # fraud / scam
 ]
 
 

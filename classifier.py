@@ -49,12 +49,22 @@ A) REFUND signals (返金, 払い戻し, refund, money back, geld terug, Rücker
    → "I didn't sign up for this" + billing complaint = REFUND_REQUEST.
    → "自動で料金が引かれている" (auto-charged) = REFUND_REQUEST.
    → "覚えがない" (don't recall) + charge = REFUND_REQUEST.
+   → Japanese: "勝手にサブスク登録されてて" / "勝手に登録" / "知らない間に登録" /
+     "登録した覚えがない" = REFUND_REQUEST (signed up without consent).
+   → Japanese: "来月引き落とし...使ってない...なぜ、いつこうなった" / "引き落とさないで
+     ください" + "なぜ、いつ" pattern = REFUND_REQUEST (surprise about an upcoming
+     recurring charge — customer didn't expect it, they want it stopped AND money
+     back). NOT plain TRIAL_CANCELLATION even though "引き落とさないで" sounds like cancel.
    → Spanish: "me cobraron sin razón" / "cobro sin razón" / "sin autorización"
      / "cargo no autorizado" / "no autoricé este cobro" = REFUND_REQUEST.
    → Spanish: "podrían cancelar los pagos" + "sin razón" / "no autoricé" / "eliminar
      mi información de pago" = REFUND_REQUEST (charge dispute + data deletion request),
      NOT TRIAL_CANCELLATION. The phrase "cancelar los pagos" alongside an unauthorized-
      charge complaint means "reverse the charges", not just "stop the subscription".
+   → Vietnamese: "huỷ thanh toán" + "bị trừ thêm" / "tự ý trừ" / "tôi không đăng ký" /
+     "hoàn tiền" / "hoàn lại tiền" = REFUND_REQUEST. The Vietnamese "huỷ thanh toán"
+     (cancel the payment) with an unauthorized-charge context means refund the charge,
+     NOT cancel the subscription going forward.
    → If customer mentions RENEWAL charges specifically (自動更新, auto-renewal,
      2回目の請求, second charge, renewal charge) + refund → SUB_RENEWAL_REFUND.
 
@@ -78,12 +88,15 @@ B) CANCEL signals (解約, キャンセル, 退会, cancel, 취소, kündigen, o
      → REFUND_REQUEST if refund signals found.
 
 C) DELETE ACCOUNT signals (アカウント削除, delete my account, 계정 삭제,
-   Konto löschen, account verwijderen, видалити акаунт, remove my account,
-   eliminar mi cuenta, borrar mi cuenta, eliminar mi información de pago,
-   eliminar mis datos):
+   계정 탈퇴, 회원 탈퇴, 탈퇴해주세요, Konto löschen, account verwijderen,
+   видалити акаунт, remove my account, eliminar mi cuenta, borrar mi cuenta,
+   eliminar mi información de pago, eliminar mis datos):
    → If ONLY account deletion with NO billing/subscription context → DELETE_ALL_DATA.
    → If delete account + billing/charges mentioned → TRIAL_CANCELLATION.
    → If delete account + refund request → REFUND_REQUEST.
+   → Korean: "계정 탈퇴 해주세요" / "회원 탈퇴" / "탈퇴해주세요" = DELETE_ALL_DATA,
+     NOT TRIAL_CANCELLATION. Korean 탈퇴 by itself can mean "cancel subscription",
+     but combined with 계정 (account) or 회원 (membership) it means "delete account".
    → Spanish: "eliminar mi información de pago" / "borrar mis datos" alongside an
      unauthorized-charge complaint → REFUND_REQUEST (not DELETE_ALL_DATA), because
      the customer is disputing the charge and requesting their card be removed.
@@ -109,9 +122,17 @@ STEP 3 — SPECIAL CASES:
 - "Conversation with [name]" subjects = live chat transcripts. Read the BODY for the
   actual customer request. Apply the same signal detection. If body mentions account
   deletion / data removal → DELETE_ALL_DATA. Default → TRIAL_CANCELLATION.
-- Cancellation VERIFICATION (past tense questions: "解約できていますか", "was my
-  cancellation successful", "취소가 되었나요") → EXPLANATION. But "how to cancel" /
-  "解約の方法" → TRIAL_CANCELLATION.
+- Cancellation VERIFICATION → CANCELLATION_VERIFICATION (NOT EXPLANATION):
+  past-tense questions where the customer says they have already cancelled and
+  just want confirmation, with NO new cancel request and NO billing complaint.
+  Examples:
+    "解約手続きをしましたが、解約になっているか確認してください" (JP)
+    "先ほど解約手続きをしたのですが、これで請求がされることはないという理解で大丈夫でしょうか？" (JP)
+    "解約できていますか" / "きちんと解約されていますよね" (JP)
+    "was my cancellation successful?" / "did my cancellation go through?" (EN)
+    "취소가 되었나요" / "해지가 잘 되었나요" (KR)
+  But "how to cancel" / "解約の方法" / "解約したい" → TRIAL_CANCELLATION (new request, not verification).
+  And verification + billing complaint / "I'm still being charged" → REFUND_REQUEST.
 - SUB_RENEWAL_CANCELLATION: use ONLY when ALL of these are true:
     (1) customer explicitly mentions "auto-renewal" / "自動更新" / "자동 갱신"
     (2) there is NO cancel word (解約, cancel, kündigen, etc.) anywhere in the message

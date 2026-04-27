@@ -548,13 +548,22 @@ class WooCommerceClient:
 
     def get_order_count(self, subscription_id: int) -> int | None:
         """
-        Return number of orders for a subscription.
-        1 order = trial, 2+ orders = paid subscription (at least one renewal).
+        Return number of SUCCESSFUL orders for a subscription.
+
+        Only orders with status=completed/processing count — failed retries,
+        cancelled orders, and refunded orders are excluded. The bot's "renewal
+        vs trial" gate uses this number, and a failed-charge sub should NOT
+        be treated as a paid renewal: customers were reporting tickets like
+        "I only paid 2 times" while the bot's note said "orders=4" because
+        the X-WP-Total header counted failed retry attempts.
+
+        We fetch up to 50 orders per page (the user-reported case had 4 total
+        orders so 50 is more than enough headroom) and count client-side.
         """
         try:
             resp = requests.get(
                 f"{self.base}/subscriptions/{subscription_id}/orders",
-                params={"per_page": 2},
+                params={"per_page": 50},
                 auth=self.auth,
                 timeout=20,
             )
@@ -569,14 +578,15 @@ class WooCommerceClient:
         if not isinstance(data, list):
             return None
 
-        total_header = resp.headers.get("X-WP-Total")
-        if total_header is not None:
-            try:
-                return int(total_header)
-            except ValueError:
-                pass
-
-        return len(data)
+        # Statuses that represent a successful (paid-through) order. Anything
+        # else — failed, cancelled, refunded, pending, on-hold — is NOT a
+        # paid renewal and must not count toward the bot's renewal threshold.
+        _SUCCESSFUL_STATUSES = {"completed", "processing"}
+        successful = sum(
+            1 for o in data
+            if isinstance(o, dict) and o.get("status") in _SUCCESSFUL_STATUSES
+        )
+        return successful
 
     # ================================================================== #
     #  Trial detection                                                   #
@@ -1071,6 +1081,50 @@ class WooCommerceClient:
                     reverse=True,
                 )
                 target = cancelled_subs[0]
+
+                # Stale-cancellation guard: if the most recent cancellation is
+                # older than STALE_CANCELLATION_DAYS, the customer is almost
+                # certainly NOT writing in to confirm a fresh cancellation —
+                # they probably have a different sub on a different email, or
+                # a Stripe sub that WC doesn't see, or they are confused. Do
+                # not auto-reply "your sub is cancelled" with a year-old sub
+                # — escalate as not_found so a human can investigate.
+                _STALE_CANCELLATION_DAYS = 90
+                end_raw = (
+                    target.get("end_date_gmt")
+                    or target.get("date_modified_gmt")
+                    or target.get("date_modified")
+                    or ""
+                )
+                stale = False
+                if end_raw and not end_raw.startswith("0000"):
+                    try:
+                        end_dt = datetime.fromisoformat(
+                            end_raw.replace("Z", "+00:00")
+                        )
+                        if end_dt.tzinfo is None:
+                            end_dt = end_dt.replace(tzinfo=timezone.utc)
+                        days_since_cancel = (
+                            datetime.now(timezone.utc) - end_dt
+                        ).days
+                        if days_since_cancel > _STALE_CANCELLATION_DAYS:
+                            stale = True
+                            log.warning(
+                                f"WC: latest cancelled sub #{target['id']} "
+                                f"ended {days_since_cancel} days ago "
+                                f"(> {_STALE_CANCELLATION_DAYS}) — treating "
+                                "as not_found so a human can verify "
+                                "(customer probably has a different sub)"
+                            )
+                    except (ValueError, AttributeError):
+                        pass
+                if stale:
+                    return {
+                        **base_result,
+                        "status": "not_found",
+                        "stale_cancelled_subscription_id": target.get("id"),
+                    }
+
                 order_count = self.get_order_count(target["id"])
                 sub_type = self._get_sub_type(target, order_count=order_count)
                 plan = ""
