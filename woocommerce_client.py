@@ -595,55 +595,33 @@ class WooCommerceClient:
     @staticmethod
     def _get_sub_type(subscription: dict, order_count: int | None = None) -> str:
         """
-        Determine whether subscription is a "trial" or "subscription".
+        Classify the subscription by its related-order count.
 
-        Rules:
-        0. order_count > 1 → "subscription" (renewal happened)
-        1. order_count ≤ 1 AND days_since_start ≤ 8 → "trial"
-        2. order_count ≤ 1 AND days_since_start > 8 → "subscription"
-        3. Fallback: trial_end in future + order_count ≤ 1 → "trial"
-        4. Default → "subscription"
+        The WooCommerce Subscription's "Related Orders" panel always lists
+        the Parent Order first, then a Renewal Order for each successful
+        recurring charge:
+          • 1 order  (Parent only)         → "trial"
+          • 2 orders (Parent + 1 Renewal)  → "subscription"
+          • 3+ orders (Parent + 2+ Renew.) → "renewal_subscription"
+
+        order_count=None means we could not fetch the orders list (API
+        timeout / lookup failure). We return "unknown" so the caller can
+        bail out and escalate to a human instead of guessing the type —
+        a wrong guess (e.g. "trial" on a paying customer) is worse than
+        asking ops to retry. cancel_subscription() detects "unknown" and
+        returns a transient_error result, which the existing escalation
+        flow translates into a Slack alert.
+
+        `subscription` is unused but kept in the signature so existing
+        call sites do not have to change.
         """
-        if order_count is not None and order_count > 1:
+        if order_count is None:
+            return "unknown"
+        if order_count <= 1:
+            return "trial"
+        if order_count == 2:
             return "subscription"
-
-        start_raw = (
-            subscription.get("start_date_gmt")
-            or subscription.get("start_date")
-            or ""
-        )
-
-        def _parse(s: str):
-            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
-            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-        now = datetime.now(timezone.utc)
-        start_dt = None
-        if start_raw and not start_raw.startswith("0000"):
-            try:
-                start_dt = _parse(start_raw)
-            except (ValueError, AttributeError):
-                pass
-
-        if start_dt is not None:
-            days_since_start = (now - start_dt).days
-            is_trial = (order_count is None or order_count <= 1) and days_since_start <= 8
-            return "trial" if is_trial else "subscription"
-
-        trial_end_raw = (
-            subscription.get("trial_end_date_gmt")
-            or subscription.get("trial_end_date")
-            or ""
-        )
-        if trial_end_raw and not trial_end_raw.startswith("0000") and (order_count is None or order_count <= 1):
-            try:
-                trial_end_dt = _parse(trial_end_raw)
-                if trial_end_dt > now:
-                    return "trial"
-            except (ValueError, AttributeError):
-                pass
-
-        return "subscription"
+        return "renewal_subscription"
 
     # ================================================================== #
     #  WRITE — cancel subscription                                       #
@@ -744,6 +722,53 @@ class WooCommerceClient:
         log.info(f"WC: cancelled subscription #{subscription_id}")
         return {"status": "cancelled", "subscription_id": subscription_id,
                 "cancelled": True}
+
+    # ================================================================== #
+    #  WRITE — add subscription note (audit marker)                      #
+    # ================================================================== #
+
+    def add_subscription_note(
+        self,
+        subscription_id: int,
+        note: str,
+        customer_note: bool = False,
+    ) -> bool:
+        """POST an admin-only note to a subscription.
+
+        Used to mark which subscriptions the bot touched so a human can
+        audit bot activity in the WooCommerce admin. Failures are
+        swallowed: the note is not load-bearing for cancellation, and we
+        must not turn a successful cancel into a reported failure just
+        because a follow-up note POST timed out.
+        """
+        if self.dry_run:
+            log.info(f"[DRY] WC add note to sub #{subscription_id}: {note}")
+            return True
+
+        try:
+            resp = _request_with_retry(
+                "POST",
+                f"{self.base}/subscriptions/{subscription_id}/notes",
+                json={"note": note, "customer_note": customer_note},
+                auth=self.auth,
+                timeout=20,
+                max_retries=1,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning(
+                f"WC add_subscription_note(#{subscription_id}) network error: {e}"
+            )
+            return False
+
+        if 200 <= resp.status_code < 300:
+            log.info(f"WC: noted sub #{subscription_id}: {note}")
+            return True
+
+        log.warning(
+            f"WC add_subscription_note(#{subscription_id}) HTTP "
+            f"{resp.status_code}: {(resp.text or '')[:200]}"
+        )
+        return False
 
     # ================================================================== #
     #  MAIN PUBLIC METHOD                                                #
@@ -1158,16 +1183,19 @@ class WooCommerceClient:
         def _priority(entry: tuple) -> int:
             sub, stype, _oc = entry
             st = sub.get("status", "")
-            if st == "pending-cancel" and stype == "subscription":
+            is_paid_sub = stype in ("subscription", "renewal_subscription")
+            if st == "pending-cancel" and is_paid_sub:
                 return 0
-            if st == "active" and stype == "subscription":
+            if st == "active" and is_paid_sub:
                 return 1
             if st == "pending-cancel" and stype == "trial":
                 return 2
-            if stype == "subscription":
+            if is_paid_sub:
                 return 3
             if stype == "trial":
                 return 4
+            # stype == "unknown" (orders endpoint failed) sorts after
+            # everything we could classify, so a known sub is preferred.
             return 5
 
         typed_subs.sort(key=_priority)
@@ -1177,6 +1205,35 @@ class WooCommerceClient:
         li = target.get("line_items") or []
         if li:
             plan = li[0].get("name", "")
+
+        # ── Step 4a: unknown type → escalate, don't guess ─────────────── #
+        # If we located a subscription but the /orders lookup failed
+        # (order_count is None → sub_type "unknown"), we cannot tell
+        # trial / subscription / renewal apart. Auto-cancelling on a
+        # guess is worse than asking a human to retry: a paying customer
+        # could otherwise receive a trial-cancellation reply ("nothing
+        # was charged") which would be wrong. Return a transient_error
+        # result so the existing wc_lookup_error flow in main.py picks
+        # it up and posts the Slack alert.
+        if sub_type == "unknown":
+            detail = (
+                f"could not determine subscription_type for sub "
+                f"#{target['id']} — /subscriptions/{target['id']}/orders "
+                "lookup failed (timeout or transient gateway error)"
+            )
+            log.warning(f"WC: sub #{target['id']} type=unknown — escalating: {detail}")
+            return {
+                **base_result,
+                "status": "transient_error",
+                "cancelled": False,
+                "subscription_id": target["id"],
+                "subscription_type": "unknown",
+                "plan": plan or "IQ Test Subscription",
+                "order_count": None,
+                "error_kind": "transient_error",
+                "error_detail": detail[:300],
+                "error_step": "subscription_type_lookup",
+            }
 
         # ── Step 4b: renewal gate (skip PUT for many-order subs) ──────── #
         # If the caller set a threshold, refuse to auto-cancel renewal
@@ -1206,6 +1263,15 @@ class WooCommerceClient:
 
         # ── Step 5: cancel ────────────────────────────────────────────── #
         cancel = self._cancel_sub_by_id(target["id"])
+
+        # Audit marker: tag every subscription the bot actually wrote to
+        # so a human can later filter "what did the bot touch" in the
+        # WooCommerce admin. Note write is best-effort; failures are
+        # logged but do not propagate.
+        if cancel.get("cancelled"):
+            self.add_subscription_note(
+                target["id"], "handled_by_ai_bot_assistant"
+            )
 
         total_wc = time.time() - wc_start
         log.info(

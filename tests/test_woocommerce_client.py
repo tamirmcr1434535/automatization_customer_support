@@ -13,16 +13,12 @@ Test scenarios:
   7.  Customer found, pending-cancel subscription → subscription_cancelled
   8.  Cancel API returns error → propagates error status
   9.  Subscription already cancelled → already_cancelled
-  10. _get_sub_type: order_count > 1 → subscription
-  11. _get_sub_type: order_count=1 + days ≤ 8 → trial
-  12. _get_sub_type: order_count=1 + days > 8 → subscription
-  13. _get_sub_type: order_count=None + days ≤ 8 → trial
-  14. _get_sub_type: order_count=None + days > 8 → subscription
-  15. _get_sub_type: no start_date + future trial_end → trial
-  16. _get_sub_type: no start_date + expired trial_end → subscription
-  17. _get_sub_type: no start_date + zero trial_end → subscription
-  18. _get_sub_type: no start_date, no trial_end → subscription
-  19. _get_sub_type: start_date with Z suffix parsed correctly
+  10. _get_sub_type: order_count=1 → trial (Parent only)
+  11. _get_sub_type: order_count=2 → subscription (Parent + 1 Renewal)
+  12. _get_sub_type: order_count=3 → renewal_subscription
+  13. _get_sub_type: order_count=10 → renewal_subscription (any 3+)
+  14. _get_sub_type: order_count=0 → trial (no orders → safe trial label)
+  15. _get_sub_type: order_count=None → unknown (escalate, do not guess type)
   20. get_subscriptions_by_billing_email: ?search= returns empty billing.email →
       individual detail fetch resolves meta_data._billing_email match
 """
@@ -158,16 +154,17 @@ def test_active_trial_cancelled(mock_get_fn, mock_put_fn):
     assert result["subscription_id"] == trial_sub["id"]
 
 
-# ── 5. Paid subscription (days > 8) → subscription_cancelled ─────────────── #
+# ── 5. Paid subscription (2 related orders) → subscription_cancelled ─────── #
 
 @patch("woocommerce_client.requests.put")
 @patch("woocommerce_client.requests.get")
 def test_paid_subscription_cancelled(mock_get_fn, mock_put_fn):
-    # days_since_start=40 → 40 > 8 → subscription
+    # 2 related orders (Parent + 1 Renewal) → "subscription"
     paid_sub = make_wc_subscription(days_since_start=40)
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [paid_sub],
+        "orders": [{"id": 1}, {"id": 2}],
     })
     mock_put_fn.return_value = mock_put(200)
 
@@ -178,26 +175,26 @@ def test_paid_subscription_cancelled(mock_get_fn, mock_put_fn):
     assert result["subscription_type"] == "subscription"
 
 
-# ── 6. Expired trial (no start_date, past trial_end) → subscription ────────── #
+# ── 6. Renewal subscription (3+ related orders) → subscription_cancelled ─── #
 
 @patch("woocommerce_client.requests.put")
 @patch("woocommerce_client.requests.get")
-def test_expired_trial_treated_as_subscription(mock_get_fn, mock_put_fn):
-    """trial_end in the past + no start_date → subscription (not a trial)."""
-    past = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-    sub = make_wc_subscription()   # no days_since_start → no start_date_gmt
-    sub["trial_end_date_gmt"] = past
-
+def test_renewal_subscription_cancelled(mock_get_fn, mock_put_fn):
+    """3+ related orders → renewal_subscription, but reuses subscription_cancelled status."""
+    sub = make_wc_subscription(days_since_start=120)
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [sub],
+        "orders": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
     })
     mock_put_fn.return_value = mock_put(200)
 
     client = make_client()
+    # No max_auto_cancel_orders passed → renewal-gate inactive → PUT happens.
     result = client.cancel_subscription("test@example.com")
-    assert result["subscription_type"] == "subscription"
+    assert result["subscription_type"] == "renewal_subscription"
     assert result["status"] == "subscription_cancelled"
+    assert result["cancelled"] is True
 
 
 # ── 7. pending-cancel subscription ───────────────────────────────────────── #
@@ -209,12 +206,14 @@ def test_pending_cancel_subscription(mock_get_fn, mock_put_fn):
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [sub],
+        "orders": [{"id": 1}, {"id": 2}],
     })
     mock_put_fn.return_value = mock_put(200)
 
     client = make_client()
     result = client.cancel_subscription("test@example.com")
     assert result["cancelled"] is True
+    assert result["subscription_type"] == "subscription"
 
 
 # ── 8. Cancel API returns error ───────────────────────────────────────────── #
@@ -244,6 +243,7 @@ def test_already_cancelled_subscription(mock_get_fn):
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [cancelled_sub],
+        "orders": [{"id": 1}, {"id": 2}],
     })
 
     client = make_client()
@@ -253,69 +253,59 @@ def test_already_cancelled_subscription(mock_get_fn):
     assert result["subscription_type"] == "subscription"
 
 
-# ── 10–19. _get_sub_type unit tests ──────────────────────────────────────── #
+# ── 10–15. _get_sub_type unit tests (related-order count rule) ──────────── #
 
 class TestGetSubType:
-    """Unit tests for WooCommerceClient._get_sub_type (static method)."""
+    """Unit tests for WooCommerceClient._get_sub_type (static method).
 
-    # ── order_count is the primary signal ────────────────────────────────── #
+    The classification rule is:
+      • 1 order  (Parent only)         → "trial"
+      • 2 orders (Parent + 1 Renewal)  → "subscription"
+      • 3+ orders                      → "renewal_subscription"
+      • None (lookup failure)          → "unknown" (caller must escalate)
+    """
 
-    def test_order_count_gt_1_returns_subscription(self):
-        start = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-        sub = {"start_date_gmt": start}
-        # Even if days ≤ 8, more than one order → definitely a subscription
+    def test_order_count_1_returns_trial(self):
+        """Parent order only → still in trial."""
+        assert WooCommerceClient._get_sub_type({}, order_count=1) == "trial"
+
+    def test_order_count_2_returns_subscription(self):
+        """Parent + 1 Renewal → first-period paid subscription."""
+        assert WooCommerceClient._get_sub_type({}, order_count=2) == "subscription"
+
+    def test_order_count_3_returns_renewal_subscription(self):
+        """Parent + 2 Renewals → renewal_subscription."""
+        assert WooCommerceClient._get_sub_type({}, order_count=3) == "renewal_subscription"
+
+    def test_order_count_high_returns_renewal_subscription(self):
+        """Any 3+ count → renewal_subscription regardless of how many."""
+        assert WooCommerceClient._get_sub_type({}, order_count=10) == "renewal_subscription"
+
+    def test_order_count_zero_returns_trial(self):
+        """0 successful orders → safe trial label (sub created but nothing charged yet)."""
+        assert WooCommerceClient._get_sub_type({}, order_count=0) == "trial"
+
+    def test_order_count_none_returns_unknown(self):
+        """API lookup failed (None) → 'unknown' so caller escalates.
+
+        Guessing the type when we cannot count orders risks sending the
+        wrong reply (e.g. trial copy 'nothing was charged' to a paying
+        customer). cancel_subscription() detects 'unknown' and returns
+        a transient_error, which existing escalation translates to a
+        Slack alert.
+        """
+        assert WooCommerceClient._get_sub_type({}, order_count=None) == "unknown"
+
+    def test_subscription_dict_is_unused(self):
+        """Subscription payload contents must not influence classification."""
+        sub = {
+            "start_date_gmt": "2020-01-01T00:00:00",
+            "trial_end_date_gmt": "2099-12-31T00:00:00",
+            "status": "active",
+        }
+        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "trial"
         assert WooCommerceClient._get_sub_type(sub, order_count=2) == "subscription"
-
-    def test_order_count_1_days_le_8_returns_trial(self):
-        start = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
-        sub = {"start_date_gmt": start}
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "trial"
-
-    def test_order_count_1_days_gt_8_returns_subscription(self):
-        start = (datetime.now(timezone.utc) - timedelta(days=15)).isoformat()
-        sub = {"start_date_gmt": start}
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "subscription"
-
-    def test_order_count_none_days_le_8_returns_trial(self):
-        """order_count=None (API timeout) + days ≤ 8 → still classified as trial."""
-        start = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
-        sub = {"start_date_gmt": start}
-        assert WooCommerceClient._get_sub_type(sub, order_count=None) == "trial"
-
-    def test_order_count_none_days_gt_8_returns_subscription(self):
-        start = (datetime.now(timezone.utc) - timedelta(days=20)).isoformat()
-        sub = {"start_date_gmt": start}
-        assert WooCommerceClient._get_sub_type(sub, order_count=None) == "subscription"
-
-    # ── fallback path: no start_date, use trial_end_date ─────────────────── #
-
-    def test_no_start_date_future_trial_end_returns_trial(self):
-        """No start_date + trial_end still in future + order_count=1 → trial."""
-        future = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
-        sub = {"trial_end_date_gmt": future}
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "trial"
-
-    def test_no_start_date_expired_trial_end_returns_subscription(self):
-        """No start_date + trial_end already past → subscription (expired trial)."""
-        past = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        sub = {"trial_end_date_gmt": past}
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "subscription"
-
-    def test_no_start_date_zero_trial_end_returns_subscription(self):
-        """'0000-00-00 00:00:00' sentinel → no trial → subscription."""
-        sub = {"trial_end_date_gmt": "0000-00-00 00:00:00"}
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "subscription"
-
-    def test_no_start_date_no_trial_end_returns_subscription(self):
-        """No date fields at all → safe default is subscription."""
-        sub = {}
-        assert WooCommerceClient._get_sub_type(sub, order_count=None) == "subscription"
-
-    def test_z_suffix_start_date_parsed_correctly(self):
-        """start_date_gmt with Z suffix (UTC) should parse without error."""
-        start = (datetime.now(timezone.utc) - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        sub = {"start_date_gmt": start}
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "trial"
+        assert WooCommerceClient._get_sub_type(sub, order_count=5) == "renewal_subscription"
 
 
 # ── 20. get_subscriptions_by_billing_email detail-fetch fallback ─────────── #

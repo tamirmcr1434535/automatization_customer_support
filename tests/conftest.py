@@ -12,20 +12,32 @@ def make_wc_subscription(
     sub_id: int = 101,
     status: str = "active",
     trial_days_from_now: int = 0,
+    days_since_start: int | None = None,
     plan_name: str = "IQ Test Monthly",
 ) -> dict:
-    """Build a fake WooCommerce subscription dict."""
+    """Build a fake WooCommerce subscription dict.
+
+    days_since_start, when provided, sets start_date_gmt to N days ago.
+    Kept for compatibility with existing integration-style tests; new
+    classification logic only depends on related-order count, not dates.
+    """
     if trial_days_from_now > 0:
         trial_end = (datetime.now(timezone.utc) + timedelta(days=trial_days_from_now)).isoformat()
     else:
         trial_end = "0000-00-00 00:00:00"
 
-    return {
+    sub: dict = {
         "id": sub_id,
         "status": status,
         "trial_end_date_gmt": trial_end,
         "line_items": [{"name": plan_name}],
     }
+
+    if days_since_start is not None:
+        start_dt = datetime.now(timezone.utc) - timedelta(days=days_since_start)
+        sub["start_date_gmt"] = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    return sub
 
 
 def make_wc_customer(customer_id: int = 42, email: str = "test@example.com") -> dict:
