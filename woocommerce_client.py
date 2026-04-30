@@ -543,22 +543,33 @@ class WooCommerceClient:
         return False
 
     # ================================================================== #
-    #  READ — order count (for trial vs subscription detection)          #
+    #  READ — related-orders breakdown (for trial / sub / renewal type)  #
     # ================================================================== #
 
-    def get_order_count(self, subscription_id: int) -> int | None:
+    def _get_completed_orders_breakdown(
+        self, subscription_id: int
+    ) -> dict | None:
         """
-        Return number of SUCCESSFUL orders for a subscription.
+        Fetch /subscriptions/{id}/orders and split the COMPLETED orders by
+        relationship (Parent vs Renewal), mirroring the "Related Orders"
+        panel in the WC admin (Order Number / Relationship / Date / Status).
 
-        Only orders with status=completed/processing count — failed retries,
-        cancelled orders, and refunded orders are excluded. The bot's "renewal
-        vs trial" gate uses this number, and a failed-charge sub should NOT
-        be treated as a paid renewal: customers were reporting tickets like
-        "I only paid 2 times" while the bot's note said "orders=4" because
-        the X-WP-Total header counted failed retry attempts.
+        Returns:
+          {"renewals": int, "parents": int, "total": int} on success
+          None if the orders lookup itself failed (timeout / 5xx / non-list
+          body) — the caller escalates instead of guessing the type.
 
-        We fetch up to 50 orders per page (the user-reported case had 4 total
-        orders so 50 is more than enough headroom) and count client-side.
+        A renewal order carries the meta key `_subscription_renewal` in its
+        meta_data; WC Subscriptions stamps this on every renewal it creates,
+        but never on the parent order. This is what the admin's
+        Relationship column reads, so using it keeps the bot's
+        classification aligned with what the support team sees.
+
+        Only status="completed" counts. Failed retries, cancelled, refunded,
+        pending, on-hold and even processing are excluded — a half-paid
+        renewal must not bump a sub into "renewal_subscription" (the prior
+        "I only paid 2 times while bot said orders=4" reports came from
+        counting failed retry attempts as paid renewals).
         """
         try:
             resp = requests.get(
@@ -568,7 +579,9 @@ class WooCommerceClient:
                 timeout=20,
             )
         except requests.exceptions.RequestException as e:
-            log.warning(f"WC: order count error for sub #{subscription_id}: {e}")
+            log.warning(
+                f"WC: orders breakdown error for sub #{subscription_id}: {e}"
+            )
             return None
 
         if not resp.ok:
@@ -578,35 +591,59 @@ class WooCommerceClient:
         if not isinstance(data, list):
             return None
 
-        # Statuses that represent a successful (paid-through) order. Anything
-        # else — failed, cancelled, refunded, pending, on-hold — is NOT a
-        # paid renewal and must not count toward the bot's renewal threshold.
-        _SUCCESSFUL_STATUSES = {"completed", "processing"}
-        successful = sum(
-            1 for o in data
-            if isinstance(o, dict) and o.get("status") in _SUCCESSFUL_STATUSES
-        )
-        return successful
+        renewals = 0
+        parents = 0
+        for o in data:
+            if not isinstance(o, dict) or o.get("status") != "completed":
+                continue
+            is_renewal = any(
+                isinstance(m, dict) and m.get("key") == "_subscription_renewal"
+                for m in (o.get("meta_data") or [])
+            )
+            if is_renewal:
+                renewals += 1
+            else:
+                parents += 1
+
+        return {
+            "renewals": renewals,
+            "parents": parents,
+            "total": renewals + parents,
+        }
+
+    def get_order_count(self, subscription_id: int) -> int | None:
+        """
+        Total number of COMPLETED orders (parent + renewals) for a sub.
+
+        Kept as a thin wrapper because main.py reads `order_count` for the
+        `>= MAX_BOT_ORDERS` escalation gate. Classification itself uses the
+        breakdown's renewal count directly via
+        `_get_completed_orders_breakdown`.
+        """
+        breakdown = self._get_completed_orders_breakdown(subscription_id)
+        if breakdown is None:
+            return None
+        return breakdown["total"]
 
     # ================================================================== #
-    #  Trial detection                                                   #
+    #  Trial / subscription / renewal classification                     #
     # ================================================================== #
 
     @staticmethod
-    def _get_sub_type(subscription: dict, order_count: int | None = None) -> str:
+    def _get_sub_type(
+        subscription: dict, renewal_count: int | None = None
+    ) -> str:
         """
-        Classify the subscription by its related-order count.
+        Classify the subscription by its number of COMPLETED renewal
+        orders, mirroring the Relationship column in the WC admin's
+        Related Orders panel:
+          • 0 renewals (Parent only)         → "trial"
+          • 1 renewal  (Parent + 1 Renewal)  → "subscription"
+          • 2+ renewals                      → "renewal_subscription"
+          • renewal_count=None               → "unknown"
 
-        The WooCommerce Subscription's "Related Orders" panel always lists
-        the Parent Order first, then a Renewal Order for each successful
-        recurring charge:
-          • 1 order  (Parent only)         → "trial"
-          • 2 orders (Parent + 1 Renewal)  → "subscription"
-          • 3+ orders (Parent + 2+ Renew.) → "renewal_subscription"
-
-        order_count=None means we could not fetch the orders list (API
-        timeout / lookup failure). We return "unknown" so the caller can
-        bail out and escalate to a human instead of guessing the type —
+        renewal_count=None means we could not fetch the orders list. We
+        return "unknown" so the caller escalates instead of guessing —
         a wrong guess (e.g. "trial" on a paying customer) is worse than
         asking ops to retry. cancel_subscription() detects "unknown" and
         returns a transient_error result, which the existing escalation
@@ -615,11 +652,11 @@ class WooCommerceClient:
         `subscription` is unused but kept in the signature so existing
         call sites do not have to change.
         """
-        if order_count is None:
+        if renewal_count is None:
             return "unknown"
-        if order_count <= 1:
+        if renewal_count <= 0:
             return "trial"
-        if order_count == 2:
+        if renewal_count == 1:
             return "subscription"
         return "renewal_subscription"
 
@@ -1150,8 +1187,16 @@ class WooCommerceClient:
                         "stale_cancelled_subscription_id": target.get("id"),
                     }
 
-                order_count = self.get_order_count(target["id"])
-                sub_type = self._get_sub_type(target, order_count=order_count)
+                breakdown = self._get_completed_orders_breakdown(target["id"])
+                if breakdown is None:
+                    renewal_count, parent_count, order_count = None, None, None
+                else:
+                    renewal_count = breakdown["renewals"]
+                    parent_count = breakdown["parents"]
+                    order_count = breakdown["total"]
+                sub_type = self._get_sub_type(
+                    target, renewal_count=renewal_count
+                )
                 plan = ""
                 li = target.get("line_items") or []
                 if li:
@@ -1159,7 +1204,8 @@ class WooCommerceClient:
 
                 log.info(
                     f"WC: already-cancelled sub #{target['id']} "
-                    f"(type={sub_type}, orders={order_count})"
+                    f"(type={sub_type}, parents={parent_count}, "
+                    f"renewals={renewal_count}, orders={order_count})"
                 )
                 return {
                     **base_result,
@@ -1168,7 +1214,9 @@ class WooCommerceClient:
                     "subscription_type": sub_type,
                     "subscription_id": target["id"],
                     "plan": plan or "IQ Test Subscription",
-                    "order_count": order_count,  # FIX: include for order-count gate in _finish_cancellation
+                    "order_count": order_count,  # total parent+renewals (gate input)
+                    "parent_count": parent_count,
+                    "renewal_count": renewal_count,
                 }
 
             log.info(f"WC: subscriptions found but none active for {email}")
@@ -1177,11 +1225,19 @@ class WooCommerceClient:
         # ── Step 4: pick best subscription to cancel ──────────────────── #
         typed_subs = []
         for s in active_subs:
-            oc = self.get_order_count(s["id"])
-            typed_subs.append((s, self._get_sub_type(s, order_count=oc), oc))
+            breakdown = self._get_completed_orders_breakdown(s["id"])
+            if breakdown is None:
+                rc, pc, oc = None, None, None
+            else:
+                rc = breakdown["renewals"]
+                pc = breakdown["parents"]
+                oc = breakdown["total"]
+            typed_subs.append(
+                (s, self._get_sub_type(s, renewal_count=rc), oc, pc, rc)
+            )
 
         def _priority(entry: tuple) -> int:
-            sub, stype, _oc = entry
+            sub, stype, _oc, _pc, _rc = entry
             st = sub.get("status", "")
             is_paid_sub = stype in ("subscription", "renewal_subscription")
             if st == "pending-cancel" and is_paid_sub:
@@ -1199,7 +1255,7 @@ class WooCommerceClient:
             return 5
 
         typed_subs.sort(key=_priority)
-        target, sub_type, order_count = typed_subs[0]
+        target, sub_type, order_count, parent_count, renewal_count = typed_subs[0]
 
         plan = ""
         li = target.get("line_items") or []
@@ -1230,6 +1286,8 @@ class WooCommerceClient:
                 "subscription_type": "unknown",
                 "plan": plan or "IQ Test Subscription",
                 "order_count": None,
+                "parent_count": None,
+                "renewal_count": None,
                 "error_kind": "transient_error",
                 "error_detail": detail[:300],
                 "error_step": "subscription_type_lookup",
@@ -1259,15 +1317,19 @@ class WooCommerceClient:
                 "subscription_id": target["id"],
                 "plan": plan or "IQ Test Subscription",
                 "order_count": order_count,
+                "parent_count": parent_count,
+                "renewal_count": renewal_count,
             }
 
         # ── Step 5: cancel ────────────────────────────────────────────── #
         cancel = self._cancel_sub_by_id(target["id"])
 
-        # Audit marker: tag every subscription the bot actually wrote to
-        # so a human can later filter "what did the bot touch" in the
-        # WooCommerce admin. Note write is best-effort; failures are
-        # logged but do not propagate.
+        # Audit marker: tag every subscription the bot successfully
+        # cancelled so a human can later filter "what did the bot touch"
+        # in the WC admin. Only on success — a failed PUT leaves the sub
+        # unchanged, so there's nothing for the audit trail to flag and
+        # we avoid noise from transient errors. Note write is best-effort;
+        # failures are logged but do not propagate.
         if cancel.get("cancelled"):
             self.add_subscription_note(
                 target["id"], "handled_by_ai_bot_assistant"
@@ -1276,7 +1338,9 @@ class WooCommerceClient:
         total_wc = time.time() - wc_start
         log.info(
             f"WC TIMING: total cancel_subscription for {email} = {total_wc:.1f}s "
-            f"(sub #{target['id']}, type={sub_type}, orders={order_count})"
+            f"(sub #{target['id']}, type={sub_type}, "
+            f"parents={parent_count}, renewals={renewal_count}, "
+            f"orders={order_count})"
         )
 
         if self.dry_run:
@@ -1301,6 +1365,8 @@ class WooCommerceClient:
             "subscription_id": target["id"],
             "plan": plan or "IQ Test Subscription",
             "order_count": order_count,
+            "parent_count": parent_count,
+            "renewal_count": renewal_count,
             "error": cancel.get("error"),
         }
 

@@ -44,6 +44,27 @@ def make_wc_customer(customer_id: int = 42, email: str = "test@example.com") -> 
     return {"id": customer_id, "email": email}
 
 
+def make_wc_order(
+    order_id: int = 1,
+    status: str = "completed",
+    is_renewal: bool = False,
+    subscription_id: int = 101,
+) -> dict:
+    """Build a fake WooCommerce order dict for /subscriptions/{id}/orders.
+
+    is_renewal=True adds the `_subscription_renewal` meta key WC stamps
+    on every renewal order — that's how the WC admin's Related Orders
+    panel distinguishes Parent Order vs Renewal Order, and what the
+    breakdown logic in WooCommerceClient reads.
+    """
+    order: dict = {"id": order_id, "status": status, "meta_data": []}
+    if is_renewal:
+        order["meta_data"].append(
+            {"key": "_subscription_renewal", "value": subscription_id}
+        )
+    return order
+
+
 @pytest.fixture
 def wc_customer():
     return make_wc_customer()

@@ -7,18 +7,18 @@ Test scenarios:
   1.  DRY_RUN mode — reads are mocked, returns dry_run status
   2.  Customer not found → not_found
   3.  Customer found, no subscriptions → no_active_sub
-  4.  Customer found, active TRIAL (days_since_start ≤ 8) → trial_cancelled
-  5.  Customer found, paid subscription (days_since_start > 8) → subscription_cancelled
-  6.  Customer found, expired trial (no start_date, past trial_end) → subscription_cancelled
+  4.  Customer found, no completed renewals → trial_cancelled
+  5.  Customer found, 1 completed renewal → subscription_cancelled
   7.  Customer found, pending-cancel subscription → subscription_cancelled
   8.  Cancel API returns error → propagates error status
   9.  Subscription already cancelled → already_cancelled
-  10. _get_sub_type: order_count=1 → trial (Parent only)
-  11. _get_sub_type: order_count=2 → subscription (Parent + 1 Renewal)
-  12. _get_sub_type: order_count=3 → renewal_subscription
-  13. _get_sub_type: order_count=10 → renewal_subscription (any 3+)
-  14. _get_sub_type: order_count=0 → trial (no orders → safe trial label)
-  15. _get_sub_type: order_count=None → unknown (escalate, do not guess type)
+  10. _get_sub_type: renewal_count=0 → trial (Parent only)
+  11. _get_sub_type: renewal_count=1 → subscription (Parent + 1 Renewal)
+  12. _get_sub_type: renewal_count=2 → renewal_subscription
+  13. _get_sub_type: renewal_count=10 → renewal_subscription (any 2+)
+  14. _get_sub_type: renewal_count=None → unknown (escalate, do not guess)
+  16. _get_completed_orders_breakdown: detects renewal via meta_data
+  17. _get_completed_orders_breakdown: excludes processing/failed
   20. get_subscriptions_by_billing_email: ?search= returns empty billing.email →
       individual detail fetch resolves meta_data._billing_email match
 """
@@ -28,7 +28,7 @@ from unittest.mock import patch, MagicMock
 from datetime import datetime, timezone, timedelta
 
 from woocommerce_client import WooCommerceClient
-from tests.conftest import make_wc_customer, make_wc_subscription
+from tests.conftest import make_wc_customer, make_wc_order, make_wc_subscription
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -50,17 +50,14 @@ def mock_get(responses: dict):
     Handles the /orders endpoint BEFORE /subscriptions to avoid the
     substring collision (subscriptions/101/orders contains "subscriptions").
 
-    The "orders" key in responses controls what the orders endpoint returns;
-    defaults to [] (no orders → order_count = 0 via len fallback).
-
-    Sets headers.get("X-WP-Total") to return None so get_order_count()
-    falls back to len(data) rather than int(MagicMock).
+    The "orders" key in responses controls what the orders endpoint
+    returns; defaults to [] (no related orders → 0 renewals → trial).
+    Pass make_wc_order(is_renewal=True) entries to simulate renewals.
     """
     def _get(url, **kwargs):
         mock_resp = MagicMock()
         mock_resp.ok = True
         mock_resp.status_code = 200
-        # Explicitly no X-WP-Total header → get_order_count() uses len(data)
         mock_resp.headers.get.return_value = None
 
         # Orders endpoint must be checked BEFORE "subscriptions" (substring match)
@@ -154,17 +151,20 @@ def test_active_trial_cancelled(mock_get_fn, mock_put_fn):
     assert result["subscription_id"] == trial_sub["id"]
 
 
-# ── 5. Paid subscription (2 related orders) → subscription_cancelled ─────── #
+# ── 5. Paid subscription (Parent + 1 Renewal) → subscription_cancelled ─── #
 
 @patch("woocommerce_client.requests.put")
 @patch("woocommerce_client.requests.get")
 def test_paid_subscription_cancelled(mock_get_fn, mock_put_fn):
-    # 2 related orders (Parent + 1 Renewal) → "subscription"
+    # 1 Parent + 1 Renewal (both completed) → "subscription"
     paid_sub = make_wc_subscription(days_since_start=40)
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [paid_sub],
-        "orders": [{"id": 1}, {"id": 2}],
+        "orders": [
+            make_wc_order(1, is_renewal=False),
+            make_wc_order(2, is_renewal=True),
+        ],
     })
     mock_put_fn.return_value = mock_put(200)
 
@@ -175,17 +175,22 @@ def test_paid_subscription_cancelled(mock_get_fn, mock_put_fn):
     assert result["subscription_type"] == "subscription"
 
 
-# ── 6. Renewal subscription (3+ related orders) → subscription_cancelled ─── #
+# ── 6. Renewal subscription (Parent + 2+ Renewals) → renewal_subscription ── #
 
 @patch("woocommerce_client.requests.put")
 @patch("woocommerce_client.requests.get")
 def test_renewal_subscription_cancelled(mock_get_fn, mock_put_fn):
-    """3+ related orders → renewal_subscription, but reuses subscription_cancelled status."""
+    """Parent + 3 Renewals → renewal_subscription; reuses subscription_cancelled status."""
     sub = make_wc_subscription(days_since_start=120)
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [sub],
-        "orders": [{"id": 1}, {"id": 2}, {"id": 3}, {"id": 4}],
+        "orders": [
+            make_wc_order(1, is_renewal=False),
+            make_wc_order(2, is_renewal=True),
+            make_wc_order(3, is_renewal=True),
+            make_wc_order(4, is_renewal=True),
+        ],
     })
     mock_put_fn.return_value = mock_put(200)
 
@@ -206,7 +211,10 @@ def test_pending_cancel_subscription(mock_get_fn, mock_put_fn):
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [sub],
-        "orders": [{"id": 1}, {"id": 2}],
+        "orders": [
+            make_wc_order(1, is_renewal=False),
+            make_wc_order(2, is_renewal=True),
+        ],
     })
     mock_put_fn.return_value = mock_put(200)
 
@@ -243,7 +251,10 @@ def test_already_cancelled_subscription(mock_get_fn):
     mock_get_fn.side_effect = mock_get({
         "customers": [make_wc_customer()],
         "subscriptions": [cancelled_sub],
-        "orders": [{"id": 1}, {"id": 2}],
+        "orders": [
+            make_wc_order(1, is_renewal=False),
+            make_wc_order(2, is_renewal=True),
+        ],
     })
 
     client = make_client()
@@ -253,48 +264,45 @@ def test_already_cancelled_subscription(mock_get_fn):
     assert result["subscription_type"] == "subscription"
 
 
-# ── 10–15. _get_sub_type unit tests (related-order count rule) ──────────── #
+# ── 10–15. _get_sub_type unit tests (renewal-count rule) ────────────────── #
 
 class TestGetSubType:
     """Unit tests for WooCommerceClient._get_sub_type (static method).
 
-    The classification rule is:
-      • 1 order  (Parent only)         → "trial"
-      • 2 orders (Parent + 1 Renewal)  → "subscription"
-      • 3+ orders                      → "renewal_subscription"
-      • None (lookup failure)          → "unknown" (caller must escalate)
+    Classification rule mirrors the Relationship column in the WC admin's
+    Related Orders panel (Parent Order vs Renewal Order):
+      • 0 renewals (Parent only)         → "trial"
+      • 1 renewal  (Parent + 1 Renewal)  → "subscription"
+      • 2+ renewals                      → "renewal_subscription"
+      • None (orders lookup failure)     → "unknown" (caller escalates)
     """
 
-    def test_order_count_1_returns_trial(self):
-        """Parent order only → still in trial."""
-        assert WooCommerceClient._get_sub_type({}, order_count=1) == "trial"
+    def test_zero_renewals_returns_trial(self):
+        """No completed renewals (Parent only) → still in trial."""
+        assert WooCommerceClient._get_sub_type({}, renewal_count=0) == "trial"
 
-    def test_order_count_2_returns_subscription(self):
+    def test_one_renewal_returns_subscription(self):
         """Parent + 1 Renewal → first-period paid subscription."""
-        assert WooCommerceClient._get_sub_type({}, order_count=2) == "subscription"
+        assert WooCommerceClient._get_sub_type({}, renewal_count=1) == "subscription"
 
-    def test_order_count_3_returns_renewal_subscription(self):
+    def test_two_renewals_returns_renewal_subscription(self):
         """Parent + 2 Renewals → renewal_subscription."""
-        assert WooCommerceClient._get_sub_type({}, order_count=3) == "renewal_subscription"
+        assert WooCommerceClient._get_sub_type({}, renewal_count=2) == "renewal_subscription"
 
-    def test_order_count_high_returns_renewal_subscription(self):
-        """Any 3+ count → renewal_subscription regardless of how many."""
-        assert WooCommerceClient._get_sub_type({}, order_count=10) == "renewal_subscription"
+    def test_many_renewals_returns_renewal_subscription(self):
+        """Any 2+ renewals → renewal_subscription regardless of count."""
+        assert WooCommerceClient._get_sub_type({}, renewal_count=10) == "renewal_subscription"
 
-    def test_order_count_zero_returns_trial(self):
-        """0 successful orders → safe trial label (sub created but nothing charged yet)."""
-        assert WooCommerceClient._get_sub_type({}, order_count=0) == "trial"
+    def test_renewal_count_none_returns_unknown(self):
+        """Orders lookup failed (None) → 'unknown' so caller escalates.
 
-    def test_order_count_none_returns_unknown(self):
-        """API lookup failed (None) → 'unknown' so caller escalates.
-
-        Guessing the type when we cannot count orders risks sending the
-        wrong reply (e.g. trial copy 'nothing was charged' to a paying
-        customer). cancel_subscription() detects 'unknown' and returns
-        a transient_error, which existing escalation translates to a
-        Slack alert.
+        Guessing the type when we cannot read the related orders risks
+        sending the wrong reply (e.g. trial copy 'nothing was charged'
+        to a paying customer). cancel_subscription() detects 'unknown'
+        and returns a transient_error, which existing escalation
+        translates to a Slack alert.
         """
-        assert WooCommerceClient._get_sub_type({}, order_count=None) == "unknown"
+        assert WooCommerceClient._get_sub_type({}, renewal_count=None) == "unknown"
 
     def test_subscription_dict_is_unused(self):
         """Subscription payload contents must not influence classification."""
@@ -303,9 +311,65 @@ class TestGetSubType:
             "trial_end_date_gmt": "2099-12-31T00:00:00",
             "status": "active",
         }
-        assert WooCommerceClient._get_sub_type(sub, order_count=1) == "trial"
-        assert WooCommerceClient._get_sub_type(sub, order_count=2) == "subscription"
-        assert WooCommerceClient._get_sub_type(sub, order_count=5) == "renewal_subscription"
+        assert WooCommerceClient._get_sub_type(sub, renewal_count=0) == "trial"
+        assert WooCommerceClient._get_sub_type(sub, renewal_count=1) == "subscription"
+        assert WooCommerceClient._get_sub_type(sub, renewal_count=4) == "renewal_subscription"
+
+
+# ── 16–17. _get_completed_orders_breakdown unit tests ────────────────────── #
+
+class TestCompletedOrdersBreakdown:
+    """Unit tests for WooCommerceClient._get_completed_orders_breakdown.
+
+    Mirrors the WC admin's Related Orders panel: a Parent Order has no
+    `_subscription_renewal` meta, every Renewal Order does. Only orders
+    with status="completed" are counted — failed retries, cancelled,
+    refunded, processing, pending, on-hold are excluded so a half-paid
+    renewal doesn't bump the sub into "renewal_subscription".
+    """
+
+    @patch("woocommerce_client.requests.get")
+    def test_renewal_meta_distinguishes_parent_from_renewal(self, mock_get_fn):
+        """Parent + 2 Renewals → renewals=2, parents=1, total=3."""
+        mock_get_fn.side_effect = mock_get({
+            "orders": [
+                make_wc_order(1, is_renewal=False),
+                make_wc_order(2, is_renewal=True),
+                make_wc_order(3, is_renewal=True),
+            ],
+        })
+        client = make_client()
+        breakdown = client._get_completed_orders_breakdown(101)
+        assert breakdown == {"renewals": 2, "parents": 1, "total": 3}
+
+    @patch("woocommerce_client.requests.get")
+    def test_non_completed_statuses_excluded(self, mock_get_fn):
+        """Failed/processing/refunded/etc. don't count.
+
+        The "I only paid 2 times while bot said orders=4" reports came
+        from counting failed retry attempts as paid renewals — guard
+        against a regression here.
+        """
+        mock_get_fn.side_effect = mock_get({
+            "orders": [
+                make_wc_order(1, is_renewal=False, status="completed"),
+                make_wc_order(2, is_renewal=True, status="completed"),
+                make_wc_order(3, is_renewal=True, status="failed"),
+                make_wc_order(4, is_renewal=True, status="processing"),
+                make_wc_order(5, is_renewal=True, status="refunded"),
+            ],
+        })
+        client = make_client()
+        breakdown = client._get_completed_orders_breakdown(101)
+        assert breakdown == {"renewals": 1, "parents": 1, "total": 2}
+
+    @patch("woocommerce_client.requests.get")
+    def test_request_failure_returns_none(self, mock_get_fn):
+        """Network error → None so caller escalates instead of guessing."""
+        import requests as _requests
+        mock_get_fn.side_effect = _requests.exceptions.Timeout("boom")
+        client = make_client()
+        assert client._get_completed_orders_breakdown(101) is None
 
 
 # ── 20. get_subscriptions_by_billing_email detail-fetch fallback ─────────── #

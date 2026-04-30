@@ -1545,6 +1545,8 @@ def _process(ticket_id: str) -> dict:
     # Enrich result with WC/Stripe lookup data for BQ logging
     result["subscription_type"] = cancel_result.get("subscription_type", "")
     result["order_count"] = cancel_result.get("order_count")
+    result["parent_count"] = cancel_result.get("parent_count")
+    result["renewal_count"] = cancel_result.get("renewal_count")
 
     log.info(
         f"[{ticket_id}] Cancel result: {cancel_status} "
@@ -1661,6 +1663,8 @@ def _process(ticket_id: str) -> dict:
             "subscription_type": wc_sub_type or "",
             "subscription_id": wc_sub_id,
             "order_count": wc_order_count,
+            "parent_count": cancel_result.get("parent_count"),
+            "renewal_count": cancel_result.get("renewal_count"),
         })
         log_result(result)
         return result
@@ -2032,6 +2036,8 @@ def _finish_cancellation(
     # ── Enrich result with subscription data for BQ logging ──────────── #
     result["subscription_type"] = cancel_result.get("subscription_type", "")
     result["order_count"] = cancel_result.get("order_count")
+    result["parent_count"] = cancel_result.get("parent_count")
+    result["renewal_count"] = cancel_result.get("renewal_count")
 
     # ── Order count gate ─────────────────────────────────────────────── #
     order_count = cancel_result.get("order_count")
@@ -2056,11 +2062,17 @@ def _finish_cancellation(
         zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
+        rc = cancel_result.get("renewal_count")
+        pc = cancel_result.get("parent_count")
+        breakdown_human = (
+            f"{pc} parent + {rc} renewal" if pc is not None and rc is not None
+            else f"{order_count} orders"
+        )
         zendesk.add_internal_note(
             ticket_id,
             f"🤖 Bot: subscription found (#{cancel_result.get('subscription_id')}, "
-            f"intent={intent}, orders={order_count}). "
-            f"Renewal subscription (>= {MAX_BOT_ORDERS} orders) — requires manual review.",
+            f"intent={intent}, {breakdown_human}). "
+            f"Renewal subscription (2+ renewals) — requires manual review.",
         )
         zendesk.set_open(ticket_id)
         result.update({
@@ -2325,6 +2337,8 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "subscription_type": woo_result.get("subscription_type"),
             "subscription_id": woo_result.get("subscription_id"),
             "order_count": woo_result.get("order_count"),
+            "parent_count": woo_result.get("parent_count"),
+            "renewal_count": woo_result.get("renewal_count"),
             "plan": woo_result.get("plan"),
         }
 
@@ -2354,6 +2368,8 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
             "subscription_type": woo_result.get("subscription_type"),
             "subscription_id": woo_result.get("subscription_id"),
             "order_count": woo_result.get("order_count"),
+            "parent_count": woo_result.get("parent_count"),
+            "renewal_count": woo_result.get("renewal_count"),
             "plan": woo_result.get("plan"),
         }
 

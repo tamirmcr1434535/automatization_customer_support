@@ -181,6 +181,8 @@ class SlackClient:
         source = result.get("cancel_source", "—")
         action = result.get("action", "—")
         order_count = result.get("order_count", "—")
+        parent_count = result.get("parent_count")
+        renewal_count = result.get("renewal_count")
 
         # Choose emoji by status
         emoji_map = {
@@ -229,7 +231,26 @@ class SlackClient:
             {"type": "mrkdwn", "text": f"*Language:*\n{lang}"},
             {"type": "mrkdwn", "text": f"*Source:*\n{source}"},
         ]
-        if order_count != "—":
+        # Show the WC Related Orders breakdown when we have it (parent /
+        # renewal split). Mirrors the "Relationship" column in the WC
+        # admin so the support team can read the bot's classification at
+        # a glance. Falls back to a plain order total if the bot only
+        # had the legacy count (older logs / Stripe-only path).
+        if parent_count is not None and renewal_count is not None:
+            if renewal_count == 0:
+                breakdown_text = f"Parent: {parent_count} (trial)"
+            elif renewal_count == 1:
+                breakdown_text = (
+                    f"Parent: {parent_count} + Renewal: {renewal_count} "
+                    "(subscription)"
+                )
+            else:
+                breakdown_text = (
+                    f"Parent: {parent_count} + Renewals: {renewal_count} "
+                    "(renewal subscription)"
+                )
+            fields.append({"type": "mrkdwn", "text": f"*Orders:*\n{breakdown_text}"})
+        elif order_count not in ("—", None):
             fields.append({"type": "mrkdwn", "text": f"*Orders:*\n{order_count}"})
         reply_count = result.get("reply_count")
         if reply_count is not None:
