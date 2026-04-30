@@ -1999,13 +1999,13 @@ def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
 
     Rules:
     - subscription_type == "trial" → TRIAL_CANCELLATION
-    - subscription_type in ("subscription", "renewal_subscription") → SUB_CANCELLATION
+    - subscription_type == "subscription" → SUB_CANCELLATION
     - anything else → keep text_intent as fallback
     """
     sub_type = cancel_result.get("subscription_type", "")
     if sub_type == "trial":
         return "TRIAL_CANCELLATION"
-    if sub_type in ("subscription", "renewal_subscription", "active"):
+    if sub_type in ("subscription", "active"):
         return "SUB_CANCELLATION"
     # Fallback: use whatever the text classifier said
     return text_intent
