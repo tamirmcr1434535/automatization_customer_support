@@ -88,13 +88,16 @@ Rules:
 - Replace "{BRAND_NAME}" with "{BRAND_NAME}" as-is (brand name stays unchanged)
 - Use the appropriate formal register for the target language:
   • JP: polite keigo (〜でございます, いただきありがとうございます).
-       FORMATTING (Japanese reading conventions for narrow screens):
+       FORMATTING (Japanese reading conventions):
        - Split into 3–4 short paragraphs separated by blank lines.
        - Within each paragraph, insert a line break (\\n) approximately
-         every 20–30 characters at NATURAL break points: after particles
+         every 38–48 characters at NATURAL break points: after particles
          (は / が / を / に / で / と / の), after punctuation (、 。),
          or between grammatical phrases. Each visible line should be
-         15–35 characters. Never break a word/compound in the middle.
+         30–55 characters. Never break a word/compound in the middle.
+       - Do NOT break too aggressively — short choppy fragments are
+         harder to read than fuller lines. Aim for the upper end of the
+         range when a phrase fits naturally.
   • KR: formal 존댓말 (〜드립니다)
   • DE: formal Sie-form
   • FR: formal vous-form
