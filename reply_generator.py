@@ -90,14 +90,15 @@ Rules:
   • JP: polite keigo (〜でございます, いただきありがとうございます).
        FORMATTING (Japanese reading conventions):
        - Split into 3–4 short paragraphs separated by blank lines.
-       - Within each paragraph, insert a line break (\\n) approximately
-         every 38–48 characters at NATURAL break points: after particles
-         (は / が / を / に / で / と / の), after punctuation (、 。),
-         or between grammatical phrases. Each visible line should be
-         30–55 characters. Never break a word/compound in the middle.
-       - Do NOT break too aggressively — short choppy fragments are
-         harder to read than fuller lines. Aim for the upper end of the
-         range when a phrase fits naturally.
+       - Within each paragraph, insert a line break (\\n) so that each
+         visible line is roughly 30–40 characters long, with 40 as the
+         hard upper limit (never exceed 40 chars per line). Break at
+         NATURAL points: after particles (は / が / を / に / で / と / の),
+         after punctuation (、 。), or between grammatical phrases.
+         Never break a word/compound in the middle.
+       - Aim for the upper end (35–40 chars). Do NOT produce short
+         choppy fragments under 25 chars unless a sentence naturally
+         ends there — full lines read better than over-broken text.
   • KR: formal 존댓말 (〜드립니다)
   • DE: formal Sie-form
   • FR: formal vous-form
