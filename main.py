@@ -120,6 +120,7 @@ if SHADOW_MODE:
 HANDLED_INTENTS = {
     "TRIAL_CANCELLATION",
     "SUB_CANCELLATION",
+    "SUB_RENEWAL_CANCELLATION",
 }
 
 # Tags set by the retired card-digits flow. A ticket carrying any of these
@@ -204,6 +205,9 @@ _TOPIC_BY_INTENT: dict[str, str] = {
     ),
     "SUB_CANCELLATION": os.getenv(
         "ZENDESK_TOPIC_SUB_CANCELLATION", "sub_cancellation",
+    ),
+    "SUB_RENEWAL_CANCELLATION": os.getenv(
+        "ZENDESK_TOPIC_SUB_RENEWAL_CANCELLATION", "sub_renewal_cancellation",
     ),
 }
 
@@ -1994,18 +1998,24 @@ def _extract_emails(text: str, exclude: str = "") -> list[str]:
 
 def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
     """
-    Determine final TRIAL_CANCELLATION vs SUB_CANCELLATION using actual data
-    returned by WooCommerce / Stripe — not just the text classifier.
+    Determine final intent using actual data returned by WooCommerce / Stripe
+    — not just the text classifier.
 
     Rules:
     - subscription_type == "trial" → TRIAL_CANCELLATION
-    - subscription_type == "subscription" → SUB_CANCELLATION
+    - subscription_type == "subscription"/"active" with order_count >= MAX_BOT_ORDERS
+      → SUB_RENEWAL_CANCELLATION (auto-handled like SUB_CANCELLATION; tagged
+      separately for support reporting)
+    - subscription_type == "subscription"/"active" otherwise → SUB_CANCELLATION
     - anything else → keep text_intent as fallback
     """
     sub_type = cancel_result.get("subscription_type", "")
+    order_count = cancel_result.get("order_count")
     if sub_type == "trial":
         return "TRIAL_CANCELLATION"
     if sub_type in ("subscription", "active"):
+        if order_count is not None and order_count >= MAX_BOT_ORDERS:
+            return "SUB_RENEWAL_CANCELLATION"
         return "SUB_CANCELLATION"
     # Fallback: use whatever the text classifier said
     return text_intent
@@ -2021,8 +2031,10 @@ def _finish_cancellation(
 ) -> dict:
     """Generate reply, tag, and solve the ticket after a successful cancellation.
 
-    Includes an order-count gate: subscriptions with >= MAX_BOT_ORDERS orders
-    are renewals that need manual review. The bot does NOT auto-cancel these.
+    Renewal subscriptions (order_count >= MAX_BOT_ORDERS) are auto-cancelled
+    the same way as a normal SUB_CANCELLATION; _resolve_intent flags them as
+    SUB_RENEWAL_CANCELLATION so the Topic / cancel_tag mapping records them
+    distinctly for support reporting.
     """
     # ── Resolve intent from actual subscription data ─────────────────── #
     # Text classifier guesses trial vs sub, but WC order count is the source of truth.
@@ -2032,48 +2044,6 @@ def _finish_cancellation(
     # ── Enrich result with subscription data for BQ logging ──────────── #
     result["subscription_type"] = cancel_result.get("subscription_type", "")
     result["order_count"] = cancel_result.get("order_count")
-
-    # ── Order count gate ─────────────────────────────────────────────── #
-    order_count = cancel_result.get("order_count")
-    if order_count is not None and order_count >= MAX_BOT_ORDERS:
-        # ── Override intent: this is a renewal, not a simple cancellation ── #
-        intent = "SUB_RENEWAL_CANCELLATION"
-        result["intent"] = intent
-
-        email = result.get("email", "unknown")
-        log.info(
-            f"[{ticket_id}] Renewal: intent={intent}, {order_count} orders "
-            f"(>= {MAX_BOT_ORDERS}) → escalate to agent (not auto-cancelling)"
-        )
-
-        current_tags = zendesk.get_ticket_tags(ticket_id)
-        if "bot_handled" in current_tags:
-            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
-            result["status"] = "skipped_race_condition"
-            return result
-
-        zendesk.add_tag(ticket_id, "bot_handled")
-        zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
-        zendesk.add_tag(ticket_id, "needs_manual_review")
-        zendesk.add_tag(ticket_id, "ai_bot_failed")
-        zendesk.add_internal_note(
-            ticket_id,
-            f"🤖 Bot: subscription found (#{cancel_result.get('subscription_id')}, "
-            f"intent={intent}, orders={order_count}). "
-            f"Renewal subscription (>= {MAX_BOT_ORDERS} orders) — requires manual review.",
-        )
-        zendesk.set_open(ticket_id)
-        result.update({
-            "status": "manual_review_required",
-            "action": "skipped_renewal_too_many_orders",
-            "order_count": order_count,
-            "reason": (
-                f"Subscription has {order_count} orders (>= {MAX_BOT_ORDERS} threshold) — "
-                "renewal subscription, bot does not auto-cancel, human review required."
-            ),
-        })
-        log_result(result)
-        return result
 
     reply_text = generate_reply(
         intent=intent,
@@ -2136,6 +2106,7 @@ def _finish_cancellation(
     cancel_tag = {
         "TRIAL_CANCELLATION": "trial_cancellation",
         "SUB_CANCELLATION": "sub_cancellation",
+        "SUB_RENEWAL_CANCELLATION": "sub_renewal_cancellation",
     }.get(intent, "cancelled")
 
     # By the time we reach this block the WC cancellation has ALREADY happened
@@ -2266,13 +2237,10 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     - status="not_found_anywhere"    — WC confirmed "no such email anywhere".
                                        Fall through to Stripe fallback in caller.
     """
-    # Pass the renewal threshold so WC skips the PUT entirely for
-    # subscriptions with too many orders. Previously this was gated AFTER
-    # the cancel, leaving customers with their sub cancelled in WC, no
-    # reply sent, and the ticket tagged "ai_bot_failed".
-    woo_result = woo.cancel_subscription(
-        email, max_auto_cancel_orders=MAX_BOT_ORDERS
-    )
+    # Renewal subscriptions (3+ orders) are auto-cancelled too — WC performs
+    # the PUT, _resolve_intent flags the ticket as SUB_RENEWAL_CANCELLATION
+    # for separate Topic / tag tracking.
+    woo_result = woo.cancel_subscription(email)
     woo_status = woo_result.get("status", "")
 
     # Successful WC outcome — return immediately

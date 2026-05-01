@@ -82,10 +82,19 @@ Your ONLY task is to translate the given English message into the target languag
 
 Rules:
 - Translate faithfully and completely — do NOT paraphrase, shorten, or add content
-- Preserve the exact structure, bullet points, and paragraph breaks
+- Preserve all factual content, but DO restructure long single paragraphs into
+  2–4 shorter paragraphs at natural topic boundaries, separated by a blank line.
+  Goal: replies should not be a wall of text on screen.
 - Replace "{BRAND_NAME}" with "{BRAND_NAME}" as-is (brand name stays unchanged)
 - Use the appropriate formal register for the target language:
-  • JP: polite keigo (〜でございます, いただきありがとうございます)
+  • JP: polite keigo (〜でございます, いただきありがとうございます).
+       FORMATTING (Japanese reading conventions for narrow screens):
+       - Split into 3–4 short paragraphs separated by blank lines.
+       - Within each paragraph, insert a line break (\\n) approximately
+         every 20–30 characters at NATURAL break points: after particles
+         (は / が / を / に / で / と / の), after punctuation (、 。),
+         or between grammatical phrases. Each visible line should be
+         15–35 characters. Never break a word/compound in the middle.
   • KR: formal 존댓말 (〜드립니다)
   • DE: formal Sie-form
   • FR: formal vous-form
