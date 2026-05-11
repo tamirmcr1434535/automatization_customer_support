@@ -420,6 +420,115 @@ class ZendeskClient:
             json={"ticket": {"comment": {"body": note, "public": False}}},
         )
 
+    # ── Merger support (search user tickets, merge, update status) ──────
+
+    def search_user_tickets(
+        self,
+        requester_id: str,
+        sort_by: str = "created_at",
+        sort_order: str = "asc",
+    ) -> dict[int, dict]:
+        """
+        Return all tickets for `requester_id`, keyed by ticket id.
+        Paginates through the Zendesk Search API. Used by ticket_merger
+        to discover sibling tickets before folding them into the oldest.
+
+        Always real, even in dry_run. Returns {} on any API error
+        (fail-open: caller will see no siblings → no merge).
+        """
+        if not requester_id:
+            return {}
+
+        tickets: dict[int, dict] = {}
+        url = f"{self.base}/search.json"
+        params = {
+            "query": f"type:ticket requester_id:{requester_id}",
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "per_page": 100,
+        }
+
+        try:
+            resp = requests.get(url, params=params, auth=self.auth, timeout=10)
+            if not resp.ok:
+                log.warning(
+                    f"search_user_tickets failed for {requester_id} "
+                    f"({resp.status_code}) — fail-open"
+                )
+                return {}
+            data = resp.json()
+            for t in data.get("results", []):
+                if t.get("id"):
+                    tickets[t["id"]] = t
+            next_page = data.get("next_page")
+            while next_page:
+                resp = requests.get(next_page, auth=self.auth, timeout=10)
+                if not resp.ok:
+                    log.warning(
+                        f"search_user_tickets pagination failed for "
+                        f"{requester_id} ({resp.status_code})"
+                    )
+                    break
+                data = resp.json()
+                for t in data.get("results", []):
+                    if t.get("id"):
+                        tickets[t["id"]] = t
+                next_page = data.get("next_page")
+        except requests.exceptions.RequestException as e:
+            log.warning(f"search_user_tickets error for {requester_id}: {e}")
+            return {}
+
+        return tickets
+
+    def merge_tickets(
+        self,
+        target_id: str,
+        source_ids: list,
+        target_comment: str = "",
+        source_comment: str = "",
+        target_comment_is_public: bool = False,
+        source_comment_is_public: bool = False,
+    ) -> dict | None:
+        """
+        Merge `source_ids` into `target_id` via Zendesk's native merge API.
+        Source tickets become closed and their contents land as comments
+        on the target. Returns the Zendesk job_status response on success,
+        or None in dry_run.
+        """
+        if self.dry_run:
+            log.info(
+                f"[DRY] merge {source_ids} → #{target_id} "
+                f"(target_comment={target_comment[:80]!r})"
+            )
+            return None
+        resp = self._request_with_retry(
+            "POST", f"{self.base}/tickets/{target_id}/merge",
+            json={
+                "ids": source_ids,
+                "target_comment": target_comment,
+                "source_comment": source_comment,
+                "target_comment_is_public": target_comment_is_public,
+                "source_comment_is_public": source_comment_is_public,
+            },
+        )
+        return resp.json()
+
+    def update_ticket_status(self, ticket_id: str, status: str) -> dict | None:
+        """
+        Update ticket status (e.g. "new", "open", "pending"). Used after a
+        merge to reset the survivor to an active state — Zendesk's merge
+        API can flip the target to "solved" otherwise. Returns the Zendesk
+        ticket response on success, or None in dry_run.
+        """
+        if self.dry_run:
+            log.info(f"[DRY] update_status '{status}' → #{ticket_id}")
+            return None
+        resp = self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
+            json={"ticket": {"status": status}},
+        )
+        return resp.json()
+
     # ── Search (read-only, always real) ──────────────────────────────────
 
     def search_tickets(self, query: str, per_page: int = 100) -> list[dict]:

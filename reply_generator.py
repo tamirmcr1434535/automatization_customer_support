@@ -89,10 +89,16 @@ Rules:
 - Use the appropriate formal register for the target language:
   • JP: polite keigo (〜でございます, いただきありがとうございます).
        FORMATTING (Japanese reading conventions):
-       - Split into 3–4 short paragraphs separated by blank lines.
-       - Within each paragraph, insert a line break (\\n) so that each
-         visible line is roughly 30–40 characters long, with 40 as the
-         hard upper limit (never exceed 40 chars per line). Break at
+       - Use TWO different newline patterns. CRITICAL — do not confuse them:
+         · BETWEEN paragraphs → exactly TWO newlines (\\n\\n) — one blank line
+         · WITHIN a paragraph → exactly ONE newline (\\n) — NO blank line.
+           Lines inside a paragraph must be directly adjacent, with nothing
+           between them. NEVER put \\n\\n between lines that belong to the
+           same paragraph.
+       - Split the message into 3–4 short paragraphs total.
+       - Within each paragraph, insert single-newline soft wraps so that
+         each visible line is roughly 30–40 characters long, with 40 as
+         the hard upper limit (never exceed 40 chars per line). Break at
          NATURAL points: after particles (は / が / を / に / で / と / の),
          after punctuation (、 。), or between grammatical phrases.
          Never break a word/compound in the middle.
