@@ -42,6 +42,7 @@ from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
 from slack_client import SlackClient
+import ticket_merger
 from reply_generator import (
     generate_reply,
     validate_reply,
@@ -101,15 +102,6 @@ SHADOW_MODE        = os.getenv("SHADOW_MODE", "false").lower() == "true"
 DRY_RUN            = os.getenv("DRY_RUN", "true").lower() == "true"
 TEST_MODE          = os.getenv("TEST_MODE", "true").lower() == "true"
 TEST_TAG           = "automation_test"
-
-# When the merge-candidate guard finds an active sibling ticket from the
-# same requester, pause this many seconds before deciding what to do.
-# The pause gives the Zendesk-side merger time to fold this ticket into
-# the sibling thread; we then re-fetch and let the "merge" tag / closed
-# status short-circuit the skip path. Tickets WITHOUT siblings are not
-# delayed, so the typical single-ticket flow stays as fast as before.
-# Set to 0 to disable.
-MERGE_DELAY_SECONDS = int(os.getenv("MERGE_DELAY_SECONDS", "30"))
 
 # SHADOW_MODE: process ALL tickets, skip ALL writes, send Slack report per ticket.
 # Overrides: DRY_RUN=true (no writes), TEST_MODE=false (all tickets), Slack stays live.
@@ -905,34 +897,56 @@ def _process(ticket_id: str) -> dict:
         result["status"] = "skipped_agent_already_replied"
         return result
 
-    # 2c-bis. Merge-candidate guard.
+    # 2c-bis. Merge-candidate guard + in-process merger.
     # If the customer already has ANOTHER active (new/open/pending/hold)
     # ticket within the last 14 days, this new one is almost certainly a
-    # follow-up that a human will merge into the existing thread (cf.
-    # #103787 → merged into #103735). If the bot tags / adds notes /
-    # escalates, those writes land on a ticket that is about to disappear
-    # into the parent, confuse agents, and steal merge authorship from
-    # Volodymyr et al. — so we stay completely hands-off here: NO tags,
-    # NO internal notes, NO reply. Just the one-per-ticket Slack report
-    # emitted by the webhook handler, which now carries the sibling ids.
+    # follow-up that should be folded into the existing thread.
     #
-    # When siblings exist we also pause MERGE_DELAY_SECONDS to let the
-    # Zendesk-side merger fold this ticket into the sibling thread, then
-    # re-fetch — if the merger acted, "merge" tag / closed status takes
-    # over and we report skipped_merged instead of skipped_merge_candidate.
+    # Strategy:
+    #   1. Detect siblings via find_active_tickets_for_email.
+    #   2. If found → invoke the in-process merger (ticket_merger.py),
+    #      which folds all active tickets into the OLDEST one via
+    #      Zendesk's native merge API.
+    #   3. Re-fetch THIS ticket — if it was merged into an older sibling
+    #      it now carries the "merge" tag (or is closed) → exit
+    #      skipped_merged / skipped_closed.
+    #   4. If THIS ticket survived as the merge target, re-check siblings
+    #      and continue processing normally. The legacy
+    #      skipped_merge_candidate path stays as a fallback for cases
+    #      where the merger refused to act (blacklisted email, errors).
     if email:
         active_siblings = zendesk.find_active_tickets_for_email(
             email, exclude_ticket_id=ticket_id, days=14,
         )
 
-        if active_siblings and MERGE_DELAY_SECONDS > 0:
+        if active_siblings:
             sibling_ids_pre = [str(t.get("id")) for t in active_siblings if t.get("id")]
+            requester_id = ticket.get("requester_id")
             log.info(
                 f"[{ticket_id}] {len(sibling_ids_pre)} active sibling(s) "
                 f"({', '.join('#' + s for s in sibling_ids_pre)}) — "
-                f"waiting {MERGE_DELAY_SECONDS}s for merger to settle"
+                "invoking in-process merger"
             )
-            _time.sleep(MERGE_DELAY_SECONDS)
+            if requester_id:
+                try:
+                    merge_result = ticket_merger.merge_user_tickets(
+                        ticket_id=str(ticket_id),
+                        requester_id=str(requester_id),
+                        zendesk=zendesk,
+                    )
+                    log.info(f"[{ticket_id}] merger result: {merge_result}")
+                except Exception as e:
+                    log.warning(
+                        f"[{ticket_id}] merger raised: {e}", exc_info=True
+                    )
+            else:
+                log.warning(
+                    f"[{ticket_id}] no requester_id on ticket — "
+                    "merger skipped, falling through to merge-candidate path"
+                )
+
+            # Re-fetch THIS ticket. If it was merged into an older sibling,
+            # "merge" tag / closed status takes over and we exit cleanly.
             ticket_after = zendesk.get_ticket(ticket_id)
             if ticket_after:
                 ticket = ticket_after
@@ -940,17 +954,17 @@ def _process(ticket_id: str) -> dict:
                 ticket_status = ticket.get("status", "open")
                 if "merge" in tags:
                     log.info(
-                        f"[{ticket_id}] Merger acted during wait — skipping (tag: merge)"
+                        f"[{ticket_id}] Merged into older sibling — exiting"
                     )
                     result["status"] = "skipped_merged"
                     return result
                 if ticket_status == "closed":
                     log.info(
-                        f"[{ticket_id}] Ticket closed during wait (likely merged)"
+                        f"[{ticket_id}] Ticket closed during merge — exiting"
                     )
                     result["status"] = "skipped_closed"
                     return result
-            # Merger may have resolved siblings instead of merging this one.
+            # Merger may have folded siblings INTO this ticket; re-check.
             active_siblings = zendesk.find_active_tickets_for_email(
                 email, exclude_ticket_id=ticket_id, days=14,
             )
