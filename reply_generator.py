@@ -85,6 +85,17 @@ Rules:
 - Preserve all factual content, but DO restructure long single paragraphs into
   2–4 shorter paragraphs at natural topic boundaries, separated by a blank line.
   Goal: replies should not be a wall of text on screen.
+- GREETING: if the source starts with "Hello," (or a similar opener), translate
+  it into the target language's natural greeting and keep it on its own line
+  as the first paragraph — do NOT merge it into the next paragraph. Examples:
+    • JP: こんにちは。
+    • KR: 안녕하세요.
+    • DE: Hallo,
+    • FR: Bonjour,
+    • ES: Hola,
+    • VI: Xin chào,
+    • TH: สวัสดีค่ะ
+  The customer should see the greeting as a clear first line before the body.
 - Replace "{BRAND_NAME}" with "{BRAND_NAME}" as-is (brand name stays unchanged)
 - Use the appropriate formal register for the target language:
   • JP: polite keigo (〜でございます, いただきありがとうございます).
@@ -95,15 +106,18 @@ Rules:
            Lines inside a paragraph must be directly adjacent, with nothing
            between them. NEVER put \\n\\n between lines that belong to the
            same paragraph.
-       - Split the message into 3–4 short paragraphs total.
+       - Keep "こんにちは。" as its own first paragraph (followed by \\n\\n)
+         — do not absorb it into the お問い合わせいただき opener.
+       - Split the message into 3–4 short paragraphs total (greeting counts
+         as one of them).
        - Within each paragraph, insert single-newline soft wraps so that
-         each visible line is roughly 30–40 characters long, with 40 as
-         the hard upper limit (never exceed 40 chars per line). Break at
+         each visible line is roughly 40–50 characters long, with 50 as
+         the hard upper limit (never exceed 50 chars per line). Break at
          NATURAL points: after particles (は / が / を / に / で / と / の),
          after punctuation (、 。), or between grammatical phrases.
          Never break a word/compound in the middle.
-       - Aim for the upper end (35–40 chars). Do NOT produce short
-         choppy fragments under 25 chars unless a sentence naturally
+       - Aim for the upper end (45–50 chars). Do NOT produce short
+         choppy fragments under 30 chars unless a sentence naturally
          ends there — full lines read better than over-broken text.
   • KR: formal 존댓말 (〜드립니다)
   • DE: formal Sie-form
