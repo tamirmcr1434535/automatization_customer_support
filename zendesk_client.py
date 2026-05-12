@@ -146,7 +146,12 @@ class ZendeskClient:
         only returns author_id (no embedded author object), so we must include users
         to reliably distinguish end-user comments from agent/bot comments.
 
-        agent_ids: set of user IDs whose role is "agent" or "admin".
+        agent_ids: set of user IDs whose role is NOT "end-user". This covers
+        "agent", "admin", and Zendesk's newer roles ("light-agent",
+        "contributor", custom role names). Previously the set only included
+        the two literal strings "agent" and "admin" — when Vova replied
+        under a non-default role, last_public_comment_is_from_agent
+        returned False and the bot wrote on top of his work.
         Always real, even in dry_run.
         """
         try:
@@ -162,7 +167,7 @@ class ZendeskClient:
         agent_ids = {
             u["id"]
             for u in data.get("users", [])
-            if u.get("role") in ("agent", "admin")
+            if u.get("role") and u.get("role") != "end-user"
         }
         return data.get("comments", []), agent_ids
 
