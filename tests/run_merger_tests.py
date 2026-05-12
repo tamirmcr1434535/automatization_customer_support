@@ -90,13 +90,17 @@ class WriteTracker:
 
 def _make_ticket(tid="99999", subject="Cancel subscription",
                  body="I want to cancel my subscription",
-                 email="test@example.com", tags=None, status="open"):
-    return {
+                 email="test@example.com", tags=None, status="open",
+                 followup_source_id=None):
+    t = {
         "id": tid, "subject": subject, "description": body,
         "tags": tags or [], "status": status,
         "requester": {"email": email, "name": "Test User"},
         "custom_fields": [],
     }
+    if followup_source_id is not None:
+        t["via_followup_source_id"] = followup_source_id
+    return t
 
 
 _PASS = 0
@@ -245,6 +249,40 @@ def _run_merger_test(
 
 # ── 5. Tests ────────────────────────────────────────────────────────────────
 
+# Smoke test for _is_followup_ticket helper — pure function, no _process needed
+print("=" * 74)
+print("FOLLOW-UP DETECTION SMOKE TESTS")
+print("=" * 74)
+_is_followup = bot._is_followup_ticket
+_followup_checks = [
+    ("via_followup_source_id set",
+     {"via_followup_source_id": 12345}, True),
+    ("via.source.rel = 'follow_up'",
+     {"via": {"source": {"rel": "follow_up"}}}, True),
+    ("regular email ticket — NOT follow-up",
+     {"via": {"channel": "email", "source": {"rel": "spam"}}}, False),
+    ("empty dict — NOT follow-up",
+     {}, False),
+    ("None — NOT follow-up",
+     None, False),
+]
+_followup_pass = 0
+_followup_fail = 0
+for name, ticket, expected in _followup_checks:
+    got = _is_followup(ticket)
+    ok = got == expected
+    icon = "PASS" if ok else "FAIL"
+    print(f"  [{icon}] {name} → expected={expected}, got={got}")
+    if ok:
+        _followup_pass += 1
+    else:
+        _followup_fail += 1
+print(f"FOLLOW-UP DETECTION: {_followup_pass} passed, {_followup_fail} failed")
+print()
+if _followup_fail > 0:
+    print(f"DEPLOYMENT BLOCKED: {_followup_fail} follow-up detection test(s) failed.")
+    sys.exit(1)
+
 print("=" * 74)
 print("MERGER INTEGRATION TESTS")
 print("=" * 74)
@@ -321,6 +359,47 @@ _run_merger_test(
     merger_status={"status": "no_action", "active_count": 1},
     refetch_overrides=None,
     expect_status="skipped_merge_candidate")
+
+# 13.x — Follow-up tickets: inherited tags must NOT block processing.
+# Regression for slowlife0127 #117184/#117190 (created as Zendesk follow-ups
+# that inherited bot_handled / closed_by_merge from parent tickets).
+
+_run_merger_test(
+    name="13.1 Follow-up with inherited bot_handled -> merger STILL runs",
+    ticket_data=_make_ticket(
+        tid="300",
+        tags=["bot_handled"],          # inherited from parent
+        followup_source_id=114279,     # marks ticket as a Zendesk follow-up
+    ),
+    siblings=[{"id": 299, "subject": "Older sibling", "status": "open"}],
+    merger_status={"status": "merged", "target_id": 299,
+                   "merged_ids": [300], "current_was_target": False},
+    refetch_overrides={"tags": ["closed_by_merge"]},
+    expect_status="skipped_merged")
+
+_run_merger_test(
+    name="13.2 Follow-up with inherited closed_by_merge -> merger STILL runs",
+    ticket_data=_make_ticket(
+        tid="301",
+        tags=["closed_by_merge"],      # inherited — NOT real merge of THIS ticket
+        followup_source_id=114279,
+    ),
+    siblings=[{"id": 299, "subject": "Older sibling", "status": "open"}],
+    merger_status={"status": "merged", "target_id": 299,
+                   "merged_ids": [301], "current_was_target": False},
+    refetch_overrides={"tags": ["closed_by_merge"]},
+    expect_status="skipped_merged")
+
+_run_merger_test(
+    name="13.3 Regular ticket with bot_handled STILL gets skipped (no regression)",
+    ticket_data=_make_ticket(
+        tid="302",
+        tags=["bot_handled"],
+        # NO followup_source_id -> not a follow-up
+    ),
+    siblings=[],
+    merger_status=None,
+    expect_status="skipped_already_handled")
 
 # ── 6. Summary ──────────────────────────────────────────────────────────────
 

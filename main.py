@@ -77,6 +77,33 @@ def _normalize_email(raw: str) -> str:
     return f"{local}@{domain}"
 
 
+def _is_followup_ticket(ticket: dict) -> bool:
+    """
+    Return True if this ticket is a Zendesk "follow-up" — i.e. created
+    automatically when a customer replied to a closed/solved ticket.
+
+    Zendesk copies the parent ticket's tags onto the follow-up at creation
+    time. That means tags like `bot_handled` and `closed_by_merge` appear
+    on the follow-up as INHERITED state from the parent, not as a record
+    of anything the bot did to THIS ticket. Our idempotency guards must
+    bypass those tags for follow-ups, otherwise the bot exits immediately
+    on every new follow-up (the slowlife0127 #117184 / #117190 case).
+
+    Detection uses Zendesk's `via_followup_source_id` field (set on the
+    ticket object when this ticket was generated as a follow-up) plus a
+    safety check on `via.source.rel == "follow_up"`.
+    """
+    if not ticket:
+        return False
+    if ticket.get("via_followup_source_id"):
+        return True
+    via = ticket.get("via") or {}
+    src = via.get("source") or {}
+    if src.get("rel") == "follow_up":
+        return True
+    return False
+
+
 def log_result(result: dict) -> None:
     """
     No-op.
@@ -826,9 +853,24 @@ def _process(ticket_id: str) -> dict:
 
     # ── 2. Guard checks (cheapest first, no API calls) ──────────────── #
 
+    # Zendesk follow-up tickets (created when a customer replies to a closed
+    # ticket) INHERIT all tags from the parent ticket — including
+    # `bot_handled` and `closed_by_merge` set during the parent's lifetime.
+    # Those inherited tags say nothing about THIS ticket's processing
+    # state, so we ignore them in the idempotency guards below. Without
+    # this bypass the bot exits on every follow-up before merger / reply
+    # ever run (cf. slowlife0127 #117184 / #117190 case).
+    is_followup = _is_followup_ticket(ticket)
+    if is_followup:
+        log.info(
+            f"[{ticket_id}] Zendesk follow-up detected "
+            f"(parent: #{ticket.get('via_followup_source_id') or '?'}) — "
+            "ignoring inherited bot_handled / closed_by_merge tags"
+        )
+
     # 2a. Idempotency — bot_handled tag blocks all re-processing.
     # Must be FIRST to prevent duplicate Slack alerts from parallel webhooks.
-    if "bot_handled" in tags:
+    if "bot_handled" in tags and not is_followup:
         log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping")
         result["status"] = "skipped_already_handled"
         return result
@@ -836,7 +878,7 @@ def _process(ticket_id: str) -> dict:
     # 2b. Skip merged-away tickets.
     # Zendesk's native merge API tags source tickets with `closed_by_merge`.
     # `merge` is kept as a fallback in case some external automation uses it.
-    if "closed_by_merge" in tags or "merge" in tags:
+    if ("closed_by_merge" in tags or "merge" in tags) and not is_followup:
         merge_tag = "closed_by_merge" if "closed_by_merge" in tags else "merge"
         log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: {merge_tag})")
         result["status"] = "skipped_merged"
