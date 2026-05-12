@@ -22,14 +22,14 @@ IMPORTANT — performance notes for iqbooster.org:
                                         → we paginate + client-side filter (up to 5 pages)
     GET /orders?customer={id}         — always times out on iqbooster.org (removed)
 
-  Lookup strategy (CF timeout = 3600s, generous timeouts):
+  Lookup strategy (CF timeout = 3600s, 15-min SLA budget = 900s):
     1.  /customers?email=              (15s timeout, indexed but server can be slow)
     1b. /customers?search=             (30s timeout, PayPal fallback)
     2a. customer meta_data → /subscriptions/{id}  (15s timeout)
-    2b. /subscriptions?customer=       (90s timeout, MOST RELIABLE)
+    2b. /subscriptions?customer=       (3 attempts: 90→120→150s + 3s/5s backoff, MOST RELIABLE)
     2c. /subscriptions?billing_email=  (60s timeout per page, up to 5 pages if filter broken)
     2d. /subscriptions?search=         (120s timeout, per_page=100, last resort)
-    Worst case: 15s + 30s + 90s + 300s + 120s = 555s (CF=3600s — plenty of room)
+    Worst case: 15 + 30 + 15 + 368(2b w/retries) + 300 + 120 = 848s ≈ 14.1 min (fits 15-min SLA)
 """
 
 import logging
@@ -48,44 +48,76 @@ log = logging.getLogger("woocommerce")
 _TRANSIENT_HTTP_STATUSES = (502, 503, 504)
 
 
-def _request_with_retry(method, url, *, max_retries=1, timeout, **kwargs):
+def _request_with_retry(
+    method, url, *,
+    max_retries=1,
+    timeout,
+    timeout_schedule=None,
+    backoff_sleeps=None,
+    **kwargs,
+):
     """
     HTTP request with automatic retry on timeout / network errors / gateway
-    transient 5xx (502/503/504). On retry, timeout is doubled to give the
-    slow server more time. Returns the response (which may itself be a non-OK
-    transient response if all retries failed), or raises the last exception
-    if all retries failed with an exception.
+    transient 5xx (502/503/504). Returns the response (which may itself be a
+    non-OK transient response if all retries failed), or raises the last
+    exception if all retries failed with an exception.
+
+    Two retry modes:
+      - Default: timeout doubles on each retry (max_retries=1 → [t, 2t]).
+        Used by every caller that doesn't pass timeout_schedule.
+      - Explicit schedule: timeout_schedule=(90, 120, 150) gives precisely
+        those per-attempt timeouts and overrides max_retries. Used by the
+        2b ?customer= path to stay under the 15-min SLA while still
+        getting 3 attempts at WC.
+
+    backoff_sleeps=(3, 5) pauses 3s before retry #2 and 5s before retry #3.
+    Pauses run on any retry trigger (transient HTTP, timeout, network error)
+    to let the upstream gateway recover instead of immediately re-hammering it.
     """
+    if timeout_schedule is not None:
+        timeouts = list(timeout_schedule)
+    else:
+        timeouts = [timeout * (2 ** i) for i in range(1 + max_retries)]
+    attempts = len(timeouts)
+    sleeps = list(backoff_sleeps) if backoff_sleeps else []
+
     last_exc = None
     last_resp = None
-    for attempt in range(1 + max_retries):
-        current_timeout = timeout * (2 ** attempt)  # double on each retry
+    for attempt in range(attempts):
+        current_timeout = timeouts[attempt]
+        is_last = attempt == attempts - 1
         try:
             resp = requests.request(
                 method, url, timeout=current_timeout, **kwargs
             )
-            if resp.status_code in _TRANSIENT_HTTP_STATUSES and attempt < max_retries:
+            if resp.status_code in _TRANSIENT_HTTP_STATUSES and not is_last:
                 last_resp = resp
                 log.warning(
                     f"WC: transient {resp.status_code} ({current_timeout}s) → "
                     f"retrying: {method} {url}"
                 )
+                if attempt < len(sleeps):
+                    time.sleep(sleeps[attempt])
                 continue
             return resp
         except requests.exceptions.Timeout as e:
             last_exc = e
             log.warning(
                 f"WC: request timed out ({current_timeout}s) → "
-                f"{'retrying' if attempt < max_retries else 'giving up'}: "
+                f"{'giving up' if is_last else 'retrying'}: "
                 f"{method} {url}"
             )
+            if not is_last and attempt < len(sleeps):
+                time.sleep(sleeps[attempt])
         except requests.exceptions.RequestException as e:
             last_exc = e
             log.warning(
                 f"WC: request error → "
-                f"{'retrying' if attempt < max_retries else 'giving up'}: "
+                f"{'giving up' if is_last else 'retrying'}: "
                 f"{method} {url}: {e}"
             )
+            if not is_last and attempt < len(sleeps):
+                time.sleep(sleeps[attempt])
     if last_resp is not None:
         # All retries exhausted with transient HTTP status — return the last
         # response so the caller can classify it via _error_kind_from_response.
@@ -891,7 +923,8 @@ class WooCommerceClient:
                 t2b = time.time()
                 try:
                     log.info(
-                        f"WC: trying ?customer={customer_id} (90s timeout + retry)"
+                        f"WC: trying ?customer={customer_id} "
+                        "(3 attempts: 90→120→150s + 3s/5s backoff)"
                     )
                     resp = _request_with_retry(
                         "GET",
@@ -899,7 +932,8 @@ class WooCommerceClient:
                         params={"customer": customer_id, "per_page": 10, "status": "any"},
                         auth=self.auth,
                         timeout=90,
-                        max_retries=1,
+                        timeout_schedule=(90, 120, 150),
+                        backoff_sleeps=(3, 5),
                     )
                     if resp.ok:
                         customer_subs = resp.json()
