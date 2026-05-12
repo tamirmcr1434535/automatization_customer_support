@@ -211,6 +211,28 @@ def test_merge_api_failure_returns_error_status():
     assert "Zendesk 500" in out["errors"][0]
 
 
+def test_solved_oldest_gets_reopened_when_followup_arrives():
+    """
+    Regression: shiho12210 case — bot solved #116700, then #116783 and
+    #116801 arrived as follow-ups. Merger should fold the newer ones INTO
+    the solved oldest AND reset its status to "open" so a human sees it.
+    """
+    tickets = {
+        # #116700 was already solved by the bot
+        116700: _ticket(116700, status="solved", created_at="2026-05-11T16:08:00Z"),
+        # #116783 just arrived (current)
+        116783: _ticket(116783, status="new", created_at="2026-05-11T18:04:00Z"),
+    }
+    fake = FakeZendesk(tickets)
+    out = merge_user_tickets("116783", "42", fake)
+    assert out["status"] == "merged"
+    assert out["target_id"] == 116700
+    assert out["merged_ids"] == [116783]
+    assert out["current_was_target"] is False
+    # Solved oldest is NOT "new", so target_status = "open" → solved → open.
+    assert fake.status_updates == [("116700", "open")]
+
+
 def test_email_extraction_is_lowercased_and_stripped():
     """Case/whitespace variations of blacklisted emails are normalized."""
     blacklisted = next(iter(EMAIL_BLACKLIST))

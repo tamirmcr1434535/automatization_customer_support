@@ -365,15 +365,19 @@ class ZendeskClient:
         days: int = 14,
     ) -> list[dict]:
         """
-        Return tickets from the same requester that are still ACTIVE
-        (status < solved, i.e. new / open / pending / hold) within the
-        last `days` days, excluding `exclude_ticket_id`.
+        Return tickets from the same requester that are still MERGEABLE
+        (status < closed, i.e. new / open / pending / hold / solved)
+        within the last `days` days, excluding `exclude_ticket_id`.
 
-        Used by `_process` as a merge-candidate guard: if the customer
-        already has an active ticket, this new ticket is almost certainly
-        a follow-up that a human will merge. The bot must stay hands-off
-        so its tags / internal notes don't land on a ticket about to be
-        merged away (which confuses agents and wastes their time).
+        Includes SOLVED tickets on purpose: a Solved sibling means the bot
+        already replied to an earlier message from this customer, and the
+        new ticket is a follow-up (cf. shiho12210 case where #116700 was
+        Solved before #116783 / #116801 arrived). The merger needs to see
+        those Solved tickets so it can fold the follow-up into the
+        original thread and re-open it for human review. Only truly
+        Closed (archived) tickets are excluded.
+
+        Used by `_process` to decide whether to invoke ticket_merger.
 
         Always performs a real API call even in dry_run — read-only, safe.
         Returns [] on any API error (fail-open: bot continues as normal).
@@ -387,7 +391,7 @@ class ZendeskClient:
 
         query = (
             f"type:ticket requester:{email} "
-            f"status<solved created>{cutoff}"
+            f"status<closed created>{cutoff}"
         )
         try:
             resp = requests.get(

@@ -898,9 +898,13 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 2c-bis. Merge-candidate guard + in-process merger.
-    # If the customer already has ANOTHER active (new/open/pending/hold)
-    # ticket within the last 14 days, this new one is almost certainly a
-    # follow-up that should be folded into the existing thread.
+    # If the customer already has ANOTHER mergeable (new/open/pending/hold
+    # /solved — anything < closed) ticket within the last 14 days, this
+    # new one is almost certainly a follow-up that should be folded into
+    # the existing thread. Solved siblings count because the bot itself
+    # often solves a first ticket within minutes, and follow-up emails
+    # ("URGENT", "FINAL DEMAND", etc.) need to land on the original
+    # thread + reopen it for human review.
     #
     # Strategy:
     #   1. Detect siblings via find_active_tickets_for_email.
