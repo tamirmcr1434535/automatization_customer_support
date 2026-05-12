@@ -851,38 +851,74 @@ def _process(ticket_id: str) -> dict:
 
     log.info(f"[{ticket_id}] Subject: {subject[:60]} | Email: {email}")
 
-    # ── 2. Guard checks (cheapest first, no API calls) ──────────────── #
+    # ── 2. Guard checks ─────────────────────────────────────────────── #
 
     # Zendesk follow-up tickets (created when a customer replies to a closed
     # ticket) INHERIT all tags from the parent ticket — including
     # `bot_handled` and `closed_by_merge` set during the parent's lifetime.
-    # Those inherited tags say nothing about THIS ticket's processing
-    # state, so we ignore them in the idempotency guards below. Without
-    # this bypass the bot exits on every follow-up before merger / reply
-    # ever run (cf. slowlife0127 #117184 / #117190 case).
+    # Those inherited tags say nothing about THIS follow-up's state.
+    # We can't tell from the tag alone whether the bot has actually
+    # processed THIS follow-up vs. inherited the tag from the parent, so
+    # for follow-ups we fall back to count_bot_replies (one extra API
+    # call, only on follow-up webhooks) as the source of truth.
+    # Without this bypass the bot exits on every follow-up before merger
+    # / reply ever runs (cf. slowlife0127 #117184 / #117190 case).
     is_followup = _is_followup_ticket(ticket)
     if is_followup:
         log.info(
             f"[{ticket_id}] Zendesk follow-up detected "
-            f"(parent: #{ticket.get('via_followup_source_id') or '?'}) — "
-            "ignoring inherited bot_handled / closed_by_merge tags"
+            f"(parent: #{ticket.get('via_followup_source_id') or '?'})"
         )
+
+    _bot_reply_count_cache: int | None = None
+
+    def _bot_has_acted_on_this_ticket() -> bool:
+        """
+        For follow-ups, verify that bot has actually replied on THIS
+        ticket (not just inherited a tag from the parent).
+        Cached via closure so we call the Zendesk API at most once.
+        """
+        nonlocal _bot_reply_count_cache
+        if _bot_reply_count_cache is None:
+            _bot_reply_count_cache = zendesk.count_bot_replies(ticket_id)
+            log.info(
+                f"[{ticket_id}] follow-up idempotency check: "
+                f"count_bot_replies = {_bot_reply_count_cache}"
+            )
+        return _bot_reply_count_cache > 0
 
     # 2a. Idempotency — bot_handled tag blocks all re-processing.
     # Must be FIRST to prevent duplicate Slack alerts from parallel webhooks.
-    if "bot_handled" in tags and not is_followup:
-        log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping")
-        result["status"] = "skipped_already_handled"
-        return result
+    if "bot_handled" in tags:
+        if is_followup and not _bot_has_acted_on_this_ticket():
+            log.info(
+                f"[{ticket_id}] bot_handled tag inherited from parent "
+                "(no bot replies on this follow-up yet) — continuing"
+            )
+        else:
+            log.info(f"[{ticket_id}] Already handled by bot (tag: bot_handled) — skipping")
+            result["status"] = "skipped_already_handled"
+            return result
 
     # 2b. Skip merged-away tickets.
     # Zendesk's native merge API tags source tickets with `closed_by_merge`.
     # `merge` is kept as a fallback in case some external automation uses it.
-    if ("closed_by_merge" in tags or "merge" in tags) and not is_followup:
+    # For follow-ups: same rule — verify with count_bot_replies. If bot
+    # hasn't replied yet, the tag is inherited and we should process.
+    # (Tickets actually merged-away end up with status=closed and are
+    # caught by the status check immediately below — this guard is just
+    # a fast path.)
+    if "closed_by_merge" in tags or "merge" in tags:
         merge_tag = "closed_by_merge" if "closed_by_merge" in tags else "merge"
-        log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: {merge_tag})")
-        result["status"] = "skipped_merged"
-        return result
+        if is_followup and not _bot_has_acted_on_this_ticket():
+            log.info(
+                f"[{ticket_id}] {merge_tag} tag inherited from parent "
+                "(no bot replies on this follow-up yet) — continuing"
+            )
+        else:
+            log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: {merge_tag})")
+            result["status"] = "skipped_merged"
+            return result
 
     if ticket_status == "closed":
         log.info(f"[{ticket_id}] Skipping — ticket status is 'closed' (likely merged)")

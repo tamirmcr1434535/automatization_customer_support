@@ -113,6 +113,7 @@ def _run_merger_test(
     refetch_overrides=None, expect_status=None,
     expect_no_reply=True, requester_id=42,
     siblings_after_merge=None,
+    bot_reply_count=0,
 ):
     global _PASS, _FAIL
     tracker = WriteTracker()
@@ -178,7 +179,8 @@ def _run_merger_test(
         stack.enter_context(patch.object(bot.zendesk, "solve_ticket", side_effect=lambda t: None))
         stack.enter_context(patch.object(bot.zendesk, "set_open", return_value=None))
         stack.enter_context(patch.object(bot.zendesk, "add_internal_note", side_effect=_on_note))
-        stack.enter_context(patch.object(bot.zendesk, "count_bot_replies", return_value=0))
+        stack.enter_context(patch.object(bot.zendesk, "count_bot_replies",
+            return_value=bot_reply_count))
         stack.enter_context(patch.object(bot.zendesk, "get_ticket_tags",
             return_value=ticket_data.get("tags", [])))
         stack.enter_context(patch.object(bot.zendesk, "last_public_comment_is_from_agent",
@@ -400,6 +402,35 @@ _run_merger_test(
     siblings=[],
     merger_status=None,
     expect_status="skipped_already_handled")
+
+_run_merger_test(
+    name="13.4 Re-opened follow-up with bot_handled + bot reply present -> SKIP",
+    # Edge case: bot already processed a follow-up (replied + marked Solved),
+    # customer replied, ticket re-opened to Open. Webhook fires again.
+    # Even though it's still a follow-up (via_followup_source_id set), the
+    # bot has actually replied here so we must NOT reprocess. Verified via
+    # count_bot_replies > 0.
+    ticket_data=_make_ticket(
+        tid="303",
+        tags=["bot_handled"],
+        followup_source_id=114279,
+    ),
+    siblings=[],
+    merger_status=None,
+    bot_reply_count=1,  # bot already replied on this follow-up
+    expect_status="skipped_already_handled")
+
+_run_merger_test(
+    name="13.5 Re-opened follow-up with closed_by_merge + bot reply -> SKIP",
+    ticket_data=_make_ticket(
+        tid="304",
+        tags=["closed_by_merge"],
+        followup_source_id=114279,
+    ),
+    siblings=[],
+    merger_status=None,
+    bot_reply_count=2,
+    expect_status="skipped_merged")
 
 # ── 6. Summary ──────────────────────────────────────────────────────────────
 
