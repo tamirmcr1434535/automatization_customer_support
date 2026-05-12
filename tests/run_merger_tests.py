@@ -260,11 +260,20 @@ _run_merger_test(
     expect_no_reply=False)
 
 _run_merger_test(
-    name="12.2 Siblings exist, current merged INTO oldest -> skipped_merged",
+    name="12.2 Siblings exist, current merged INTO oldest -> skipped_merged (closed_by_merge tag)",
     ticket_data=_make_ticket(tid="200"),
     siblings=[{"id": 199, "subject": "Older ticket", "status": "open"}],
     merger_status={"status": "merged", "target_id": 199,
                    "merged_ids": [200], "current_was_target": False},
+    refetch_overrides={"tags": ["closed_by_merge"]},  # Zendesk's actual tag
+    expect_status="skipped_merged")
+
+_run_merger_test(
+    name="12.2b Legacy 'merge' tag still recognized (backward compat)",
+    ticket_data=_make_ticket(tid="202"),
+    siblings=[{"id": 199, "subject": "Older ticket", "status": "open"}],
+    merger_status={"status": "merged", "target_id": 199,
+                   "merged_ids": [202], "current_was_target": False},
     refetch_overrides={"tags": ["merge"]},
     expect_status="skipped_merged")
 

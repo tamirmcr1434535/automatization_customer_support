@@ -834,8 +834,11 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 2b. Skip merged-away tickets.
-    if "merge" in tags:
-        log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: merge)")
+    # Zendesk's native merge API tags source tickets with `closed_by_merge`.
+    # `merge` is kept as a fallback in case some external automation uses it.
+    if "closed_by_merge" in tags or "merge" in tags:
+        merge_tag = "closed_by_merge" if "closed_by_merge" in tags else "merge"
+        log.info(f"[{ticket_id}] Skipping — ticket was merged into another (tag: {merge_tag})")
         result["status"] = "skipped_merged"
         return result
 
@@ -956,7 +959,9 @@ def _process(ticket_id: str) -> dict:
                 ticket = ticket_after
                 tags = ticket.get("tags", [])
                 ticket_status = ticket.get("status", "open")
-                if "merge" in tags:
+                # Zendesk's native merge API tags source tickets with
+                # `closed_by_merge`; older external automations used `merge`.
+                if "closed_by_merge" in tags or "merge" in tags:
                     log.info(
                         f"[{ticket_id}] Merged into older sibling — exiting"
                     )
