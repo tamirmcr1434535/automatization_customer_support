@@ -925,67 +925,17 @@ def _process(ticket_id: str) -> dict:
         result["status"] = "skipped_closed"
         return result
 
-    # ── 2c. Early subject/body signals (still no API calls) ──────────── #
-
-    # Follow-up ticket detection.
-    # Zendesk auto-prepends "This is a follow-up to your previous request #XXXXX"
-    # when a customer replies to a closed/solved ticket. These are escalations
-    # that an agent already touched — the bot must not interfere.
-    _FOLLOWUP_SIGNALS = [
-        "this is a follow-up to your previous request",
-        "follow-up to your previous request",
-        "follow up to your previous request",
-        "following up on my previous request",
-        "following up on ticket",
-        "in reference to ticket",
-        "regarding my previous request",
-    ]
-    body_lower_early = body.lower()
-    if any(sig in body_lower_early for sig in _FOLLOWUP_SIGNALS):
-        log.info(
-            f"[{ticket_id}] Follow-up ticket detected (references previous request) "
-            "→ skipping, sending Slack alert for manual review"
-        )
-        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
-        result["status"] = "skipped_followup"
-        result["intent"] = "FOLLOWUP"
-        result["reason"] = "Follow-up to a previous request — agent already handled or will handle this thread"
-        log_result(result)
-        return result
-
-    # Subject refund check — if the email subject itself contains refund
-    # keywords, this is an escalation/dispute and should go straight to a human.
-    if _contains_refund_request(subject):
-        log.info(
-            f"[{ticket_id}] Refund keyword in subject line: '{subject[:60]}' "
-            "→ skipping, sending Slack alert"
-        )
-        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
-        result["intent"] = "REFUND_REQUEST"
-        result["status"] = "skipped_refund_request"
-        result["reason"] = "Refund keyword detected in subject — refund disputes require a human"
-        log_result(result)
-        return result
-
-    # 2c. Skip if a human agent already replied publicly.
-    # If the last public comment is from our team, they are already handling it —
-    # no need for the bot to classify, escalate, or interfere.
-    if zendesk.last_public_comment_is_from_agent(ticket_id):
-        log.info(
-            f"[{ticket_id}] Last public comment is from an agent — "
-            "skipping (human already replied)"
-        )
-        result["status"] = "skipped_agent_already_replied"
-        return result
-
-    # 2c-bis. Merge-candidate guard + in-process merger.
-    # If the customer already has ANOTHER mergeable (new/open/pending/hold
-    # /solved — anything < closed) ticket within the last 14 days, this
-    # new one is almost certainly a follow-up that should be folded into
-    # the existing thread. Solved siblings count because the bot itself
-    # often solves a first ticket within minutes, and follow-up emails
-    # ("URGENT", "FINAL DEMAND", etc.) need to land on the original
-    # thread + reopen it for human review.
+    # ── 2c-bis. Merge-candidate guard + in-process merger. ──────────── #
+    #
+    # Run BEFORE the heuristic skip guards (follow-up text / refund-subject
+    # / agent-replied). Reason: if the customer already has a recent sibling
+    # ticket, we want to fold THIS one into that thread regardless of what
+    # this ticket's subject or body says. The slowlife0127 / khn3138 cases
+    # both hit the refund-subject guard (line below) and exited before the
+    # merger ever ran — so duplicates piled up as separate tickets even
+    # though they belonged to one conversation. Merging first keeps the
+    # support thread together; subject-based skips still apply afterwards
+    # if this ticket survives as the merge target.
     #
     # Strategy:
     #   1. Detect siblings via find_active_tickets_for_email.
@@ -993,7 +943,7 @@ def _process(ticket_id: str) -> dict:
     #      which folds all active tickets into the OLDEST one via
     #      Zendesk's native merge API.
     #   3. Re-fetch THIS ticket — if it was merged into an older sibling
-    #      it now carries the "merge" tag (or is closed) → exit
+    #      it now carries the "closed_by_merge" tag (or is closed) → exit
     #      skipped_merged / skipped_closed.
     #   4. If THIS ticket survived as the merge target, re-check siblings
     #      and continue processing normally. The legacy
@@ -1079,6 +1029,59 @@ def _process(ticket_id: str) -> dict:
                 result["sibling_subjects"] = sibling_subjects
             log_result(result)
             return result
+
+    # ── 2c. Early subject/body signals (still no API calls) ──────────── #
+
+    # Follow-up ticket detection.
+    # Zendesk auto-prepends "This is a follow-up to your previous request #XXXXX"
+    # when a customer replies to a closed/solved ticket. These are escalations
+    # that an agent already touched — the bot must not interfere.
+    _FOLLOWUP_SIGNALS = [
+        "this is a follow-up to your previous request",
+        "follow-up to your previous request",
+        "follow up to your previous request",
+        "following up on my previous request",
+        "following up on ticket",
+        "in reference to ticket",
+        "regarding my previous request",
+    ]
+    body_lower_early = body.lower()
+    if any(sig in body_lower_early for sig in _FOLLOWUP_SIGNALS):
+        log.info(
+            f"[{ticket_id}] Follow-up ticket detected (references previous request) "
+            "→ skipping, sending Slack alert for manual review"
+        )
+        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
+        result["status"] = "skipped_followup"
+        result["intent"] = "FOLLOWUP"
+        result["reason"] = "Follow-up to a previous request — agent already handled or will handle this thread"
+        log_result(result)
+        return result
+
+    # Subject refund check — if the email subject itself contains refund
+    # keywords, this is an escalation/dispute and should go straight to a human.
+    if _contains_refund_request(subject):
+        log.info(
+            f"[{ticket_id}] Refund keyword in subject line: '{subject[:60]}' "
+            "→ skipping, sending Slack alert"
+        )
+        zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
+        result["intent"] = "REFUND_REQUEST"
+        result["status"] = "skipped_refund_request"
+        result["reason"] = "Refund keyword detected in subject — refund disputes require a human"
+        log_result(result)
+        return result
+
+    # 2c. Skip if a human agent already replied publicly.
+    # If the last public comment is from our team, they are already handling it —
+    # no need for the bot to classify, escalate, or interfere.
+    if zendesk.last_public_comment_is_from_agent(ticket_id):
+        log.info(
+            f"[{ticket_id}] Last public comment is from an agent — "
+            "skipping (human already replied)"
+        )
+        result["status"] = "skipped_agent_already_replied"
+        return result
 
     # 2d. Spam detection — if bot already replied 2+ times, stop and alert.
     # Tag guard prevents duplicate Slack alerts when Zendesk fires webhook twice
