@@ -1701,6 +1701,21 @@ def _process(ticket_id: str) -> dict:
             result["status"] = "skipped_race_condition"
             return result
 
+        # Agent-reply race guard: WC lookup can block for 60-180s. While we
+        # were waiting, a human agent may have replied (cf. korobocle.s
+        # case where Volodymyr replied at min 40 and bot still wrote an
+        # internal note at min 39 because the early `last_public_comment`
+        # check ran ~60s earlier, before the human appeared). Re-check
+        # immediately before any write to avoid piling internal notes on
+        # an already-handled ticket.
+        if zendesk.last_public_comment_is_from_agent(ticket_id):
+            log.info(
+                f"[{ticket_id}] Agent replied while WC lookup was running — "
+                "skipping WC error write (human is handling it)"
+            )
+            result["status"] = "skipped_agent_already_replied"
+            return result
+
         zendesk.add_tag(ticket_id, "bot_handled")
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_tag(ticket_id, "ai_bot_failed")
