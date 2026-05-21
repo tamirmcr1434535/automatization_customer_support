@@ -26,10 +26,11 @@ IMPORTANT — performance notes for iqbooster.org:
     1.  /customers?email=              (15s timeout, indexed but server can be slow)
     1b. /customers?search=             (30s timeout, PayPal fallback)
     2a. customer meta_data → /subscriptions/{id}  (15s timeout)
-    2b. /subscriptions?customer=       (3 attempts: 90→120→150s + 3s/5s backoff, MOST RELIABLE)
+    2b. /subscriptions?customer=       (2 attempts: 90→120s + 3s backoff, MOST RELIABLE)
     2c. /subscriptions?billing_email=  (60s timeout per page, up to 5 pages if filter broken)
-    2d. /subscriptions?search=         (120s timeout, per_page=100, last resort)
-    Worst case: 15 + 30 + 15 + 368(2b w/retries) + 300 + 120 = 848s ≈ 14.1 min (fits 15-min SLA)
+    2d. /subscriptions?search=         DISABLED 2026-05-21 to reduce server load
+                                       (full-text scan over 200K+ subs, no index)
+    Worst case: 15 + 30 + 15 + 218(2b w/1 retry) + 300 = 578s ≈ 9.6 min (fits 15-min SLA)
 """
 
 import logging
@@ -65,12 +66,12 @@ def _request_with_retry(
     Two retry modes:
       - Default: timeout doubles on each retry (max_retries=1 → [t, 2t]).
         Used by every caller that doesn't pass timeout_schedule.
-      - Explicit schedule: timeout_schedule=(90, 120, 150) gives precisely
+      - Explicit schedule: timeout_schedule=(90, 120) gives precisely
         those per-attempt timeouts and overrides max_retries. Used by the
-        2b ?customer= path to stay under the 15-min SLA while still
-        getting 3 attempts at WC.
+        2b ?customer= path — 2 attempts (reduced from 3 on 2026-05-21 to
+        ease WC server load).
 
-    backoff_sleeps=(3, 5) pauses 3s before retry #2 and 5s before retry #3.
+    backoff_sleeps=(3,) pauses 3s before retry #2.
     Pauses run on any retry trigger (transient HTTP, timeout, network error)
     to let the upstream gateway recover instead of immediately re-hammering it.
     """
@@ -801,10 +802,10 @@ class WooCommerceClient:
           1.  /customers?email=           (15s timeout, indexed but server can spike)
           1b. /customers?search=          (30s timeout, PayPal fallback)
           2a. customer meta_data → /subscriptions/{id}  (15s timeout)
-          2b. /subscriptions?customer=    (90s timeout, MOST RELIABLE)
+          2b. /subscriptions?customer=    (2 attempts: 90→120s + 3s backoff, MOST RELIABLE)
           2c. /subscriptions?billing_email= (60s/page, up to 5 pages if filter broken)
-          2d. /subscriptions?search=      (120s timeout, per_page=100, last resort)
-          Worst case: 15s + 30s + 90s + 300s + 120s = 555s (CF=3600s — plenty of room)
+          2d. /subscriptions?search=      DISABLED 2026-05-21 (server-load reduction)
+          Worst case: 15s + 30s + 90s + 120s + 300s = 555s (CF=3600s — plenty of room)
 
         If subscription not found → returns "not_found" → bot asks customer
         for last 4 card digits → Stripe finds email → we try again.
@@ -924,7 +925,7 @@ class WooCommerceClient:
                 try:
                     log.info(
                         f"WC: trying ?customer={customer_id} "
-                        "(3 attempts: 90→120→150s + 3s/5s backoff)"
+                        "(2 attempts: 90→120s + 3s backoff)"
                     )
                     resp = _request_with_retry(
                         "GET",
@@ -932,8 +933,8 @@ class WooCommerceClient:
                         params={"customer": customer_id, "per_page": 10, "status": "any"},
                         auth=self.auth,
                         timeout=90,
-                        timeout_schedule=(90, 120, 150),
-                        backoff_sleeps=(3, 5),
+                        timeout_schedule=(90, 120),
+                        backoff_sleeps=(3,),
                     )
                     if resp.ok:
                         customer_subs = resp.json()
@@ -986,76 +987,16 @@ class WooCommerceClient:
                 all_subs = billing_subs
             log.info(f"WC TIMING: step2c billing_email done in {time.time()-t2c:.1f}s (total {time.time()-wc_start:.1f}s)")
 
-        # ── Step 2d: /subscriptions?search= last resort (120s timeout) ──── #
-        # Increased per_page (100) and timeout (120s) — the server is slow
-        # (200K+ subs, full-text search not indexed) and 45s/20 was not enough.
-        if not all_subs:
-            t2d = time.time()
-            _SEARCH_TIMEOUT = 120
-            _SEARCH_PER_PAGE = 100
-            try:
-                log.info(
-                    f"WC: all lookups failed for {email}, "
-                    f"trying ?search= last resort ({_SEARCH_TIMEOUT}s timeout, "
-                    f"per_page={_SEARCH_PER_PAGE})"
-                )
-                resp = _request_with_retry(
-                    "GET",
-                    f"{self.base}/subscriptions",
-                    params={
-                        "search": email,
-                        "per_page": _SEARCH_PER_PAGE,
-                        "status": "any",
-                    },
-                    auth=self.auth,
-                    timeout=_SEARCH_TIMEOUT,
-                    max_retries=1,
-                )
-                if resp.ok:
-                    search_subs = resp.json()
-                    if isinstance(search_subs, list) and search_subs:
-                        verified = [
-                            s for s in search_subs
-                            if self._subscription_matches_email(
-                                s, email.lower().strip()
-                            )
-                        ]
-                        if not verified:
-                            verified = [
-                                s for s in search_subs
-                                if not s.get("billing", {}).get("email", "").strip()
-                            ]
-                        if verified:
-                            log.info(
-                                f"WC: ?search= found {len(verified)} verified "
-                                f"sub(s) for {email}"
-                            )
-                            all_subs = verified
-                        else:
-                            log.info(
-                                f"WC: ?search= returned {len(search_subs)} sub(s) "
-                                f"but none matched {email}"
-                            )
-                    else:
-                        log.info(f"WC: ?search= returned 0 results for {email}")
-                else:
-                    log.warning(f"WC: ?search= failed: {resp.status_code}")
-                    err = _error_kind_from_response(resp)
-                    if err:
-                        kind, detail = err
-                        errors.append({"step": "subs_search", "kind": kind, "detail": detail})
-            except requests.exceptions.Timeout as e:
-                log.warning(
-                    f"WC: ?search= TIMED OUT ({_SEARCH_TIMEOUT}s) for {email} "
-                    "— falling through to Stripe fallback"
-                )
-                kind, detail = _error_kind_from_exception(e)
-                errors.append({"step": "subs_search", "kind": kind, "detail": detail})
-            except requests.exceptions.RequestException as e:
-                log.warning(f"WC: ?search= error: {e}")
-                kind, detail = _error_kind_from_exception(e)
-                errors.append({"step": "subs_search", "kind": kind, "detail": detail})
-            log.info(f"WC TIMING: step2d ?search= done in {time.time()-t2d:.1f}s (total {time.time()-wc_start:.1f}s)")
+        # ── Step 2d: /subscriptions?search= — DISABLED 2026-05-21 ────────── #
+        # Removed to reduce load on iqbooster.org WC server. This was a
+        # full-text scan over 200K+ subscriptions with no index — the single
+        # heaviest query in the lookup chain. The 95%+ case is covered by 2a
+        # (meta_data), 2b (?customer=), and 2c (billing_email). The few
+        # tickets that ONLY 2d could find now fall through to the Stripe
+        # fallback (bot asks customer for last 4 card digits → Stripe finds
+        # email → retry the WC lookup with that email).
+        # Revert: see backup/stable-2943be8-pre-load-reduction or tag
+        # stable-pre-load-reduction-2026-05-21.
 
         if not all_subs:
             total = time.time() - wc_start
