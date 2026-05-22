@@ -26,6 +26,7 @@ log = logging.getLogger("ticket_merger")
 EMAIL_BLACKLIST: set[str] = {
     "crossborder@kca.go.kr",
     "cukbusan@cuk.or.kr",
+    "chargebackvnm@hsbc.com.vn",
 }
 
 
