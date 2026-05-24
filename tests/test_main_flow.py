@@ -101,6 +101,10 @@ def _setup_zd(mock_zd, ticket=None, agent_replied=False):
     mock_zd.get_ticket.return_value = ticket
     mock_zd.last_public_comment_is_from_agent.return_value = agent_replied
     mock_zd.get_all_customer_comments_text.return_value = ""
+    # Thin-body classification path falls back to first customer comment;
+    # return empty string so the body argument used downstream stays a
+    # plain str instead of a MagicMock.
+    mock_zd.get_first_customer_comment.return_value = ""
     # No sibling tickets — avoid the merge-candidate guard kicking in
     # and skipping every test with 'skipped_merge_candidate'.
     mock_zd.find_active_tickets_for_email.return_value = []
@@ -150,6 +154,72 @@ class TestProcess:
         assert result["status"] == "escalated_low_confidence"
         mock_zd.add_tag.assert_any_call("1003", "bot_low_confidence")
         mock_zd.add_internal_note.assert_called_once()
+
+    # D1a. Low-confidence cancel boost: subject="キャンセルします", thin body,
+    # classifier returned TRIAL_CANCELLATION at 0.72 → boost to 0.85 → auto-cancel.
+    # This is the #120924-pattern from production.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.72, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_low_confidence_boost_pattern_a_auto_cancels(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="キャンセルします",
+            body="iPhoneから送信",
+        ))
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("1020")
+        assert result["status"] == "success"
+        assert result["confidence"] == 0.85  # boosted from 0.72
+
+    # D1b. Low-confidence cancel boost — amount+currency disqualifier.
+    # Same subject "キャンセル" but body mentions a specific charge (¥1,990) →
+    # boost skips, ticket stays escalated. Protects refund-leaning customers
+    # who used the word "cancel" but really want a charge dispute.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.72, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_low_confidence_boost_skipped_on_amount(
+        self, mock_zd, mock_cls, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="キャンセル",
+            body="1990円が引かれていた、キャンセルしたい",
+        ))
+        result = main._process("1021")
+        # Boost MUST NOT fire because the body contains an amount+currency —
+        # this is the strict-narrow guard against auto-cancelling refund cases.
+        assert result["status"] == "escalated_low_confidence"
+
+    # D1c. UNKNOWN safety-net bug fix: classifier returned UNKNOWN at 0.0,
+    # body contains explicit cancel keyword → safety net overrides to
+    # TRIAL_CANCELLATION AND bumps confidence to 0.85, so the downstream
+    # low-confidence gate no longer kills the override. Before the fix this
+    # combination escalated at confidence=0.0 despite the keyword match.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(intent="UNKNOWN", confidence=0.0, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_unknown_safety_net_cancel_keyword_auto_handles(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約",
+            body="解約お願いします",
+        ))
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("1022")
+        assert result["status"] == "success"
+        assert result["intent"] == "TRIAL_CANCELLATION"
 
     # D2. Cancellation + "what is this charge?" → escalate (bot can't explain)
     #

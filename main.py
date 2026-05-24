@@ -199,6 +199,57 @@ def _contains_cancel_signal(text: str) -> bool:
     text_lower = text.lower()
     return any(kw in text_lower for kw in _CANCEL_SIGNALS)
 
+
+# ── Delete-account signal keywords ──────────────────────────────────── #
+# Multi-word forms that take priority over the bare cancel signal "탈퇴"
+# (which is in _CANCEL_SIGNALS). When these are present, the customer
+# wants account deletion (GDPR scope) — must NOT auto-cancel + reply.
+_DELETE_ACCOUNT_SIGNALS = [
+    "delete my account", "delete account", "remove my account",
+    "close my account", "deactivate my account",
+    "アカウント削除", "アカウントの削除", "アカウントを削除",
+    "アカウントを消して", "アカウントを消去",
+    "계정 삭제", "계정삭제",
+    "계정 탈퇴", "계정탈퇴",
+    "회원 탈퇴", "회원탈퇴",
+    "탈퇴해주세요", "탈퇴 해주세요",
+    "탈퇴하고 싶", "탈퇴하고싶",
+    "konto löschen", "supprimer mon compte",
+    "видалити акаунт", "удалить аккаунт",
+    "account verwijderen",
+    "eliminar mi cuenta", "eliminar cuenta", "borrar mi cuenta",
+    "borrar cuenta", "cerrar mi cuenta", "cerrar cuenta",
+    "eliminar mi información", "eliminar mi informacion",
+    "eliminar mi información de pago", "eliminar mi informacion de pago",
+    "eliminar mis datos", "eliminar datos personales",
+    "borrar mis datos", "borrar mi información", "borrar mi informacion",
+]
+
+
+def _contains_delete_account_signal(text: str) -> bool:
+    """Return True if text contains an explicit delete-account keyword."""
+    text_lower = text.lower()
+    return any(kw in text_lower for kw in _DELETE_ACCOUNT_SIGNALS)
+
+
+# ── Amount + currency pattern (used in low-confidence boost guard) ── #
+# Strict-narrow guard: when the body contains a numeric amount with a
+# currency unit, the customer is usually complaining about a specific
+# charge — even without an explicit refund word. Skip the auto-handle
+# boost in that case so refund-leaning tickets stay with a human.
+_AMOUNT_CURRENCY_RE = re.compile(
+    r"\d[\d.,]*\s*"
+    r"(?:円|yen|jpy|usd|eur|\$|€|vnd|₫|krw|원|gbp|£|cad|aud|chf|"
+    r"rub|₽|uah|₴|pln|zł|brl|r\$|mxn|inr|₹|cny|¥)",
+    re.IGNORECASE,
+)
+
+
+def _contains_amount_with_currency(text: str) -> bool:
+    """Return True if text contains a numeric amount followed by a currency unit."""
+    return bool(_AMOUNT_CURRENCY_RE.search(text))
+
+
 ZENDESK_SUBDOMAIN = os.getenv("ZENDESK_SUBDOMAIN", "")
 
 # ── Zendesk "Topic" custom field ──────────────────────────────────────── #
@@ -1197,38 +1248,13 @@ def _process(ticket_id: str) -> dict:
     # short body with strong signals like "解約したのに...返金してほしい").
     if intent == "UNKNOWN":
         full_text_lower = (subject + " " + body).lower()
-        _DELETE_ACCOUNT_KEYWORD_FALLBACK = [
-            "delete my account", "delete account", "remove my account",
-            "close my account", "deactivate my account",
-            "アカウント削除", "アカウントの削除", "アカウントを削除",
-            "アカウントを消して", "アカウントを消去",
-            "계정 삭제", "계정삭제",
-            # Korean — 탈퇴 (withdrawal/leave) when paired with 계정/회원 means
-            # "delete account", not just "cancel subscription". The bare 탈퇴
-            # is in _CANCEL_SIGNALS, but these multi-word forms are stronger
-            # delete-account signals and should win.
-            "계정 탈퇴", "계정탈퇴",
-            "회원 탈퇴", "회원탈퇴",
-            "탈퇴해주세요", "탈퇴 해주세요",
-            "탈퇴하고 싶", "탈퇴하고싶",
-            "konto löschen", "supprimer mon compte",
-            "видалити акаунт", "удалить аккаунт",
-            "account verwijderen",
-            # Spanish
-            "eliminar mi cuenta", "eliminar cuenta", "borrar mi cuenta",
-            "borrar cuenta", "cerrar mi cuenta", "cerrar cuenta",
-            "eliminar mi información", "eliminar mi informacion",
-            "eliminar mi información de pago", "eliminar mi informacion de pago",
-            "eliminar mis datos", "eliminar datos personales",
-            "borrar mis datos", "borrar mi información", "borrar mi informacion",
-        ]
         _REFUND_KEYWORD_FALLBACK = [
             "refund", "返金", "払い戻し", "クーリングオフ", "お金を返して", "geld zurück",
             "rückerstattung", "widerruf", "remboursement", "환불", "reembolso", "возврат",
             "rimborso", "money back", "chargeback",
         ]
         has_cancel = any(kw in full_text_lower for kw in _CANCEL_SIGNALS)
-        has_delete = any(kw in full_text_lower for kw in _DELETE_ACCOUNT_KEYWORD_FALLBACK)
+        has_delete = any(kw in full_text_lower for kw in _DELETE_ACCOUNT_SIGNALS)
         has_refund = any(kw in full_text_lower for kw in _REFUND_KEYWORD_FALLBACK)
 
         # ORDER MATTERS: refund > delete-account > cancel.
@@ -1237,6 +1263,11 @@ def _process(ticket_id: str) -> dict:
         # bare cancel signal "탈퇴" but the customer's actual intent is
         # account deletion — must NOT auto-cancel + reply. Same for any
         # ticket that mixes a refund word with a cancel word.
+        # When the safety net deterministically identifies the intent from a
+        # keyword in the customer's own text, also boost confidence above the
+        # 0.80 gate downstream — otherwise the override is silently undone by
+        # the low-confidence escalation (the keyword match IS the proof, no
+        # need to defer to the LLM's discarded UNKNOWN judgement).
         if has_refund:
             log.info(
                 f"[{ticket_id}] Classifier returned UNKNOWN but refund signal found "
@@ -1244,6 +1275,8 @@ def _process(ticket_id: str) -> dict:
             )
             intent = "REFUND_REQUEST"
             classification["intent"] = intent
+            confidence = 0.85
+            classification["confidence"] = confidence
             classification["reasoning"] = (
                 f"classifier fallback: UNKNOWN overridden — "
                 f"refund keyword detected in body"
@@ -1255,6 +1288,8 @@ def _process(ticket_id: str) -> dict:
             )
             intent = "DELETE_ACCOUNT"
             classification["intent"] = intent
+            confidence = 0.85
+            classification["confidence"] = confidence
             classification["reasoning"] = (
                 f"classifier fallback: UNKNOWN overridden — "
                 f"delete-account keyword detected in body"
@@ -1266,6 +1301,8 @@ def _process(ticket_id: str) -> dict:
             )
             intent = "TRIAL_CANCELLATION"
             classification["intent"] = intent
+            confidence = 0.85
+            classification["confidence"] = confidence
             classification["reasoning"] = (
                 f"classifier fallback: UNKNOWN overridden — "
                 f"cancel keyword detected in body"
@@ -1292,6 +1329,12 @@ def _process(ticket_id: str) -> dict:
                     sib_refund = any(kw in combined for kw in _REFUND_KEYWORD_FALLBACK)
                     sib_strong_refund = _contains_strong_refund_signal(" ".join(sibling_texts))
 
+                    # Sibling-based overrides use a SOFTER confidence bump (0.75)
+                    # for cancel-only — the cancel-keyword lived in a DIFFERENT
+                    # ticket, not in the text we are about to act on, so the
+                    # auto-handle gate (>= 0.80) intentionally stays out of reach
+                    # and these tickets remain human-reviewed. Refund branches
+                    # bump to 0.85 because they always escalate downstream anyway.
                     if sib_cancel and sib_strong_refund:
                         log.info(
                             f"[{ticket_id}] UNKNOWN safety net: sibling tickets "
@@ -1299,6 +1342,8 @@ def _process(ticket_id: str) -> dict:
                         )
                         intent = "REFUND_REQUEST"
                         classification["intent"] = intent
+                        confidence = 0.85
+                        classification["confidence"] = confidence
                         classification["reasoning"] = (
                             "classifier fallback: UNKNOWN overridden — "
                             "sibling ticket has cancel + strong refund signals"
@@ -1310,6 +1355,8 @@ def _process(ticket_id: str) -> dict:
                         )
                         intent = "TRIAL_CANCELLATION"
                         classification["intent"] = intent
+                        confidence = 0.75
+                        classification["confidence"] = confidence
                         classification["reasoning"] = (
                             "classifier fallback: UNKNOWN overridden — "
                             "sibling ticket has cancel keyword"
@@ -1321,6 +1368,8 @@ def _process(ticket_id: str) -> dict:
                         )
                         intent = "REFUND_REQUEST"
                         classification["intent"] = intent
+                        confidence = 0.85
+                        classification["confidence"] = confidence
                         classification["reasoning"] = (
                             "classifier fallback: UNKNOWN overridden — "
                             "sibling ticket has refund keyword"
@@ -1596,10 +1645,59 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
+    # 4c. Low-confidence cancel boost (strict Pattern A only).
+    # Rescue obvious cancel tickets that fall just below the 80% threshold
+    # because the body is empty / device signature only (e.g. subject
+    # "キャンセルします", body "iPhoneから送信"). The LLM correctly returned
+    # TRIAL/SUB_CANCELLATION but was cautious due to thin context — when an
+    # explicit cancel keyword IS present and zero refund/fraud/delete/
+    # chargeback/amount signals are around it, we trust the deterministic
+    # keyword match and bypass the gate.
+    #
+    # Strict-narrow disqualifiers (all must be ABSENT):
+    #   - strong refund signal: fraud, scam, unauthorized charge, bank-action,
+    #     "didn't sign up", "didn't recognize", etc. (_contains_strong_refund_signal)
+    #   - delete-account signal (_contains_delete_account_signal)
+    #   - chargeback risk flagged by the classifier
+    #   - any numeric amount + currency in body/comments — usually means the
+    #     customer is complaining about a specific charge → refund territory
+    #
+    # The cancel-keyword check uses the full text (subject + body + comments)
+    # that was already assembled in step 3c above. The amount-with-currency
+    # check is intentionally scoped to body+comments only (not subject) — a
+    # subject like "Cancel my $9.99 sub" is a clean cancel, not a charge
+    # complaint.
+    #
+    # Note: the broad _contains_refund_request guard (step 3c) has already
+    # filtered out tickets with explicit refund vocabulary by this point,
+    # so we don't recheck it here.
+    if (intent in HANDLED_INTENTS
+            and 0.60 <= confidence < 0.80
+            and _contains_cancel_signal(_all_text_for_refund)
+            and not _contains_strong_refund_signal(_all_text_for_refund)
+            and not _contains_delete_account_signal(_all_text_for_refund)
+            and not _contains_amount_with_currency(_customer_text_only)
+            and not classification.get("chargeback_risk")):
+        _orig_conf = confidence
+        confidence = 0.85
+        result["confidence"] = confidence
+        classification["reasoning"] = (
+            f"[CONFIDENCE BOOST {_orig_conf:.2f}→0.85: explicit cancel keyword, "
+            f"no refund/fraud/delete/chargeback/amount signals] "
+            f"{classification.get('reasoning', '')}"
+        )
+        result["reasoning"] = classification["reasoning"]
+        log.info(
+            f"[{ticket_id}] Confidence boost: {_orig_conf:.0%} → 85% — "
+            f"explicit cancel keyword + no disqualifiers "
+            f"(intent={intent}, lang={language})"
+        )
+
     # 5. Low confidence → always escalate to human.
     # Threshold: 80%. If the classifier is not confident enough, a human must review.
     # The bot tells the agent what it THINKS the intent is, so they have a head start.
-    # No auto-actions below 80% — strict rule, can be softened later with keyword boost.
+    # No auto-actions below 80% — strict rule, softened by the 4c boost above
+    # for the narrow case of "explicit cancel keyword + zero conflicting signals".
     if confidence < 0.80:
         # Build a hint for the agent: what did the bot detect + any keyword signals
         _keyword_hint_parts = []
