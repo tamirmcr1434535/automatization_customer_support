@@ -166,12 +166,26 @@ _CANCEL_SIGNALS = [
     "cancel my subscription", "cancel subscription", "cancel immediately",
     "stop all future charges", "stop future charges", "stop charging",
     "stop my subscription", "end my subscription",
+    "terminate my subscription", "terminate subscription", "terminate the program",
+    "end the program", "end the subscription", "stop the program", "stop the subscription",
+    "i don't want to continue", "i do not want to continue", "i don't want this",
+    "i do not want this", "please cancel", "please stop",
     # Japanese
     "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい", "取り消",
     "解約したい", "退会したい", "解約してください", "退会してください",
+    # Japanese — imperative / polite-imperative cancel forms (te-form + 下さい/ください)
+    "止めて", "止めてください", "止めて下さい", "やめて", "やめてください", "やめて下さい",
+    "停止", "停止して", "停止してください", "停止して下さい",
+    "終了", "終了して", "終了してください", "終了して下さい", "終了したい",
+    "解除して", "解除してください", "解除して下さい",
+    "引き落としを止めて", "引き落としを止めて下さい", "引き落としを止めてください",
+    "サブスクを解約", "サブスクリプションを解約", "課金を止めて", "課金を停止",
     # Korean
     "취소", "해지", "탈퇴",
     "구독 취소", "구독취소", "해지 요청", "해지요청",
+    "취소해주세요", "취소해 주세요", "해지해주세요", "해지해 주세요",
+    "결제 취소", "결제취소", "정기결제 취소", "정기결제취소",
+    "그만두고 싶", "그만하고 싶",
     # German
     "kündigen", "stornieren", "kündigung", "abo kündigen", "abonnement kündigen",
     # French
@@ -189,6 +203,8 @@ _CANCEL_SIGNALS = [
     "annullere", "opsige",
     # Indonesian
     "batalkan", "hentikan langganan", "berhenti berlangganan",
+    "batalkan langganan", "batalkan berlangganan", "hentikan berlangganan",
+    "hentikan saja", "tolong batalkan", "tolong hentikan",
     # Ukrainian / Russian
     "отменить", "відмінити", "скасувати", "отписаться",
 ]
@@ -1690,6 +1706,46 @@ def _process(ticket_id: str) -> dict:
         log.info(
             f"[{ticket_id}] Confidence boost: {_orig_conf:.0%} → 85% — "
             f"explicit cancel keyword + no disqualifiers "
+            f"(intent={intent}, lang={language})"
+        )
+
+    # 4d. Live-chat empty-body boost.
+    # "Conversation with [name]" tickets with effectively no customer message
+    # body are how the chat widget records form-only submissions. The
+    # classifier's system prompt defaults them to TRIAL_CANCELLATION but with
+    # conf ~0.40 because there's no text to verify. ~42% of all
+    # escalated_low_confidence trial cancels fall in this bucket
+    # (629 over 30d as of 2026-06-04 — see memory).
+    #
+    # Safety is provided by the downstream _cancel_by_email lookup: if the
+    # email has no active subscription anywhere, the escalated_not_found
+    # path catches it. So bypassing the conf gate here can ONLY auto-cancel
+    # a customer who actually has a sub — the LLM-side intent risk is
+    # accepted because live-chat-empty + active-trial is the exact pattern
+    # the user wants auto-handled.
+    #
+    # Disqualifiers mirror Pattern A: any refund/delete/chargeback/amount
+    # signal kills the boost so refund-leaning tickets still escalate.
+    elif (subject.lower().startswith("conversation with")
+            and len(body.strip()) < 80
+            and intent == "TRIAL_CANCELLATION"
+            and confidence < 0.80
+            and not _contains_strong_refund_signal(_all_text_for_refund)
+            and not _contains_delete_account_signal(_all_text_for_refund)
+            and not _contains_amount_with_currency(_customer_text_only)
+            and not classification.get("chargeback_risk")):
+        _orig_conf = confidence
+        confidence = 0.85
+        result["confidence"] = confidence
+        classification["reasoning"] = (
+            f"[LIVE-CHAT BOOST {_orig_conf:.2f}→0.85: empty 'Conversation with' "
+            f"body, no refund/delete/chargeback/amount signals — defer safety "
+            f"to downstream sub lookup] {classification.get('reasoning', '')}"
+        )
+        result["reasoning"] = classification["reasoning"]
+        log.info(
+            f"[{ticket_id}] Live-chat empty-body boost: {_orig_conf:.0%} → 85% — "
+            f"subject='Conversation with', body<80 chars, no disqualifiers "
             f"(intent={intent}, lang={language})"
         )
 
