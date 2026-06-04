@@ -170,6 +170,11 @@ _CANCEL_SIGNALS = [
     "end the program", "end the subscription", "stop the program", "stop the subscription",
     "i don't want to continue", "i do not want to continue", "i don't want this",
     "i do not want this", "please cancel", "please stop",
+    # English — soft cancel signals ("I don't need it" = polite refusal-to-continue)
+    "i don't need it", "i do not need it", "i don't need this", "i do not need this",
+    "i don't need it anymore", "i do not need it anymore",
+    "i don't need this anymore", "i do not need this anymore",
+    "no longer need it", "no longer need this",
     # Japanese
     "キャンセル", "解約", "解除", "退会", "止めたい", "やめたい", "取り消",
     "解約したい", "退会したい", "解約してください", "退会してください",
@@ -180,6 +185,10 @@ _CANCEL_SIGNALS = [
     "解除して", "解除してください", "解除して下さい",
     "引き落としを止めて", "引き落としを止めて下さい", "引き落としを止めてください",
     "サブスクを解約", "サブスクリプションを解約", "課金を止めて", "課金を停止",
+    # Japanese — soft signals ("don't need / no longer need" = polite refusal-to-continue)
+    "いりません", "いらない", "要りません", "要らない",
+    "必要ない", "必要ありません", "必要ないです",
+    "もういりません", "もういらない", "もう必要ない", "もう必要ありません",
     # Korean
     "취소", "해지", "탈퇴",
     "구독 취소", "구독취소", "해지 요청", "해지요청",
