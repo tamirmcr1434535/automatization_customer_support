@@ -331,6 +331,48 @@ def _set_topic_for_intent(ticket_id: str, intent: str) -> None:
     except Exception as e:
         log.warning(f"[{ticket_id}] Failed to set topic for intent {intent}: {e}")
 
+
+# ── Zendesk "Country" custom field ────────────────────────────────────── #
+# Tagger (dropdown) custom field with 241 ISO-2 country options. Setting
+# it lets the Zendesk dashboard aggregate by country without doubling up on
+# free-form values. Confirmed via /api/v2/ticket_fields.json on both the
+# wwiqtest and iqbooster subdomains: id=18169250913436, type=tagger,
+# options shaped like {name: "Japan", value: "jp"}. The field value is
+# ISO-2 lowercase; Zendesk shows the matching `name` ("Japan") in the UI.
+#
+# We populate it from WooCommerce billing.country (ISO-2 uppercase like
+# "JP"), lower-casing as we set it. Empty / non-ISO-2 values silently
+# skip — leaving the field blank is the user-confirmed default for
+# tickets the bot couldn't resolve a country for.
+_ZENDESK_COUNTRY_FIELD_ID = os.getenv(
+    "ZENDESK_COUNTRY_FIELD_ID", "18169250913436",
+).strip()
+
+
+def _set_country_for_ticket(ticket_id: str, country_iso: str) -> None:
+    """
+    Set the Zendesk Country custom field from an ISO-2 country code.
+
+    Silently skipped when the field id is unset, the code is empty, or
+    the code isn't a 2-letter alphabetic ISO-2 string. Never raises —
+    country is a reporting aid, not part of the cancellation guarantee.
+    """
+    if not _ZENDESK_COUNTRY_FIELD_ID or not country_iso:
+        return
+    value = country_iso.strip().lower()
+    if len(value) != 2 or not value.isalpha():
+        log.warning(
+            f"[{ticket_id}] Country {country_iso!r} is not ISO-2 — skip"
+        )
+        return
+    try:
+        zendesk.set_custom_field(
+            ticket_id, int(_ZENDESK_COUNTRY_FIELD_ID), value,
+        )
+        log.info(f"[{ticket_id}] Country set to '{value}'")
+    except Exception as e:
+        log.warning(f"[{ticket_id}] Failed to set country: {e}")
+
 # ── Webhook deduplication (Firestore-backed distributed lock) ────────── #
 # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
 # change, status change, etc.). Each webhook is a separate HTTP request.
@@ -1901,6 +1943,7 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, f"wc_{error_kind}")
         if intent == "SUB_RENEWAL_CANCELLATION":
             zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
+        _set_country_for_ticket(ticket_id, cancel_result.get("country", ""))
 
         sub_info_human = ""
         if wc_sub_id is not None or wc_sub_type or wc_order_count is not None:
@@ -2442,6 +2485,8 @@ def _finish_cancellation(
         zendesk.add_tag(ticket_id, "ai_bot_success")
         zendesk_step = "set_topic"
         _set_topic_for_intent(ticket_id, intent)
+        zendesk_step = "set_country"
+        _set_country_for_ticket(ticket_id, cancel_result.get("country", ""))
         # Audit note BEFORE solve so it shows up on the closed ticket.
         zendesk_step = "add_internal_note"
         zendesk.add_internal_note(ticket_id, audit_note)

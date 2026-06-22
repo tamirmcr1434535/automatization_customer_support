@@ -823,6 +823,7 @@ class WooCommerceClient:
             "subscription_type": None,
             "subscription_id": None,
             "plan": "",
+            "country": "",  # ISO-2, lowercase; filled in after customer/sub lookup
         }
 
         log.info(f"{'[DRY] ' if self.dry_run else ''}WC cancel_subscription START for email={email}")
@@ -893,6 +894,16 @@ class WooCommerceClient:
                 kind, detail = _error_kind_from_exception(e)
                 errors.append({"step": "customer_search", "kind": kind, "detail": detail})
             log.info(f"WC TIMING: step1b customer?search= done in {time.time()-t1b:.1f}s")
+
+        # Extract billing.country from the customer (whether found via step1
+        # or step1b) for the Zendesk Country custom field. Country is taken
+        # from billing.country (WC stores ISO-2 uppercase, e.g. "JP"); the
+        # Zendesk Country tagger field expects ISO-2 lowercase ("jp"),
+        # main.py normalises the case before setting the field.
+        if customer:
+            base_result["country"] = (
+                (customer.get("billing") or {}).get("country", "") or ""
+            )
 
         all_subs: list[dict] | None = None
 
@@ -1107,6 +1118,12 @@ class WooCommerceClient:
                 if li:
                     plan = li[0].get("name", "")
 
+                # Fallback country lookup from the matched sub.
+                if not base_result.get("country"):
+                    sub_country = (target.get("billing") or {}).get("country", "") or ""
+                    if sub_country:
+                        base_result["country"] = sub_country
+
                 log.info(
                     f"WC: already-cancelled sub #{target['id']} "
                     f"(type={sub_type}, orders={order_count})"
@@ -1147,6 +1164,15 @@ class WooCommerceClient:
 
         typed_subs.sort(key=_priority)
         target, sub_type, order_count = typed_subs[0]
+
+        # Fallback: if customer lookup didn't yield a country, take it from
+        # the picked subscription's billing block. WC keeps both in sync, but
+        # there are edge cases (PayPal-only customers) where only the sub
+        # has billing.country populated.
+        if not base_result.get("country"):
+            sub_country = (target.get("billing") or {}).get("country", "") or ""
+            if sub_country:
+                base_result["country"] = sub_country
 
         plan = ""
         li = target.get("line_items") or []
