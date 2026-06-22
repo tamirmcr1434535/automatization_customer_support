@@ -268,6 +268,27 @@ class ZendeskClient:
             }},
         )
 
+    def get_ticket_field(self, field_id: int) -> dict | None:
+        """Fetch a ticket field definition (incl. custom_field_options).
+
+        Used at module-init / first-call for lazy maps such as the
+        Country name→tag dictionary. Returns None on any error so the
+        caller can fall back to a no-op.
+        """
+        try:
+            resp = self._request_with_retry(
+                "GET", f"{self.base}/ticket_fields/{int(field_id)}.json",
+            )
+            if not resp.ok:
+                log.warning(
+                    f"get_ticket_field {field_id} → {resp.status_code}"
+                )
+                return None
+            return resp.json().get("ticket_field")
+        except Exception as e:
+            log.warning(f"get_ticket_field {field_id} error: {e}")
+            return None
+
     def set_custom_field(self, ticket_id: str, field_id: int, value: str):
         """
         Set a single ticket custom field (e.g. the "Topic" dropdown).

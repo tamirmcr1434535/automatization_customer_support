@@ -895,15 +895,31 @@ class WooCommerceClient:
                 errors.append({"step": "customer_search", "kind": kind, "detail": detail})
             log.info(f"WC TIMING: step1b customer?search= done in {time.time()-t1b:.1f}s")
 
-        # Extract billing.country from the customer (whether found via step1
-        # or step1b) for the Zendesk Country custom field. Country is taken
-        # from billing.country (WC stores ISO-2 uppercase, e.g. "JP"); the
-        # Zendesk Country tagger field expects ISO-2 lowercase ("jp"),
-        # main.py normalises the case before setting the field.
+        # Resolve the customer's country for the Zendesk Country custom
+        # field. Priority order, walking down until we hit a non-empty
+        # value:
+        #   1. customer.meta_data['country']   — the 16types.ai signup flow
+        #      stores the full English name here ("Japan", "Korea, ...").
+        #      This is the most reliable source on iqbooster — billing
+        #      block is left blank by Stripe-only / PayPal-only flows.
+        #   2. customer.billing.country        — ISO-2 uppercase ("JP")
+        #      when the user filled out a billing address.
+        # `subscription.billing.country` is checked later as a final
+        # fallback once we've picked a target sub. main.py normalises
+        # full names and ISO-2 codes against the Zendesk field options
+        # before writing.
         if customer:
-            base_result["country"] = (
-                (customer.get("billing") or {}).get("country", "") or ""
-            )
+            country = ""
+            for meta in (customer.get("meta_data") or []):
+                if meta.get("key") == "country":
+                    country = str(meta.get("value") or "").strip()
+                    if country:
+                        break
+            if not country:
+                country = (
+                    (customer.get("billing") or {}).get("country", "") or ""
+                ).strip()
+            base_result["country"] = country
 
         all_subs: list[dict] | None = None
 
