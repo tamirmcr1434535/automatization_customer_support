@@ -431,6 +431,72 @@ class ZendeskClient:
 
     # ── Merger support (search user tickets, merge, update status) ──────
 
+    def get_requester_tickets(
+        self,
+        requester_id: str,
+        sort_by: str = "created_at",
+        sort_order: str = "asc",
+    ) -> dict[int, dict]:
+        """
+        Return all tickets requested by `requester_id`, keyed by ticket id.
+
+        Hits `/users/{id}/tickets/requested.json` — Zendesk's real-time
+        listing endpoint, which reads from the canonical DB rather than the
+        search index. This is the difference that matters for the merger:
+        Zendesk Search has a 30s-2min indexing lag, so a sibling ticket
+        created moments before the current webhook fires is invisible to
+        `search_user_tickets` and the bot ends up double-replying.
+        `/users/{id}/tickets/requested` sees it immediately.
+
+        Always real, even in dry_run. Returns {} on any API error
+        (fail-open: caller falls back to `search_user_tickets`, then to
+        no merge).
+        """
+        if not requester_id:
+            return {}
+
+        tickets: dict[int, dict] = {}
+        url = f"{self.base}/users/{requester_id}/tickets/requested.json"
+        params = {
+            "sort_by": sort_by,
+            "sort_order": sort_order,
+            "per_page": 100,
+        }
+
+        try:
+            resp = requests.get(url, params=params, auth=self.auth, timeout=10)
+            if not resp.ok:
+                log.warning(
+                    f"get_requester_tickets failed for {requester_id} "
+                    f"({resp.status_code}) — fail-open"
+                )
+                return {}
+            data = resp.json()
+            for t in data.get("tickets", []):
+                if t.get("id"):
+                    tickets[t["id"]] = t
+            next_page = data.get("next_page")
+            while next_page:
+                resp = requests.get(next_page, auth=self.auth, timeout=10)
+                if not resp.ok:
+                    log.warning(
+                        f"get_requester_tickets pagination failed for "
+                        f"{requester_id} ({resp.status_code})"
+                    )
+                    break
+                data = resp.json()
+                for t in data.get("tickets", []):
+                    if t.get("id"):
+                        tickets[t["id"]] = t
+                next_page = data.get("next_page")
+        except requests.exceptions.RequestException as e:
+            log.warning(
+                f"get_requester_tickets error for {requester_id}: {e}"
+            )
+            return {}
+
+        return tickets
+
     def search_user_tickets(
         self,
         requester_id: str,
@@ -440,7 +506,10 @@ class ZendeskClient:
         """
         Return all tickets for `requester_id`, keyed by ticket id.
         Paginates through the Zendesk Search API. Used by ticket_merger
-        to discover sibling tickets before folding them into the oldest.
+        as a fallback to get_requester_tickets — the search index has a
+        30s-2min indexing lag, so freshly-created sibling tickets are
+        invisible until the index catches up. Kept here for fail-open
+        behaviour when the real-time endpoint is unavailable.
 
         Always real, even in dry_run. Returns {} on any API error
         (fail-open: caller will see no siblings → no merge).

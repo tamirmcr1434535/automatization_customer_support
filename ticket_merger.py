@@ -72,10 +72,22 @@ def merge_user_tickets(
         )
         return {"status": "skipped_blacklist", "email": email}
 
-    all_tickets = zendesk.search_user_tickets(requester_id)
-    # Search may not have indexed the just-created current ticket yet —
-    # ensure it's in the candidate set so we don't accidentally exclude it
-    # from sibling resolution.
+    # Prefer the real-time endpoint (`/users/{id}/tickets/requested`) which
+    # reads from the DB directly — Zendesk Search has a 30s-2min indexing
+    # lag and was the root cause of the #112983/#112986 double-reply (see
+    # AN-157, AN-179). Fall back to search if the real-time path returns
+    # nothing usable (network error, transient 5xx, etc.) — the search
+    # results are still better than treating the ticket as an orphan.
+    all_tickets = zendesk.get_requester_tickets(requester_id)
+    if not all_tickets:
+        log.info(
+            f"[{ticket_id}] get_requester_tickets returned 0 results — "
+            "falling back to search_user_tickets"
+        )
+        all_tickets = zendesk.search_user_tickets(requester_id)
+    # Real-time should always include the current ticket, but the fallback
+    # search index might not have indexed the just-created current ticket
+    # yet — ensure it's in the candidate set either way.
     if current.get("id") is not None:
         all_tickets[current["id"]] = current
 

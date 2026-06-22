@@ -18,16 +18,48 @@ class FakeZendesk:
     methods ticket_merger touches.
     """
 
-    def __init__(self, tickets: dict[int, dict]):
+    def __init__(
+        self,
+        tickets: dict[int, dict],
+        # Real-time endpoint sees a subset (e.g. simulate index-lag tickets
+        # by listing them only in the realtime set). Defaults to None ⇒
+        # behaves identically to search.
+        realtime_ids: list[int] | None = None,
+        # Set to True to simulate the real-time endpoint failing/erroring,
+        # which forces ticket_merger to fall back to search_user_tickets.
+        realtime_returns_empty: bool = False,
+    ):
         # tickets keyed by id; each entry is a ticket dict
         self.tickets = tickets
         self.merge_calls: list[dict] = []
         self.status_updates: list[tuple[str, str]] = []
+        self._realtime_ids = realtime_ids
+        self._realtime_returns_empty = realtime_returns_empty
+        # Track which discovery endpoint the merger actually used.
+        self.realtime_calls = 0
+        self.search_calls = 0
 
     def get_ticket(self, ticket_id):
         return self.tickets.get(int(ticket_id))
 
+    def get_requester_tickets(self, requester_id, **_kwargs):
+        self.realtime_calls += 1
+        if self._realtime_returns_empty:
+            return {}
+        if self._realtime_ids is not None:
+            return {
+                tid: self.tickets[tid]
+                for tid in self._realtime_ids
+                if tid in self.tickets
+                and self.tickets[tid].get("requester_id") == int(requester_id)
+            }
+        return {
+            tid: t for tid, t in self.tickets.items()
+            if t.get("requester_id") == int(requester_id)
+        }
+
     def search_user_tickets(self, requester_id, **_kwargs):
+        self.search_calls += 1
         return {
             tid: t for tid, t in self.tickets.items()
             if t.get("requester_id") == int(requester_id)
@@ -245,3 +277,94 @@ def test_email_extraction_is_lowercased_and_stripped():
     fake = FakeZendesk(tickets)
     out = merge_user_tickets("100", "42", fake)
     assert out["status"] == "skipped_blacklist"
+
+
+# ── BUG-3: real-time endpoint preferred over search.json ─────────────────
+
+def test_realtime_endpoint_is_called_first():
+    """
+    Standard happy path: merger asks the real-time endpoint first.
+    Search is only invoked if real-time came back empty.
+    """
+    tickets = {
+        100: _ticket(100, status="new", created_at="2026-01-02T00:00:00Z"),
+        101: _ticket(101, status="open", created_at="2026-01-01T00:00:00Z"),
+    }
+    fake = FakeZendesk(tickets)
+    out = merge_user_tickets("100", "42", fake)
+    assert out["status"] == "merged"
+    assert fake.realtime_calls == 1
+    assert fake.search_calls == 0  # search NOT called when realtime delivers
+
+
+def test_search_fallback_when_realtime_returns_empty():
+    """
+    If the real-time endpoint returns {} (network blip, transient 5xx,
+    misconfigured permissions), the merger falls back to search.json
+    so we don't lose merge coverage during outages.
+    """
+    tickets = {
+        100: _ticket(100, status="new", created_at="2026-01-02T00:00:00Z"),
+        101: _ticket(101, status="open", created_at="2026-01-01T00:00:00Z"),
+    }
+    fake = FakeZendesk(tickets, realtime_returns_empty=True)
+    out = merge_user_tickets("100", "42", fake)
+    assert out["status"] == "merged", out
+    assert fake.realtime_calls == 1
+    assert fake.search_calls == 1  # fallback fired
+
+
+def test_realtime_catches_sibling_invisible_to_search():
+    """
+    The actual BUG-3 case: real-time sees a sibling that search-index
+    lag would have hidden. We model this by listing the sibling ONLY in
+    realtime_ids — search returns the full dict via the default impl,
+    so this stays a pure realtime-wins test if we also restrict search
+    output. To verify "realtime saw it, merge happened", we just check
+    that the merge proceeded and search was never consulted.
+
+    Mirrors the original #112983 / #112986 case from AN-157 / AN-179:
+    two tickets one minute apart, where the bot used to double-reply
+    because /search.json hadn't indexed #112983 by the time #112986
+    arrived.
+    """
+    tickets = {
+        # Sibling #112983 — solved by the bot a moment ago.
+        112983: _ticket(
+            112983, status="solved",
+            created_at="2026-05-06T03:51:24Z",
+        ),
+        # Current ticket #112986 — arrived 1 minute later.
+        112986: _ticket(
+            112986, status="new",
+            created_at="2026-05-06T03:52:25Z",
+        ),
+    }
+    # Real-time sees both tickets (DB read); search would have indexed
+    # only the older one — we don't even consult it in this test.
+    fake = FakeZendesk(tickets, realtime_ids=[112983, 112986])
+    out = merge_user_tickets("112986", "42", fake)
+    assert out["status"] == "merged"
+    assert out["target_id"] == 112983
+    assert out["merged_ids"] == [112986]
+    # Realtime was sufficient — fallback search must not fire.
+    assert fake.realtime_calls == 1
+    assert fake.search_calls == 0
+
+
+def test_realtime_empty_and_search_empty_returns_no_action():
+    """
+    Defensive: both endpoints come back empty. Merger reports no_action
+    rather than crashing. (Edge case for users with no other tickets at
+    all — neither realtime nor search will find anything.)
+    """
+    tickets = {
+        # Only the current ticket exists for this requester.
+        100: _ticket(100, status="new", created_at="2026-01-02T00:00:00Z"),
+    }
+    fake = FakeZendesk(tickets, realtime_returns_empty=True)
+    out = merge_user_tickets("100", "42", fake)
+    assert out["status"] == "no_action"
+    assert out["active_count"] == 1
+    assert fake.realtime_calls == 1
+    assert fake.search_calls == 1
