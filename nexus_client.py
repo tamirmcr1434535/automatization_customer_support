@@ -36,18 +36,28 @@ class NexusClient:
         self,
         base_url: str,
         api_token: str,
-        x_host: str,
         *,
+        x_host: str = "",
         timeout: int = 30,
     ):
+        """
+        `x_host` is OPTIONAL. The 23/06/26 build of search-subscription
+        ignores it — empirical test with no header, empty string,
+        `iqbooster`, `all`, and `16_persons` all returned the identical
+        payload. The endpoint searches by email across every brand
+        Nexus has migrated. We keep the parameter as a defensive escape
+        hatch in case the API starts enforcing it later; default is to
+        not send the header at all.
+        """
         self.base = base_url.rstrip("/")
         self.timeout = timeout
         self.headers = {
             "Authorization": f"Bearer {api_token}",
-            "x-host": x_host,
             "Content-Type": "application/json",
             "User-Agent": "automatization-customer-support",
         }
+        if x_host:
+            self.headers["x-host"] = x_host
 
     def search_subscription(self, email: str) -> dict | None:
         """Look up subscription state for `email`.
@@ -134,13 +144,15 @@ class NexusClient:
 # `USE_NEXUS_FOR_LOOKUP` flag is on, to avoid loading config in the
 # common (flag-off) path.
 def build_from_env() -> NexusClient | None:
-    """Build a NexusClient from env vars, or return None if any required
-    config is missing.
+    """Build a NexusClient from env vars, or return None if the API
+    token is missing.
 
     Env vars (read at startup):
-      NEXUS_BASE_URL   default: https://apinexus.cellon.ai
-      NEXUS_API_TOKEN  required (loaded from Secret Manager binding)
-      NEXUS_X_HOST     default: 16_persons
+      NEXUS_API_TOKEN  REQUIRED (load from Secret Manager binding)
+      NEXUS_BASE_URL   optional, default: https://apinexus.cellon.ai
+      NEXUS_X_HOST     optional, default: "" (header omitted) —
+                       only set this if Nexus starts enforcing brand
+                       scoping; the current build ignores the header.
     """
     token = os.getenv("NEXUS_API_TOKEN", "").strip()
     if not token:
@@ -149,5 +161,5 @@ def build_from_env() -> NexusClient | None:
     return NexusClient(
         base_url=os.getenv("NEXUS_BASE_URL", "https://apinexus.cellon.ai"),
         api_token=token,
-        x_host=os.getenv("NEXUS_X_HOST", "16_persons"),
+        x_host=os.getenv("NEXUS_X_HOST", "").strip(),
     )

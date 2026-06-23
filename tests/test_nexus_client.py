@@ -36,8 +36,12 @@ from woocommerce_client import WooCommerceClient  # noqa: E402
 #  A. NexusClient.search_subscription
 # ────────────────────────────────────────────────────────────────────────
 
-def _nexus():
-    return NexusClient("https://apinexus.cellon.ai", "test_token", "16_persons")
+def _nexus(x_host: str = ""):
+    return NexusClient(
+        "https://apinexus.cellon.ai",
+        "test_token",
+        x_host=x_host,
+    )
 
 
 def _resp(status_code, json_body=None, raise_on_read=False):
@@ -131,6 +135,44 @@ def test_search_empty_email_returns_none():
     with patch("nexus_client.requests.post") as mock_post:
         assert _nexus().search_subscription("") is None
         mock_post.assert_not_called()
+
+
+# ── x-host header behaviour ──────────────────────────────────────────────
+
+@patch("nexus_client.requests.post")
+def test_x_host_omitted_by_default(mock_post):
+    """Default constructor sends NO x-host header. Confirmed
+    empirically on 2026-06-23 that the current API build ignores the
+    header — we omit it for cleaner config."""
+    mock_post.return_value = _resp(200, {
+        "meta": {"success": True}, "data": {"subscription_id": "1"},
+    })
+    _nexus().search_subscription("foo@x.com")
+    sent_headers = mock_post.call_args.kwargs["headers"]
+    assert "x-host" not in sent_headers, sent_headers
+
+
+@patch("nexus_client.requests.post")
+def test_x_host_sent_when_explicitly_set(mock_post):
+    """If brand scoping is ever enforced, callers can opt in via
+    env var NEXUS_X_HOST. Header is forwarded as-is."""
+    mock_post.return_value = _resp(200, {
+        "meta": {"success": True}, "data": {"subscription_id": "1"},
+    })
+    _nexus(x_host="16_persons").search_subscription("foo@x.com")
+    sent_headers = mock_post.call_args.kwargs["headers"]
+    assert sent_headers.get("x-host") == "16_persons"
+
+
+@patch("nexus_client.requests.post")
+def test_x_host_empty_string_omitted(mock_post):
+    """Empty string is treated the same as not-set — header omitted."""
+    mock_post.return_value = _resp(200, {
+        "meta": {"success": True}, "data": {"subscription_id": "1"},
+    })
+    _nexus(x_host="").search_subscription("foo@x.com")
+    sent_headers = mock_post.call_args.kwargs["headers"]
+    assert "x-host" not in sent_headers
 
 
 # ────────────────────────────────────────────────────────────────────────
