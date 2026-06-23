@@ -1265,3 +1265,217 @@ class WooCommerceClient:
                 result["error_step"] = cancel["error_step"]
 
         return result
+
+    # ================================================================== #
+    #  ALTERNATIVE LOOKUP — Nexus search-subscription                    #
+    # ================================================================== #
+
+    def cancel_subscription_via_nexus(
+        self,
+        email: str,
+        nexus_client,
+        *,
+        max_auto_cancel_orders: int | None = None,
+    ) -> dict:
+        """
+        Same external contract as `cancel_subscription`, but the
+        subscription-lookup phase goes through Nexus (which reads
+        directly from the migrated DB and doesn't 504) instead of
+        WooCommerce's `/subscriptions?customer={id}` endpoint.
+
+        Flow:
+          1. wc.get_customer_by_email(email)         — FAST, gives country
+          2. nexus.search_subscription(email)        — replaces slow WC lookup
+          3. wc._get_subscription_by_id(sub_id)      — FAST by-id, gives plan
+          4. renewal gate (Nexus renewal_subscriptions ≥ MAX)
+          5. wc._cancel_sub_by_id(sub_id)            — PUT cancel (unchanged)
+
+        Returned dict has the same keys + status values as the legacy
+        `cancel_subscription`, so main.py can treat both paths
+        interchangeably without branching.
+
+        Activated by env-flag `USE_NEXUS_FOR_LOOKUP=true` in main.py.
+        """
+        import time
+        t0 = time.time()
+        errors: list[dict] = []
+        base_result = {
+            "email": email,
+            "cancelled": False,
+            "source": "woocommerce",
+            "subscription_type": None,
+            "subscription_id": None,
+            "plan": "",
+            "country": "",
+        }
+        log.info(
+            f"{'[DRY] ' if self.dry_run else ''}WC[nexus] cancel_subscription "
+            f"START for email={email}"
+        )
+
+        # ── Step 1: customer lookup (FAST, for country) ───────────────── #
+        customer = self.get_customer_by_email(email, _errors=errors)
+        if customer:
+            log.info(
+                f"WC[nexus] STEP1: customer for {email} → id={customer['id']}"
+            )
+            # Same country resolution chain as in cancel_subscription:
+            # meta_data['country'] → billing.country.
+            country = ""
+            for meta in (customer.get("meta_data") or []):
+                if meta.get("key") == "country":
+                    country = str(meta.get("value") or "").strip()
+                    if country:
+                        break
+            if not country:
+                country = (
+                    (customer.get("billing") or {}).get("country", "") or ""
+                ).strip()
+            base_result["country"] = country
+
+        # ── Step 2: Nexus search-subscription (replaces slow WC) ──────── #
+        nexus_data = nexus_client.search_subscription(email)
+        if nexus_data is None:
+            # Nexus returned 404 / network error / 5xx. Two cases:
+            # - if WC also has no customer → genuinely not found
+            # - if WC found customer but Nexus 404 → sub really missing
+            log.info(
+                f"WC[nexus] STEP2: Nexus has no sub for {email} "
+                f"(customer_found={customer is not None})"
+            )
+            if customer is None:
+                return {**base_result, "status": "not_found"}
+            return {**base_result, "status": "no_active_sub"}
+
+        sub_id_raw = nexus_data.get("subscription_id")
+        try:
+            sub_id = int(sub_id_raw)
+        except (TypeError, ValueError):
+            log.warning(
+                f"WC[nexus] STEP2: Nexus returned non-numeric subscription_id "
+                f"{sub_id_raw!r} for {email} — treating as not_found"
+            )
+            return {**base_result, "status": "not_found"}
+
+        # ── Step 2b: was-already-cancelled → skip PUT ─────────────────── #
+        # Nexus tells us up-front if the sub is already cancelled in WC.
+        # We still need a status_before-aware branch for the customer
+        # reply, but we don't redo the PUT.
+        was_already_cancelled = bool(nexus_data.get("was_already_cancelled"))
+        status_before = nexus_data.get("status_before") or ""
+
+        # ── Step 3: WC by-id lookup for plan + sub object ─────────────── #
+        # FAST endpoint (not `?customer=`), no 504. Used for plan name in
+        # the customer reply, and for sub.billing fallback in case the
+        # customer record didn't have a country.
+        sub_obj = self._get_subscription_by_id(sub_id)
+        plan = ""
+        if sub_obj:
+            li = sub_obj.get("line_items") or []
+            if li:
+                plan = li[0].get("name", "")
+            if not base_result.get("country"):
+                sb_country = (sub_obj.get("billing") or {}).get("country", "") or ""
+                if sb_country:
+                    base_result["country"] = sb_country
+
+        # ── Step 4: derive sub_type + order_count from Nexus fields ───── #
+        # Nexus's subscription_start / renewal_subscriptions are
+        # authoritative — closes the BUG-1 misclassification window where
+        # the date-based heuristic in _get_sub_type can flip on day 8.
+        n_renewals_raw = nexus_data.get("renewal_subscriptions")
+        try:
+            n_renewals = int(n_renewals_raw) if n_renewals_raw is not None else 0
+        except (TypeError, ValueError):
+            n_renewals = 0
+        sub_started = bool(nexus_data.get("subscription_start"))
+
+        if n_renewals >= 1 or sub_started:
+            sub_type = "subscription"
+        else:
+            sub_type = "trial"
+
+        # `order_count` for downstream code mirrors WC semantics: number
+        # of paid orders including the signup. Nexus's `order_count` only
+        # counts renewals on iqbooster; we reconstruct the legacy number
+        # so main.py's existing renewal gate behaves the same.
+        try:
+            nexus_oc = int(nexus_data.get("order_count") or 0)
+        except (TypeError, ValueError):
+            nexus_oc = 0
+        order_count = max(nexus_oc, n_renewals + (1 if sub_started else 0))
+
+        # ── Step 5: already-cancelled branch ──────────────────────────── #
+        if was_already_cancelled:
+            log.info(
+                f"WC[nexus]: sub #{sub_id} already cancelled "
+                f"(status_before={status_before!r}, type={sub_type}, "
+                f"orders={order_count})"
+            )
+            return {
+                **base_result,
+                "status": "already_cancelled",
+                "cancelled": True,
+                "subscription_type": sub_type,
+                "subscription_id": sub_id,
+                "plan": plan or "IQ Test Subscription",
+                "order_count": order_count,
+            }
+
+        # ── Step 6: renewal gate (skip PUT for many-renewal subs) ─────── #
+        if (
+            max_auto_cancel_orders is not None
+            and order_count >= max_auto_cancel_orders
+        ):
+            log.info(
+                f"WC[nexus]: sub #{sub_id} has {order_count} orders "
+                f"(>= {max_auto_cancel_orders}) — SKIPPING PUT, "
+                "returning renewal_too_many_orders for human review"
+            )
+            return {
+                **base_result,
+                "status": "renewal_too_many_orders",
+                "cancelled": False,
+                "subscription_type": sub_type,
+                "subscription_id": sub_id,
+                "plan": plan or "IQ Test Subscription",
+                "order_count": order_count,
+            }
+
+        # ── Step 7: PUT cancel via existing WC method ─────────────────── #
+        cancel = self._cancel_sub_by_id(sub_id)
+
+        total = time.time() - t0
+        log.info(
+            f"WC[nexus] TIMING: cancel_subscription for {email} = {total:.1f}s "
+            f"(sub #{sub_id}, type={sub_type}, orders={order_count})"
+        )
+
+        if self.dry_run:
+            status_label = "dry_run"
+        elif cancel["cancelled"]:
+            status_label = (
+                "trial_cancelled" if sub_type == "trial"
+                else "subscription_cancelled"
+            )
+        else:
+            status_label = cancel.get("error_kind") or cancel.get("status", "error")
+
+        result = {
+            **base_result,
+            "status": status_label,
+            "cancelled": cancel["cancelled"],
+            "subscription_type": sub_type,
+            "subscription_id": sub_id,
+            "plan": plan or "IQ Test Subscription",
+            "order_count": order_count,
+            "error": cancel.get("error"),
+        }
+
+        if not cancel["cancelled"] and not self.dry_run:
+            if cancel.get("error_detail"):
+                result["error_detail"] = cancel["error_detail"]
+            if cancel.get("error_step"):
+                result["error_step"] = cancel["error_step"]
+
+        return result

@@ -567,6 +567,30 @@ woo = WooCommerceClient(
     consumer_secret=os.getenv("WOO_CONSUMER_SECRET", ""),
     dry_run=DRY_RUN,
 )
+
+# ── Feature flag: Nexus-backed subscription lookup ─────────────────── #
+# When `USE_NEXUS_FOR_LOOKUP=true`, the subscription-lookup phase of
+# `cancel_subscription` goes through Nexus (apinexus.cellon.ai) instead
+# of the slow WC `?customer={id}` endpoint that intermittently returns
+# 504 (BUG-2*). The actual PUT cancel still goes through WooCommerce —
+# Nexus just supplies the subscription_id + classification flags.
+#
+# The flag is read once at startup. Toggle via Cloud Run env without
+# redeploy: the new revision keeps the bot on the same code, just on a
+# different code path. To roll back: flip USE_NEXUS_FOR_LOOKUP=false.
+USE_NEXUS_FOR_LOOKUP = os.getenv("USE_NEXUS_FOR_LOOKUP", "false").lower() == "true"
+nexus_client = None
+if USE_NEXUS_FOR_LOOKUP:
+    from nexus_client import build_from_env as _build_nexus
+    nexus_client = _build_nexus()
+    if nexus_client is None:
+        log.error(
+            "USE_NEXUS_FOR_LOOKUP=true but NEXUS_API_TOKEN missing — "
+            "bot will fall back to the legacy WC lookup path"
+        )
+        USE_NEXUS_FOR_LOOKUP = False
+    else:
+        log.info("Nexus lookup enabled — using apinexus.cellon.ai for subscription search")
 stripe_cli = StripeClient(
     api_key=os.getenv("STRIPE_SECRET_KEY"),
     dry_run=DRY_RUN,
@@ -2623,7 +2647,16 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     # Renewal subscriptions (3+ orders) are auto-cancelled too — WC performs
     # the PUT, _resolve_intent flags the ticket as SUB_RENEWAL_CANCELLATION
     # for separate Topic / tag tracking.
-    woo_result = woo.cancel_subscription(email)
+    #
+    # Lookup dispatch: when USE_NEXUS_FOR_LOOKUP=true the subscription search
+    # goes through Nexus (apinexus.cellon.ai) instead of the slow WC
+    # ?customer={id} endpoint. The PUT cancel itself still hits WC, so the
+    # blast radius of the swap is the lookup phase only. Flip the env var
+    # off in Cloud Run to revert without redeploy.
+    if USE_NEXUS_FOR_LOOKUP and nexus_client is not None:
+        woo_result = woo.cancel_subscription_via_nexus(email, nexus_client)
+    else:
+        woo_result = woo.cancel_subscription(email)
     woo_status = woo_result.get("status", "")
 
     # Successful WC outcome — return immediately
