@@ -283,6 +283,9 @@ def test_via_nexus_trial_happy_path(mock_get, mock_request, mock_put):
     assert out["subscription_id"] == 3750501
     assert out["plan"].startswith("IQ Test 1 Week Trial")
     assert out["country"] == "Japan"
+    # order_count parity with legacy WC client: signup is +1 even on
+    # trial (Nexus's order_count omits it).
+    assert out["order_count"] == 1, out
     assert nexus.calls == ["test@x.com"]
 
 

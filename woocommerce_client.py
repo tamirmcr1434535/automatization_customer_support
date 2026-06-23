@@ -1395,15 +1395,28 @@ class WooCommerceClient:
         else:
             sub_type = "trial"
 
-        # `order_count` for downstream code mirrors WC semantics: number
-        # of paid orders including the signup. Nexus's `order_count` only
-        # counts renewals on iqbooster; we reconstruct the legacy number
-        # so main.py's existing renewal gate behaves the same.
+        # `order_count` for downstream code mirrors legacy WC semantics:
+        # the number of paid orders INCLUDING the signup. Nexus's
+        # `order_count` only counts renewals (post-trial) on iqbooster:
+        # for a trial it reports 0 even though the customer has already
+        # paid for the trial period at signup. We add +1 for that signup
+        # payment when the subscription hasn't yet entered the post-trial
+        # state, so audit notes and Slack reports show "Orders: 1" for a
+        # trial cancel (matching the pre-Nexus behaviour) and "Orders: N"
+        # for any sub with N-1 renewals.
         try:
             nexus_oc = int(nexus_data.get("order_count") or 0)
         except (TypeError, ValueError):
             nexus_oc = 0
-        order_count = max(nexus_oc, n_renewals + (1 if sub_started else 0))
+        if sub_started:
+            # Sub has entered its first paid period; Nexus's order_count
+            # already counts the signup (we verified this against 14
+            # legacy BQ rows on 2026-06-23 — Nexus oc == legacy oc for
+            # every sub_started=True case).
+            order_count = nexus_oc
+        else:
+            # Trial state; signup payment isn't reflected in Nexus's oc.
+            order_count = nexus_oc + 1
 
         # ── Step 5: already-cancelled branch ──────────────────────────── #
         if was_already_cancelled:
