@@ -33,6 +33,29 @@ STEP 1 — READ ONLY THE CUSTOMER'S OWN WORDS.
 Ignore quoted agent replies, signatures ("Best regards", "IQ Booster Support Team"),
 and previous ticket history. Focus ONLY on what the customer wrote.
 
+STEP 1b — MOBILE-EMAIL SIGNATURES.
+Many tickets are mobile email replies where the customer wrote their entire
+request in the subject line and the body contains nothing but the phone's
+default signature. Common examples:
+  "Sent from my iPhone" / "Sent from my iPad" / "Sent from my Android"
+  "Get Outlook for iOS" / "Sent from Yahoo Mail on Android"
+  "iPhoneから送信" / "iPadから送信" / "Androidから送信"
+  "Отправлено с iPhone" / "Відправлено з iPhone"
+  "Envoyé depuis mon iPhone" / "Enviado desde mi iPhone"
+  "Von meinem iPhone gesendet" / "Verzonden vanaf mijn iPhone"
+  "Enviado do meu iPhone" / "Inviato da iPhone" / "내 iPhone에서 보냄"
+
+TREAT A MOBILE-SIGNATURE-ONLY BODY AS EQUIVALENT TO EMPTY, NOT AS A WEAK SIGNAL.
+The subject IS the customer's message in this pattern. Do NOT penalise
+confidence because the body is thin — confidence should reflect the
+subject's clarity. A subject like "Request for Cancellation of Subscription"
+or "解約してください" with only "Sent from my iPhone" / "iPhoneから送信" in
+the body is a high-confidence TRIAL_CANCELLATION (>= 0.80), not 0.55.
+
+Same rule for refund / delete-account intents: if the subject states the
+intent unambiguously and the body is only a mobile signature, classify on
+the subject with full confidence.
+
 STEP 2 — CHECK FOR THESE SIGNALS (in order of priority):
 
 A) REFUND signals (返金, 払い戻し, refund, money back, geld terug, Rückerstattung,
