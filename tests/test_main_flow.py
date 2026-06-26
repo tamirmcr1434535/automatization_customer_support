@@ -510,6 +510,96 @@ class TestProcess:
         assert "5555" in str(call_args)
 
 
+# ── Tests: billing-amount-complaint refund override ────────────────────── #
+# Real failure: ticket #149230 (June 2026). Customer wrote a JP message
+# about past charges (Apr–Jun) with a specific amount that rose, asking
+# to "stop the payment" — classifier read this as SUB_RENEWAL_CANCELLATION
+# at 82% and auto-cancelled. Correct intent is SUB_RENEWAL_REFUND; human
+# had to apologise and offer goodwill compensation.
+#
+# Fix: compound check `_contains_billing_amount_complaint` requires THREE
+# signals together (amount+currency, amount-rose phrase, stop-payment verb)
+# and feeds into the existing refund-keyword override in _process.
+
+
+class TestBillingAmountComplaint:
+    """Unit tests for main._contains_billing_amount_complaint."""
+
+    # ── True positives ────────────────────────────────────────────────── #
+
+    def test_ticket_149230_exact_text_matches(self):
+        # Verbatim from ticket #149230 — must trip the compound check.
+        body = (
+            "4月から6月にかけてWWIQTEST.COMの支払い金額が5490円と"
+            "上がっているため、支払いを取りやめてほしい。"
+        )
+        assert main._contains_billing_amount_complaint(body) is True
+
+    def test_amount_high_with_yame_verb_matches(self):
+        body = "毎月の支払い金額が1990円と高くなっているので、支払いをやめてください。"
+        assert main._contains_billing_amount_complaint(body) is True
+
+    def test_amount_increased_with_stop_deduction_matches(self):
+        body = "金額が増えているので、引き落としを止めてください。1500円も取られている。"
+        assert main._contains_billing_amount_complaint(body) is True
+
+    # ── False positives must NOT match ────────────────────────────────── #
+
+    def test_plain_cancel_with_price_does_not_match(self):
+        # "Cancel my 1990 yen subscription" — has amount, no rose-signal,
+        # uses a SUBSCRIPTION-cancel verb (not stop-payment) → must NOT match.
+        body = "1990円のサブスクをキャンセルしてください。"
+        assert main._contains_billing_amount_complaint(body) is False
+
+    def test_amount_only_without_complaint_does_not_match(self):
+        body = "5490円を支払いました。解約したいです。"
+        assert main._contains_billing_amount_complaint(body) is False
+
+    def test_complaint_without_amount_does_not_match(self):
+        body = "金額が上がっているので、支払いを取りやめてほしい。"
+        # No amount+currency → must NOT match (3-of-3 rule).
+        assert main._contains_billing_amount_complaint(body) is False
+
+    def test_amount_and_complaint_without_stop_payment_does_not_match(self):
+        # Has amount + rose-signal but no stop-payment verb → must NOT match.
+        body = "5490円と上がっています。理由を教えてください。"
+        assert main._contains_billing_amount_complaint(body) is False
+
+    def test_empty_text_does_not_match(self):
+        assert main._contains_billing_amount_complaint("") is False
+
+
+class TestBillingComplaintIntegration:
+    """Integration test: ticket #149230 pattern routes to refund."""
+
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(
+                      intent="SUB_RENEWAL_CANCELLATION",
+                      confidence=0.82,
+                      language="JP",
+                  ))
+    @patch.object(main, "zendesk")
+    def test_ticket_149230_pattern_routes_to_refund(
+        self, mock_zd, mock_cls, mock_log
+    ):
+        # Verbatim from ticket #149230. Classifier returned cancel at 0.82
+        # (above the 80% gate, so no boost involved) but the new refund
+        # override must intercept it as skipped_refund_request.
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="支払いを取りやめてほしい",
+            body=(
+                "4月から6月にかけてWWIQTEST.COMの支払い金額が5490円と"
+                "上がっているため、支払いを取りやめてほしい。"
+            ),
+        ))
+        result = main._process("149230")
+        assert result["status"] == "skipped_refund_request"
+        # And no cancel-side write should have happened.
+        mock_zd.post_reply.assert_not_called()
+        mock_zd.solve_ticket.assert_not_called()
+
+
 # ── Tests: speculative subscription-lookup boost (4e) ───────────────────── #
 # Covers _quick_subscription_check (unit) and the new 4e boost branch in
 # _process (integration). Mirrors the ticket #149925 pattern: JP cancel

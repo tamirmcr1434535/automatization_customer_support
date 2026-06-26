@@ -3174,16 +3174,89 @@ _REFUND_KEYWORDS = [
 ]
 
 
+# ── Billing-amount-complaint compound signal ─────────────────────────── #
+# JP pattern that surface-looks like a cancel but is actually a refund:
+# customer cites past charges with a specific amount, complains the amount
+# rose / is too high, and asks to "stop the payment(s)". The verbs
+# 止めて / 取りやめ / やめてほしい look like cancel signals to the LLM, but
+# the past-charge complaint is the dominant signal — the customer wants
+# the money back, not just forward-looking cancellation.
+#
+# Real failure: ticket #149230 (June 2026).
+# Customer wrote: "4月から6月にかけて...支払い金額が5490円と上がっているため、
+# 支払いを取りやめてほしい。" Classifier returned SUB_RENEWAL_CANCELLATION at
+# 82% (above the gate), bot auto-cancelled, human had to apologise and
+# offer 6 months free as goodwill.
+
+_AMOUNT_ROSE_SIGNALS = [
+    # JP — amount rose / became expensive / increased / wrong
+    "上がっている", "上がってる", "上がった",
+    "高くなっている", "高くなった",
+    "増えている", "増えてる", "増えた",
+    "高すぎる",
+    "金額が違う", "金額がおかしい",
+]
+
+_STOP_PAYMENT_VERBS = [
+    # JP — "stop the payments" / "discontinue the payments" verbs.
+    # These ARE in the cancel keyword list too — the discriminator from
+    # plain cancel is the amount-rose signal alongside them.
+    "支払いを取りやめ",       # discontinue the payment
+    "支払いをやめて",         # stop the payment
+    "支払いをやめ",           # stop the payment (stem)
+    "支払いを止めて",         # stop the payment
+    "支払いを止め",           # stop the payment (stem)
+    "支払いをストップ",       # stop the payment (katakana)
+    "引き落としを止め",       # stop the deduction
+    "引き落としをやめ",       # stop the deduction
+    "課金を止め",             # stop the charging
+    "課金をやめ",             # stop the charging
+]
+
+
+def _contains_billing_amount_complaint(text: str) -> bool:
+    """
+    Compound refund-pattern detector for the "amount-rose + stop-payment"
+    case (ticket #149230). Returns True ONLY when ALL THREE signals are
+    present in `text`:
+
+      1. amount + currency (via _contains_amount_with_currency)
+      2. an amount-complaint phrase (上がっている / 高くなった / 増えている / …)
+      3. a stop-payment verb on the payments themselves
+         (支払いを取りやめ / 支払いをやめて / 引き落としを止め / …)
+
+    The three-signal requirement is what keeps false positives off
+    legitimate cancellations that happen to mention a price ("cancel my
+    1990 yen subscription" trips signal 1 but neither 2 nor 3).
+    """
+    if not text:
+        return False
+    if not _contains_amount_with_currency(text):
+        return False
+    text_lower = text.lower()
+    if not any(s in text_lower for s in _AMOUNT_ROSE_SIGNALS):
+        return False
+    if not any(v in text_lower for v in _STOP_PAYMENT_VERBS):
+        return False
+    return True
+
+
 def _contains_refund_request(text: str) -> bool:
     """
-    Return True if *text* contains refund/repayment/unauthorized-charge keywords.
+    Return True if *text* contains refund/repayment/unauthorized-charge keywords
+    OR matches the compound billing-amount-complaint pattern (amount rose +
+    stop-payment verb — see _contains_billing_amount_complaint).
 
     Should be called with subject + body concatenated so that a refund signal
     in either field is caught (e.g. subject='Cancel payment', body='I want
     to cancel' should still be flagged).
     """
     text_lower = text.lower()
-    return any(kw in text_lower for kw in _REFUND_KEYWORDS)
+    if any(kw in text_lower for kw in _REFUND_KEYWORDS):
+        return True
+    if _contains_billing_amount_complaint(text):
+        return True
+    return False
 
 
 # ── Strong refund signals ────────────────────────────────────────────── #

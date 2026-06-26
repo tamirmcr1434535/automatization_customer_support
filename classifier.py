@@ -78,6 +78,26 @@ A) REFUND signals (返金, 払い戻し, refund, money back, geld terug, Rücker
      ください" + "なぜ、いつ" pattern = REFUND_REQUEST (surprise about an upcoming
      recurring charge — customer didn't expect it, they want it stopped AND money
      back). NOT plain TRIAL_CANCELLATION even though "引き落とさないで" sounds like cancel.
+   → Japanese: AMOUNT-ROSE / PAST-CHARGES complaint pattern. Customer cites a
+     past multi-month timeframe (e.g. "4月から6月にかけて", "先月から", "3ヶ月間",
+     "毎月") AND a specific amount that ROSE or is too high (e.g.
+     "5490円と上がっている", "金額が高くなった", "金額が増えている",
+     "金額が高すぎる") AND asks to "stop the payment(s)" (e.g.
+     "支払いを取りやめてほしい", "支払いをやめてほしい", "支払いを止めてほしい",
+     "引き落としを止めてください") = REFUND_REQUEST or SUB_RENEWAL_REFUND.
+     The "stop" verb here applies to the PAST charges, not the subscription
+     going forward — the customer wants the money back. NOT TRIAL_CANCELLATION,
+     NOT SUB_CANCELLATION, NOT SUB_RENEWAL_CANCELLATION, even though
+     "止めて / 取りやめ / やめてほしい" sound like cancel signals on their own.
+     Use SUB_RENEWAL_REFUND if the charges are renewal-related (multi-month
+     timeline = renewal); REFUND_REQUEST otherwise.
+
+     Real-world failure (ticket #149230, June 2026):
+       "4月から6月にかけてWWIQTEST.COMの支払い金額が5490円と上がっているため、
+        支払いを取りやめてほしい。"
+     → Bot misclassified as SUB_RENEWAL_CANCELLATION at 82% confidence and
+       auto-cancelled; human had to apologise and offer 6 months free as
+       goodwill. Correct intent is SUB_RENEWAL_REFUND.
    → Spanish: "me cobraron sin razón" / "cobro sin razón" / "sin autorización"
      / "cargo no autorizado" / "no autoricé este cobro" = REFUND_REQUEST.
    → Spanish: "podrían cancelar los pagos" + "sin razón" / "no autoricé" / "eliminar
