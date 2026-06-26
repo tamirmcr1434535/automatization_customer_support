@@ -508,3 +508,241 @@ class TestProcess:
         assert result["status"] == "awaiting_card_digits"
         call_args = mock_zd.post_reply_and_set_pending.call_args
         assert "5555" in str(call_args)
+
+
+# ── Tests: speculative subscription-lookup boost (4e) ───────────────────── #
+# Covers _quick_subscription_check (unit) and the new 4e boost branch in
+# _process (integration). Mirrors the ticket #149925 pattern: JP cancel
+# subject + mobile-signature-only body → classifier returns
+# TRIAL_CANCELLATION at 0.55, which the rescue path lifts to 0.85 ONLY
+# when a real account/subscription exists for the email.
+
+
+class TestQuickSubscriptionCheck:
+    """Unit tests for main._quick_subscription_check."""
+
+    def test_empty_email_returns_unknown(self):
+        assert main._quick_subscription_check("", "1") == "unknown"
+
+    # ── Nexus mode ────────────────────────────────────────────────────── #
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", True)
+    def test_nexus_sub_found_returns_exists(self):
+        fake_nexus = MagicMock()
+        fake_nexus.search_subscription.return_value = {
+            "subscription_id": 9001, "source": "iqbooster"
+        }
+        with patch.object(main, "nexus_client", fake_nexus):
+            assert main._quick_subscription_check("a@b.com", "1") == "exists"
+        fake_nexus.search_subscription.assert_called_once_with("a@b.com")
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", True)
+    def test_nexus_returns_none_treated_as_unknown(self):
+        # NexusClient conflates clean 404 with 5xx — we MUST NOT downgrade
+        # the ticket on a None response (could be a transient outage).
+        fake_nexus = MagicMock()
+        fake_nexus.search_subscription.return_value = None
+        with patch.object(main, "nexus_client", fake_nexus):
+            assert main._quick_subscription_check("a@b.com", "1") == "unknown"
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", True)
+    def test_nexus_exception_returns_unknown(self):
+        fake_nexus = MagicMock()
+        fake_nexus.search_subscription.side_effect = RuntimeError("boom")
+        with patch.object(main, "nexus_client", fake_nexus):
+            assert main._quick_subscription_check("a@b.com", "1") == "unknown"
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", True)
+    def test_nexus_response_without_sub_id_returns_unknown(self):
+        # Defensive: even if the wrapper somehow returned a dict without
+        # subscription_id (contract violation), we must not call it "exists".
+        fake_nexus = MagicMock()
+        fake_nexus.search_subscription.return_value = {"source": "iqbooster"}
+        with patch.object(main, "nexus_client", fake_nexus):
+            assert main._quick_subscription_check("a@b.com", "1") == "unknown"
+
+    # ── WooCommerce mode (default — USE_NEXUS_FOR_LOOKUP=False) ───────── #
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "woo")
+    def test_wc_customer_found_returns_exists(self, mock_woo):
+        mock_woo.get_customer_by_email.return_value = {"id": 42, "email": "a@b.com"}
+        assert main._quick_subscription_check("a@b.com", "1") == "exists"
+        # Helper must pass the _errors list so we can distinguish missing vs error.
+        _, kwargs = mock_woo.get_customer_by_email.call_args
+        assert "_errors" in kwargs
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "woo")
+    def test_wc_no_customer_clean_returns_missing(self, mock_woo):
+        # No customer, no errors → email genuinely has no history.
+        def _fake_lookup(email, _errors=None):
+            return None
+        mock_woo.get_customer_by_email.side_effect = _fake_lookup
+        assert main._quick_subscription_check("a@b.com", "1") == "missing"
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "woo")
+    def test_wc_no_customer_with_errors_returns_unknown(self, mock_woo):
+        # Lookup errored (e.g. 504) → we don't know if the customer exists.
+        # Must not boost; must escalate.
+        def _fake_lookup(email, _errors=None):
+            if _errors is not None:
+                _errors.append({"step": "customer_email", "kind": "timeout_error", "detail": "504"})
+            return None
+        mock_woo.get_customer_by_email.side_effect = _fake_lookup
+        assert main._quick_subscription_check("a@b.com", "1") == "unknown"
+
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "woo")
+    def test_wc_exception_returns_unknown(self, mock_woo):
+        mock_woo.get_customer_by_email.side_effect = RuntimeError("network down")
+        assert main._quick_subscription_check("a@b.com", "1") == "unknown"
+
+
+class TestSpeculativeLookupBoost:
+    """Integration tests for the 4e boost branch in main._process."""
+
+    # 4e-1. Ticket #149925-pattern: JP subject "Request for Cancellation"
+    # + iPhone-signature body, classifier returns 0.55, WC says "customer
+    # exists" → boost to 0.85 → auto-cancel via WC.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.55, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_boost_fires_when_wc_confirms_customer(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Request for Cancellation of Subscription",
+            body="Sent from my iPhone",
+        ))
+        # Speculative lookup says "customer exists".
+        mock_woo.get_customer_by_email.return_value = {"id": 42, "email": "user@example.com"}
+        # Downstream cancel actually happens.
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("4001")
+        assert result["status"] == "success"
+        assert result["confidence"] == 0.85  # boosted from 0.55
+        # The speculative lookup must have been consulted.
+        mock_woo.get_customer_by_email.assert_called()
+
+    # 4e-2. Same shape, but Nexus mode is on and Nexus finds a sub →
+    # boost still fires.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", True)
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.55, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_boost_fires_when_nexus_confirms_subscription(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約してください",
+            body="iPhoneから送信",
+        ))
+        fake_nexus = MagicMock()
+        fake_nexus.search_subscription.return_value = {
+            "subscription_id": 9001, "source": "iqbooster"
+        }
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        with patch.object(main, "nexus_client", fake_nexus):
+            result = main._process("4002")
+        assert result["status"] == "success"
+        assert result["confidence"] == 0.85
+        fake_nexus.search_subscription.assert_called()
+
+    # 4e-3. Lookup returns "missing" → no boost → escalation as before.
+    @patch.object(main, "log_result")
+    @patch.object(main, "woo")
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.55, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_boost_skipped_when_lookup_missing(
+        self, mock_zd, mock_cls, mock_woo, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Request for Cancellation of Subscription",
+            body="Sent from my iPhone",
+        ))
+        # Clean miss — no customer, no errors.
+        def _fake_lookup(email, _errors=None):
+            return None
+        mock_woo.get_customer_by_email.side_effect = _fake_lookup
+        result = main._process("4003")
+        assert result["status"] == "escalated_low_confidence"
+
+    # 4e-4. Lookup errored ("unknown") → no boost — transient failures
+    # must NOT auto-cancel. Mirrors WC 504 / Nexus 5xx behaviour.
+    @patch.object(main, "log_result")
+    @patch.object(main, "woo")
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.55, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_boost_skipped_when_lookup_unknown(
+        self, mock_zd, mock_cls, mock_woo, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Request for Cancellation of Subscription",
+            body="Sent from my iPhone",
+        ))
+        def _fake_lookup(email, _errors=None):
+            if _errors is not None:
+                _errors.append({"step": "customer_email", "kind": "timeout_error", "detail": "504"})
+            return None
+        mock_woo.get_customer_by_email.side_effect = _fake_lookup
+        result = main._process("4004")
+        assert result["status"] == "escalated_low_confidence"
+
+    # 4e-5. Confidence below 0.50 floor → no boost even if sub exists.
+    # Very-low confidence usually means the classifier was genuinely
+    # unsure about the intent, not just thin context — we keep escalating.
+    @patch.object(main, "log_result")
+    @patch.object(main, "woo")
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.30, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_boost_skipped_below_floor(
+        self, mock_zd, mock_cls, mock_woo, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Request for Cancellation of Subscription",
+            body="Sent from my iPhone",
+        ))
+        mock_woo.get_customer_by_email.return_value = {"id": 42, "email": "user@example.com"}
+        result = main._process("4005")
+        assert result["status"] == "escalated_low_confidence"
+        # Lookup must NOT even be attempted at this confidence — short-circuit.
+        mock_woo.get_customer_by_email.assert_not_called()
+
+    # 4e-6. Amount + currency in body → disqualifier kicks in → no boost.
+    # Protects refund-leaning customers who mentioned a charge alongside
+    # the cancel word.
+    @patch.object(main, "log_result")
+    @patch.object(main, "woo")
+    @patch.object(main, "USE_NEXUS_FOR_LOOKUP", False)
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.55, language="JP"))
+    @patch.object(main, "zendesk")
+    def test_boost_skipped_on_amount_currency(
+        self, mock_zd, mock_cls, mock_woo, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="解約",
+            body="1990円が引かれていた、解約したい",
+        ))
+        mock_woo.get_customer_by_email.return_value = {"id": 42, "email": "user@example.com"}
+        result = main._process("4006")
+        assert result["status"] == "escalated_low_confidence"
+        # Disqualifier short-circuits the boost — lookup never runs.
+        mock_woo.get_customer_by_email.assert_not_called()
