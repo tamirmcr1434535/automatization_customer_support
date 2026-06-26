@@ -1867,6 +1867,60 @@ def _process(ticket_id: str) -> dict:
             f"(intent={intent}, lang={language})"
         )
 
+    # 4e. Speculative subscription-lookup boost.
+    # When the classifier returns a cancel intent at 0.50–0.79 because the
+    # body is thin (e.g. mobile-email replies with only "Sent from my iPhone"
+    # / "iPhoneから送信" — see ticket #149925), the LLM has nothing to verify
+    # against and floors confidence. Ground truth is in the subscription DB,
+    # not the email text: if the email has an account/subscription on file
+    # AND a cancel keyword is present AND no disqualifying signals are
+    # around it, we trust the intent and let the flow proceed to the same
+    # `_cancel_by_email` lookup it would have run anyway.
+    #
+    # Works in BOTH lookup modes:
+    #   - USE_NEXUS_FOR_LOOKUP=true  → Nexus search-subscription
+    #   - default                    → WC ?email= customer lookup
+    # `_quick_subscription_check` returns "exists" only on positive
+    # confirmation; on transient errors or absence it returns "unknown" /
+    # "missing" and the ticket falls through to normal escalation.
+    #
+    # Safety mirrors 4c/4d: refund / delete / chargeback / amount signals
+    # all disqualify, so refund-leaning tickets still escalate. The 0.50
+    # floor blocks rescue from very-low-confidence outputs where the
+    # classifier was genuinely unsure (e.g. UNKNOWN-leaning at ~0.3).
+    elif (intent in HANDLED_INTENTS
+            and 0.50 <= confidence < 0.80
+            and email
+            and _contains_cancel_signal(_all_text_for_refund)
+            and not _contains_strong_refund_signal(_all_text_for_refund)
+            and not _contains_delete_account_signal(_all_text_for_refund)
+            and not _contains_amount_with_currency(_customer_text_only)
+            and not classification.get("chargeback_risk")):
+        _sub_check = _quick_subscription_check(email, ticket_id)
+        if _sub_check == "exists":
+            _orig_conf = confidence
+            _lookup_source = "nexus" if (USE_NEXUS_FOR_LOOKUP and nexus_client is not None) else "woocommerce"
+            confidence = 0.85
+            result["confidence"] = confidence
+            classification["reasoning"] = (
+                f"[SUB-EXISTS BOOST {_orig_conf:.2f}→0.85: {_lookup_source} "
+                f"confirmed account/subscription for the email, cancel keyword "
+                f"present, no refund/delete/chargeback/amount signals — defer "
+                f"safety to downstream sub lookup] "
+                f"{classification.get('reasoning', '')}"
+            )
+            result["reasoning"] = classification["reasoning"]
+            log.info(
+                f"[{ticket_id}] Speculative lookup boost: {_orig_conf:.0%} → 85% — "
+                f"sub confirmed via {_lookup_source} "
+                f"(intent={intent}, lang={language})"
+            )
+        else:
+            log.info(
+                f"[{ticket_id}] Speculative lookup: result={_sub_check} — "
+                f"no boost (conf={confidence:.0%}, intent={intent})"
+            )
+
     # 5. Low confidence → always escalate to human.
     # Threshold: 80%. If the classifier is not confident enough, a human must review.
     # The bot tells the agent what it THINKS the intent is, so they have a head start.
@@ -2625,6 +2679,69 @@ def _finish_cancellation(
     log.info(f"[{ticket_id}] ✅ Done")
     log_result(result)
     return result
+
+
+def _quick_subscription_check(email: str, ticket_id: str) -> str:
+    """
+    Best-effort read-only check: does `email` have a known account/subscription?
+
+    Used by the low-confidence cancel rescue path to decide whether to boost
+    confidence above the 80% gate. Boost ONLY on positive confirmation —
+    failures and ambiguous outcomes return "unknown" so the ticket keeps
+    escalating as it does today.
+
+    Honours both lookup modes:
+      - `USE_NEXUS_FOR_LOOKUP=true`  → Nexus `search_subscription(email)`
+                                       (returns sub dict or None)
+      - default                      → WC `get_customer_by_email(email)`
+                                       (returns customer dict or None)
+
+    The WC fallback is the indexed `?email=` endpoint (15s + 1 retry) — same
+    call WC's `cancel_subscription` runs as its first step, so the extra
+    cost on the rescue path is one cheap lookup, not the full 555s chain.
+
+    Returns one of:
+      - "exists"  — lookup confirmed an account/subscription for the email
+      - "missing" — lookup ran cleanly and returned no match
+      - "unknown" — lookup failed, timed out, or is unavailable; do NOT
+                    use this signal to override escalation
+    """
+    if not email:
+        return "unknown"
+
+    if USE_NEXUS_FOR_LOOKUP and nexus_client is not None:
+        try:
+            data = nexus_client.search_subscription(email)
+        except Exception as e:
+            log.warning(
+                f"[{ticket_id}] _quick_subscription_check: nexus error: {e}"
+            )
+            return "unknown"
+        if data and data.get("subscription_id"):
+            return "exists"
+        # NexusClient returns None for BOTH a clean 404 and a 5xx / network
+        # error. We can't tell them apart here, so treat None as "unknown"
+        # — the boost is only allowed on positive confirmation.
+        return "unknown"
+
+    # WC fallback: cheap indexed customer lookup. A customer record on
+    # iqbooster means the email has account history — strong enough signal
+    # to trust the cancel intent. The downstream `_cancel_by_email` still
+    # gates on an ACTIVE subscription (no_active_sub → human escalation),
+    # so a stale-customer false positive cannot auto-cancel anything.
+    try:
+        errs: list[dict] = []
+        customer = woo.get_customer_by_email(email, _errors=errs)
+    except Exception as e:
+        log.warning(
+            f"[{ticket_id}] _quick_subscription_check: WC error: {e}"
+        )
+        return "unknown"
+    if customer:
+        return "exists"
+    if errs:
+        return "unknown"
+    return "missing"
 
 
 def _cancel_by_email(email: str, ticket_id: str) -> dict:
