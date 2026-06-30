@@ -905,6 +905,20 @@ class TestResolveIntentNexusMode:
         }
         assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_RENEWAL_CANCELLATION"
 
+    def test_unbounded_renewals_still_renewal(self):
+        # Contract: the dispatch has NO upper ceiling on renewal count.
+        # `n_renewals >= 1` matches everything from 1 to 2**31 and beyond.
+        # We pick a deliberately large value (matches what a customer with
+        # 8+ years of monthly renewals would have) plus a pathological
+        # very-large value to lock the contract against any future "cap
+        # at N" change sneaking in.
+        for big in (12, 99, 9999, 10_000_000):
+            cancel_result = {
+                "nexus_sub_started": True,
+                "nexus_renewals": big,
+            }
+            assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_RENEWAL_CANCELLATION", big
+
     def test_renewal_outranks_sub_started_false(self):
         # Defensive edge case: if Nexus ever reports renewals>=1 with
         # subscription_start=False, renewal still wins. We trust the
