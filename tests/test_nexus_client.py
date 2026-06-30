@@ -286,6 +286,10 @@ def test_via_nexus_trial_happy_path(mock_get, mock_request, mock_put):
     # order_count parity with legacy WC client: signup is +1 even on
     # trial (Nexus's order_count omits it).
     assert out["order_count"] == 1, out
+    # Nexus-mode signals must be present so main._resolve_intent can
+    # route via the Nexus dispatch (no order_count heuristic needed).
+    assert out["nexus_sub_started"] is False
+    assert out["nexus_renewals"] == 0
     assert nexus.calls == ["test@x.com"]
 
 
@@ -324,6 +328,11 @@ def test_via_nexus_subscription_happy_path(mock_get, mock_request, mock_put):
     assert out["subscription_type"] == "subscription"
     assert out["order_count"] == 2
     assert out["country"] == "JP"
+    # Renewal-bearing sub → Nexus signals reflect 1 renewal so
+    # _resolve_intent picks SUB_RENEWAL_CANCELLATION even though
+    # order_count (2) is below the legacy MAX_BOT_ORDERS=3 threshold.
+    assert out["nexus_sub_started"] is True
+    assert out["nexus_renewals"] == 1
 
 
 @patch("woocommerce_client.requests.put")

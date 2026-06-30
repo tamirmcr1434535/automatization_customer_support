@@ -1395,6 +1395,16 @@ class WooCommerceClient:
         else:
             sub_type = "trial"
 
+        # Raw Nexus signals — passed through to main._resolve_intent so the
+        # Nexus-mode classifier can distinguish trial / sub / sub_renewal
+        # natively from Nexus's authoritative fields (vs. the legacy WC
+        # `order_count >= MAX_BOT_ORDERS` heuristic, which exists because
+        # WC doesn't natively separate post-trial subs from renewals).
+        nexus_signals = {
+            "nexus_sub_started": sub_started,
+            "nexus_renewals": n_renewals,
+        }
+
         # `order_count` for downstream code mirrors legacy WC semantics:
         # the number of paid orders INCLUDING the signup. Nexus's
         # `order_count` only counts renewals (post-trial) on iqbooster:
@@ -1433,6 +1443,7 @@ class WooCommerceClient:
                 "subscription_id": sub_id,
                 "plan": plan or "IQ Test Subscription",
                 "order_count": order_count,
+                **nexus_signals,
             }
 
         # ── Step 6: renewal gate (skip PUT for many-renewal subs) ─────── #
@@ -1453,6 +1464,7 @@ class WooCommerceClient:
                 "subscription_id": sub_id,
                 "plan": plan or "IQ Test Subscription",
                 "order_count": order_count,
+                **nexus_signals,
             }
 
         # ── Step 7: PUT cancel via existing WC method ─────────────────── #
@@ -1483,6 +1495,7 @@ class WooCommerceClient:
             "plan": plan or "IQ Test Subscription",
             "order_count": order_count,
             "error": cancel.get("error"),
+            **nexus_signals,
         }
 
         if not cancel["cancelled"] and not self.dry_run:
