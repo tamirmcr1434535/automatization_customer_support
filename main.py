@@ -316,6 +316,43 @@ _ZENDESK_TOPIC_FIELD_ID = os.getenv(
     "ZENDESK_TOPIC_FIELD_ID", "16656154392220",
 ).strip()
 
+# ── Zendesk "Request Description" custom field ────────────────────────── #
+# Native Messaging tickets ("Conversation with X") arrive with the
+# auto-generated description "Conversation with Web User <hex>" — the
+# customer's actual form text lands in a custom field named "Request
+# Description", NOT in ticket.description and NOT in comments. Without
+# reading this field the bot sees an empty body and either escalates or
+# (before the empty-body guard) wrongly boost-auto-cancelled — see #152536.
+#
+# Field id was discovered via /api/v2/ticket_fields.json on wwiqtest
+# 2026-06-30: id=21564352562460, type=text, title="Request Description".
+# Override per-Zendesk via ZENDESK_REQUEST_DESCRIPTION_FIELD_ID env;
+# set to empty string to disable lookup entirely.
+_ZENDESK_REQUEST_DESCRIPTION_FIELD_ID = os.getenv(
+    "ZENDESK_REQUEST_DESCRIPTION_FIELD_ID", "21564352562460",
+).strip()
+
+
+def _extract_request_description(ticket: dict) -> str:
+    """Return the "Request Description" custom-field text for *ticket*, or "".
+
+    Tolerates: field not configured, field absent, value None/non-string.
+    Never raises — failure mode is "no extra text", same as a missing field.
+    """
+    if not _ZENDESK_REQUEST_DESCRIPTION_FIELD_ID:
+        return ""
+    try:
+        target = int(_ZENDESK_REQUEST_DESCRIPTION_FIELD_ID)
+    except ValueError:
+        return ""
+    for f in ticket.get("custom_fields") or []:
+        if f.get("id") == target:
+            value = f.get("value")
+            if isinstance(value, str):
+                return value.strip()
+            return ""
+    return ""
+
 _TOPIC_BY_INTENT: dict[str, str] = {
     "TRIAL_CANCELLATION": os.getenv(
         "ZENDESK_TOPIC_TRIAL_CANCELLATION", "trial_cancellation",
@@ -1004,6 +1041,10 @@ def _enrich_result_if_missing(ticket_id: str, result: dict) -> None:
                 first_comment = zendesk.get_first_customer_comment(ticket_id)
                 if first_comment:
                     body = first_comment
+        # Also fold Request Description custom field (Sunshine messaging).
+        _req_descr = _extract_request_description(ticket)
+        if _req_descr and _req_descr not in body:
+            body = (body + "\n" + _req_descr).strip() if body else _req_descr
 
         classification = classify_ticket(subject, body)
         # Keep existing intent if it was already set (e.g. REFUND_REQUEST from keyword check)
@@ -1373,6 +1414,20 @@ def _process(ticket_id: str) -> dict:
             if first_comment:
                 body = first_comment
                 log.info(f"[{ticket_id}] No aggregated comments — using first customer comment")
+
+        # Sunshine/native_messaging tickets put the customer's form text in
+        # the "Request Description" custom field, NOT in description or
+        # comments. Fold it into body so refund / cancel / amount detectors
+        # have something to match on. Verified root cause of #152536:
+        # the field contained "Refund money autodebt IDR 499,990 from my
+        # card" while body stayed empty until the bot auto-cancelled.
+        _req_descr = _extract_request_description(ticket)
+        if _req_descr and _req_descr not in body:
+            body = (body + "\n" + _req_descr).strip() if body else _req_descr
+            log.info(
+                f"[{ticket_id}] Folded Request Description custom field "
+                f"into body ({len(_req_descr)} chars)"
+            )
 
     # 3. Classify (needed for language even in card-lookup flows)
     classification = classify_ticket(subject, body)
