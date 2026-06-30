@@ -338,6 +338,42 @@ def test_via_nexus_subscription_happy_path(mock_get, mock_request, mock_put):
 @patch("woocommerce_client.requests.put")
 @patch("woocommerce_client.requests.request")
 @patch("woocommerce_client.requests.get")
+def test_via_nexus_unbounded_renewal_count_parses_cleanly(
+    mock_get, mock_request, mock_put,
+):
+    """Defensive: Nexus may send arbitrarily large renewal_subscriptions
+    values (long-lived monthly subs accumulate them indefinitely). The
+    cancel_subscription_via_nexus path must parse any int the string
+    holds — no clamp, no overflow, no silent fall-through to 0."""
+    dispatch = _wc_dispatch({
+        "/customers": [{"id": 1, "email": "x@y.com", "billing": {}, "meta_data": []}],
+        "/subscriptions/7777": {
+            "id": 7777, "status": "active",
+            "line_items": [{"name": "IQ Test Monthly"}],
+        },
+    })
+    mock_get.side_effect = dispatch
+    mock_request.side_effect = dispatch
+    mock_put.return_value = _mock_put_ok()
+
+    nexus = FakeNexus({
+        "subscription_id": "7777",
+        "source": "stripe",
+        "order_count": "99999",
+        "subscription_start": True,
+        "renewal_subscriptions": "99999",
+        "was_already_cancelled": False,
+    })
+
+    out = _wc().cancel_subscription_via_nexus("x@y.com", nexus)
+    assert out["nexus_renewals"] == 99999
+    assert out["nexus_sub_started"] is True
+    assert out["order_count"] == 99999
+
+
+@patch("woocommerce_client.requests.put")
+@patch("woocommerce_client.requests.request")
+@patch("woocommerce_client.requests.get")
 def test_via_nexus_already_cancelled_skips_put(mock_get, mock_request, mock_put):
     """was_already_cancelled=true → no PUT, status=already_cancelled."""
     dispatch = _wc_dispatch({
