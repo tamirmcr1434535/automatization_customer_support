@@ -383,11 +383,12 @@ class TestProcess:
 
     # E. WooCommerce handles trial
     @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
     @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
-    def test_woo_trial_success(self, mock_zd, mock_cls, mock_woo, mock_reply, mock_log):
+    def test_woo_trial_success(self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_trial()
         result = main._process("1004")
@@ -396,13 +397,14 @@ class TestProcess:
 
     # F. WooCommerce not_found → Stripe success
     @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
     @patch.object(main, "generate_reply", return_value="Subscription cancelled.")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification(intent="SUB_CANCELLATION"))
     @patch.object(main, "zendesk")
     def test_woo_not_found_stripe_fallback(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_log
+        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_validate, mock_log
     ):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_not_found()
@@ -413,13 +415,14 @@ class TestProcess:
 
     # G. WooCommerce no_active_sub → Stripe success
     @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
     @patch.object(main, "generate_reply", return_value="Subscription cancelled.")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification(intent="SUB_CANCELLATION"))
     @patch.object(main, "zendesk")
     def test_woo_no_active_sub_stripe_fallback(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_log
+        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_validate, mock_log
     ):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_no_active()
@@ -430,12 +433,13 @@ class TestProcess:
 
     # H. Full SUB_CANCELLATION via WooCommerce paid sub
     @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
     @patch.object(main, "generate_reply", return_value="Your subscription has been cancelled.")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket",
                   return_value=_classification(intent="SUB_CANCELLATION", language="JP"))
     @patch.object(main, "zendesk")
-    def test_sub_cancellation_woo_paid(self, mock_zd, mock_cls, mock_woo, mock_reply, mock_log):
+    def test_sub_cancellation_woo_paid(self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = {
             "status": "subscription_cancelled", "email": "user@example.com",
@@ -448,34 +452,37 @@ class TestProcess:
         mock_zd.post_reply.assert_called_once()
         mock_zd.solve_ticket.assert_called_once_with("1007")
 
-    # I. Not found anywhere → ask for card digits, ticket set to pending
+    # I. Not found anywhere → silent Slack escalation (card-digits flow was
+    # retired as "unreliable and spammy" — see main.py:2274). The customer
+    # gets NO reply; a human picks the ticket up from Slack.
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
-    def test_not_found_anywhere_asks_card_digits(
+    def test_not_found_anywhere_escalates_silently(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
     ):
         _setup_zd(mock_zd, ticket=make_zendesk_ticket(email="ghost@example.com"))
         mock_woo.cancel_subscription.return_value = _woo_not_found("ghost@example.com")
         mock_stripe.cancel_subscription.return_value = _stripe_not_found("ghost@example.com")
         result = main._process("1008")
-        assert result["status"] == "awaiting_card_digits"
-        assert result["action"] == "asked_for_card_digits"
-        mock_zd.post_reply_and_set_pending.assert_called_once()
+        assert result["status"] == "escalated_not_found"
+        assert result["action"] == "slack_alerted_not_found"
+        # No customer-facing message goes out on the not-found path.
+        mock_zd.post_reply.assert_not_called()
+        mock_zd.post_reply_and_set_pending.assert_not_called()
         mock_zd.solve_ticket.assert_not_called()
-        mock_slack.notify_manual_review.assert_not_called()
 
-    # J. Not found anywhere → awaiting_card_digits tag added, ticket NOT solved
+    # J. Not found anywhere → ticket re-opened with escalation tags, NOT solved.
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
-    def test_not_found_ticket_stays_open(
+    def test_not_found_reopens_ticket_with_escalation_tags(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
     ):
         _setup_zd(mock_zd)
@@ -483,20 +490,23 @@ class TestProcess:
         mock_stripe.cancel_subscription.return_value = _stripe_not_found()
         main._process("1009")
         mock_zd.solve_ticket.assert_not_called()
-        # post_reply (solve-path) must NOT be called; post_reply_and_set_pending (card digits) IS
         mock_zd.post_reply.assert_not_called()
-        mock_zd.post_reply_and_set_pending.assert_called_once()
+        mock_zd.set_open.assert_called_once_with("1009")
         tags_added = [c.args[1] for c in mock_zd.add_tag.call_args_list]
-        assert "awaiting_card_digits" in tags_added
+        # Current escalation tag set — replaces the retired awaiting_card_digits.
+        assert "bot_handled" in tags_added
+        assert "needs_manual_review" in tags_added
+        assert "ai_bot_failed" in tags_added
 
-    # K. Card digits request called with correct ticket_id
+    # K. Not-found ticket: ticket_id is propagated correctly through the
+    # escalation path (internal note + set_open + tags all target the same id).
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
-    def test_card_digits_request_called_with_correct_args(
+    def test_not_found_escalation_uses_correct_ticket_id(
         self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
     ):
         _setup_zd(mock_zd, ticket=make_zendesk_ticket(
@@ -505,9 +515,13 @@ class TestProcess:
         mock_woo.cancel_subscription.return_value = _woo_not_found("specific@example.com")
         mock_stripe.cancel_subscription.return_value = _stripe_not_found("specific@example.com")
         result = main._process("5555")
-        assert result["status"] == "awaiting_card_digits"
-        call_args = mock_zd.post_reply_and_set_pending.call_args
-        assert "5555" in str(call_args)
+        assert result["status"] == "escalated_not_found"
+        mock_zd.set_open.assert_called_once_with("5555")
+        # The escalation internal note must mention the looked-up email so a
+        # human can pick up where the bot left off.
+        note_call = mock_zd.add_internal_note.call_args
+        assert "5555" == note_call.args[0]
+        assert "specific@example.com" in note_call.args[1]
 
 
 # ── Tests: billing-amount-complaint refund override ────────────────────── #
@@ -836,3 +850,113 @@ class TestSpeculativeLookupBoost:
         assert result["status"] == "escalated_low_confidence"
         # Disqualifier short-circuits the boost — lookup never runs.
         mock_woo.get_customer_by_email.assert_not_called()
+
+
+# ── Tests: _resolve_intent in both legacy WC and new Nexus modes ────────── #
+# Mirrors the three intent buckets the bot tags and topic-codes for renewal
+# tracking. Under Nexus mode the dispatch reads native fields
+# (renewal_subscriptions, subscription_start) — no order_count heuristic.
+
+class TestResolveIntentNexusMode:
+    """Nexus-mode dispatch: triggered when cancel_result carries
+    `nexus_renewals` (set only by woo.cancel_subscription_via_nexus).
+    These tests are the contract for the new classifier branch."""
+
+    def test_no_sub_no_renewal_is_trial(self):
+        # Rule 1: "людина просить відмінити підписку, а в неї немає саба,
+        # чи реньювала" → TRIAL_CANCELLATION.
+        cancel_result = {
+            "subscription_type": "trial",  # ignored in Nexus dispatch
+            "order_count": 1,              # ignored in Nexus dispatch
+            "nexus_sub_started": False,
+            "nexus_renewals": 0,
+        }
+        assert main._resolve_intent("SUB_CANCELLATION", cancel_result) == "TRIAL_CANCELLATION"
+
+    def test_sub_started_no_renewal_is_sub(self):
+        # Rule 2: "в неї тріал вже пройшов, а реньювала немає" → SUB_CANCELLATION.
+        cancel_result = {
+            "subscription_type": "subscription",
+            "order_count": 1,
+            "nexus_sub_started": True,
+            "nexus_renewals": 0,
+        }
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_CANCELLATION"
+
+    def test_sub_started_with_renewal_is_renewal(self):
+        # Rule 3: "тріал пройшов, і є реньювал" → SUB_RENEWAL_CANCELLATION.
+        # Importantly: ONE renewal is enough — no order_count >= MAX_BOT_ORDERS
+        # heuristic in Nexus mode, because Nexus tells us natively.
+        cancel_result = {
+            "subscription_type": "subscription",
+            "order_count": 2,
+            "nexus_sub_started": True,
+            "nexus_renewals": 1,
+        }
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_RENEWAL_CANCELLATION"
+
+    def test_multiple_renewals_still_renewal(self):
+        # Many renewals → SUB_RENEWAL_CANCELLATION (same bucket as 1 renewal).
+        cancel_result = {
+            "subscription_type": "subscription",
+            "order_count": 7,
+            "nexus_sub_started": True,
+            "nexus_renewals": 5,
+        }
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_RENEWAL_CANCELLATION"
+
+    def test_renewal_outranks_sub_started_false(self):
+        # Defensive edge case: if Nexus ever reports renewals>=1 with
+        # subscription_start=False, renewal still wins. We trust the
+        # renewal count because that's what the customer is being
+        # billed on right now.
+        cancel_result = {
+            "nexus_sub_started": False,
+            "nexus_renewals": 2,
+        }
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_RENEWAL_CANCELLATION"
+
+    def test_nexus_mode_ignores_order_count_threshold(self):
+        # Regression: under Nexus mode the legacy `order_count >= 3`
+        # heuristic must NOT apply. A first-paid-period sub with high
+        # order_count but zero renewals stays SUB_CANCELLATION.
+        # (This shape isn't expected in real data — Nexus order_count
+        # mirrors renewal count when sub_started — but the assertion
+        # documents the dispatch contract.)
+        cancel_result = {
+            "subscription_type": "subscription",
+            "order_count": 5,
+            "nexus_sub_started": True,
+            "nexus_renewals": 0,
+        }
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_CANCELLATION"
+
+
+class TestResolveIntentLegacyWCMode:
+    """Legacy WooCommerce dispatch — when `nexus_renewals` is absent
+    (either toggle off, or a Stripe-fallback cancel result). Asserts the
+    pre-Nexus behaviour didn't shift."""
+
+    def test_trial_subscription_type(self):
+        cancel_result = {"subscription_type": "trial", "order_count": 1}
+        assert main._resolve_intent("SUB_CANCELLATION", cancel_result) == "TRIAL_CANCELLATION"
+
+    def test_subscription_under_threshold_is_sub(self):
+        # order_count=2 < MAX_BOT_ORDERS(3) → SUB_CANCELLATION, NOT renewal.
+        cancel_result = {"subscription_type": "subscription", "order_count": 2}
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_CANCELLATION"
+
+    def test_subscription_at_threshold_is_renewal(self):
+        # order_count >= 3 → SUB_RENEWAL_CANCELLATION (legacy WC heuristic).
+        cancel_result = {"subscription_type": "subscription", "order_count": 3}
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_RENEWAL_CANCELLATION"
+
+    def test_active_treated_like_subscription(self):
+        cancel_result = {"subscription_type": "active", "order_count": 1}
+        assert main._resolve_intent("TRIAL_CANCELLATION", cancel_result) == "SUB_CANCELLATION"
+
+    def test_unknown_sub_type_falls_back_to_text_intent(self):
+        # No sub_type, no Nexus signals → keep whatever the text
+        # classifier returned.
+        cancel_result = {"status": "not_found_anywhere"}
+        assert main._resolve_intent("REFUND_REQUEST", cancel_result) == "REFUND_REQUEST"

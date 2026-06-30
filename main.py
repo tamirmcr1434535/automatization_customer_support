@@ -2458,16 +2458,42 @@ def _extract_emails(text: str, exclude: str = "") -> list[str]:
 def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
     """
     Determine final intent using actual data returned by WooCommerce / Stripe
-    — not just the text classifier.
+    / Nexus — not just the text classifier.
 
-    Rules:
-    - subscription_type == "trial" → TRIAL_CANCELLATION
-    - subscription_type == "subscription"/"active" with order_count >= MAX_BOT_ORDERS
-      → SUB_RENEWAL_CANCELLATION (auto-handled like SUB_CANCELLATION; tagged
-      separately for support reporting)
-    - subscription_type == "subscription"/"active" otherwise → SUB_CANCELLATION
-    - anything else → keep text_intent as fallback
+    Two dispatch modes, picked by what the lookup layer returned:
+
+    Nexus mode — `cancel_result` carries native Nexus signals
+    (`nexus_renewals`, `nexus_sub_started`). The Nexus DB authoritatively
+    separates trial / first-paid-period / renewal, so we map directly:
+      - renewals >= 1                          → SUB_RENEWAL_CANCELLATION
+      - sub_started AND renewals == 0          → SUB_CANCELLATION
+      - otherwise (no sub, no renewal)         → TRIAL_CANCELLATION
+    No order_count threshold here — even ONE renewal means the customer is
+    asking to cancel a renewal, not a fresh sub.
+
+    Legacy WC mode (USE_NEXUS_FOR_LOOKUP=false, or Nexus signals absent —
+    e.g. Stripe-fallback `cancel_result`):
+      - subscription_type == "trial"                                   → TRIAL_CANCELLATION
+      - subscription_type ∈ ("subscription","active") AND order_count >= MAX_BOT_ORDERS
+                                                                       → SUB_RENEWAL_CANCELLATION
+      - subscription_type ∈ ("subscription","active") otherwise        → SUB_CANCELLATION
+      - anything else → keep text_intent as fallback.
+    The order_count >= 3 heuristic exists because WC doesn't natively
+    separate "first paid period" from "renewal" — multiple orders is the
+    only signal available. Nexus exposes the distinction directly, so the
+    Nexus branch above doesn't need it.
     """
+    # ── Nexus mode: native sub/renewal distinction ─────────────────────── #
+    if "nexus_renewals" in cancel_result:
+        n_renewals = cancel_result.get("nexus_renewals") or 0
+        sub_started = bool(cancel_result.get("nexus_sub_started"))
+        if n_renewals >= 1:
+            return "SUB_RENEWAL_CANCELLATION"
+        if sub_started:
+            return "SUB_CANCELLATION"
+        return "TRIAL_CANCELLATION"
+
+    # ── Legacy WC mode (or Stripe-fallback cancel result) ──────────────── #
     sub_type = cancel_result.get("subscription_type", "")
     order_count = cancel_result.get("order_count")
     if sub_type == "trial":
