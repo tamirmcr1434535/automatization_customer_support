@@ -1060,6 +1060,94 @@ class TestLiveChatBoostEmptyBody:
         mock_woo.cancel_subscription.assert_not_called()
 
 
+class TestRequestDescriptionExtractor:
+    """Unit tests for main._extract_request_description.
+
+    Documents the contract: pull custom_field id 21564352562460 (wwiqtest
+    Zendesk) string value from a ticket dict. Tolerate every shape of
+    "field missing / value None / wrong type" without raising — the bot
+    must never crash on a missing field; worst case is "no extra text".
+    """
+
+    _FID = 21564352562460  # matches default ZENDESK_REQUEST_DESCRIPTION_FIELD_ID
+
+    def test_extracts_real_152536_payload(self):
+        ticket = {
+            "id": 152536,
+            "subject": "Conversation with Zefira",
+            "description": "Conversation with Web User abc",
+            "custom_fields": [
+                {"id": self._FID, "value": "Refund money autodebt IDR 499,990 from my card"},
+                {"id": 999, "value": "unrelated"},
+            ],
+        }
+        assert main._extract_request_description(ticket) == \
+            "Refund money autodebt IDR 499,990 from my card"
+
+    def test_missing_field_returns_empty(self):
+        ticket = {"id": 1, "custom_fields": [{"id": 999, "value": "x"}]}
+        assert main._extract_request_description(ticket) == ""
+
+    def test_no_custom_fields_key_returns_empty(self):
+        assert main._extract_request_description({"id": 1}) == ""
+
+    def test_null_value_returns_empty(self):
+        ticket = {"custom_fields": [{"id": self._FID, "value": None}]}
+        assert main._extract_request_description(ticket) == ""
+
+    def test_non_string_value_returns_empty(self):
+        ticket = {"custom_fields": [{"id": self._FID, "value": 12345}]}
+        assert main._extract_request_description(ticket) == ""
+
+    def test_strips_whitespace(self):
+        ticket = {"custom_fields": [{"id": self._FID, "value": "  refund please  \n"}]}
+        assert main._extract_request_description(ticket) == "refund please"
+
+    def test_disabled_via_empty_env_returns_empty(self):
+        ticket = {"custom_fields": [{"id": self._FID, "value": "refund please"}]}
+        with patch.object(main, "_ZENDESK_REQUEST_DESCRIPTION_FIELD_ID", ""):
+            assert main._extract_request_description(ticket) == ""
+
+
+class TestProcessFoldsRequestDescription:
+    """End-to-end: #152536-shape ticket → bot sees the refund text from
+    the custom field → REFUND keyword override fires → NO auto-cancel."""
+
+    @patch.dict(os.environ, {"MESSAGING_CLASSIFY_DELAY_SEC": "0"})
+    @patch("time.sleep")
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="OK")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.32, language="EN"))
+    @patch.object(main, "zendesk")
+    def test_152536_full_shape_routes_to_refund(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log,
+        mock_sleep,
+    ):
+        # Exact Zendesk-API shape captured from the real #152536 ticket.
+        ticket = make_zendesk_ticket(
+            ticket_id="152536",
+            subject="Conversation with Zefira",
+            body="Conversation with Web User 6a437732f05f2e15b9f83bf3",
+        )
+        ticket["custom_fields"] = [
+            {"id": 21564352562460,
+             "value": "Refund money autodebt IDR 499,990 from my card"},
+        ]
+        _setup_zd(mock_zd, ticket=ticket)
+        mock_zd.get_all_customer_comments_text.return_value = ""
+        mock_zd.get_first_customer_comment.return_value = ""
+
+        result = main._process("152536")
+
+        # Refund keyword override catches it (the body now contains the
+        # custom-field text). No WC cancel must be issued.
+        assert result["status"] == "skipped_refund_request", result
+        mock_woo.cancel_subscription.assert_not_called()
+
+
 class TestLiveChatBoostIDRRefund:
     """Live-chat boost must drop on amount+currency in body (IDR coverage)."""
 
