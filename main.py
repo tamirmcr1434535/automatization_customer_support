@@ -262,10 +262,32 @@ def _contains_delete_account_signal(text: str) -> bool:
 # currency unit, the customer is usually complaining about a specific
 # charge — even without an explicit refund word. Skip the auto-handle
 # boost in that case so refund-leaning tickets stay with a human.
+# Amount + currency in EITHER order — "$5,490", "5490円", "IDR 499,990",
+# "499,990 IDR", "Rp499.990", "฿1,990", "₱990" all match. The original
+# regex was suffix-only ("\d...UNIT") and silently missed prefix-style
+# currencies like "$5,490" — surfaced by ticket #152536 (June 2026) where
+# the body "Refund money autodebt IDR 499,990 from my card" sailed past
+# the amount-currency disqualifier and the live-chat boost auto-cancelled
+# the customer.
+#
+# Currency set covers every market wwiqtest / iqbooster / 16personas /
+# 16types sell into. Word-boundary anchors prevent random substring matches
+# (e.g. "rp" inside "Trump" must not match — that's why `rp` only matches
+# when preceded/followed by a digit and surrounded by word boundaries).
+_CURRENCY_UNITS = (
+    # Symbol-style (no separator required before/after the amount)
+    r"\$|€|£|¥|円|₫|₽|₴|₹|₺|₱|฿|₪|৳|zł|"
+    # Code-style and abbreviations (space or boundary required)
+    r"yen|jpy|usd|eur|vnd|krw|원|gbp|cad|aud|chf|"
+    r"rub|uah|pln|brl|r\$|mxn|inr|cny|"
+    # Added 2026-06-30 (#152536):
+    r"idr|rp|myr|rm|thb|sgd|s\$|php|hkd|hk\$|twd|nt\$|nzd|nz\$|"
+    r"zar|try|aed|sar|ils|nok|sek|dkk|czk|huf|ft|egp|ngn|kes|pkr|bdt"
+)
+
 _AMOUNT_CURRENCY_RE = re.compile(
-    r"\d[\d.,]*\s*"
-    r"(?:円|yen|jpy|usd|eur|\$|€|vnd|₫|krw|원|gbp|£|cad|aud|chf|"
-    r"rub|₽|uah|₴|pln|zł|brl|r\$|mxn|inr|₹|cny|¥)",
+    rf"(?:(?:{_CURRENCY_UNITS})\s*\d[\d.,]*"     # prefix: "$5,490" / "Rp 499.990" / "IDR 499,990"
+    rf"|\d[\d.,]*\s*(?:{_CURRENCY_UNITS}))",    # suffix: "5490円" / "499,990 IDR" / "1990 THB"
     re.IGNORECASE,
 )
 
@@ -1844,8 +1866,20 @@ def _process(ticket_id: str) -> dict:
     #
     # Disqualifiers mirror Pattern A: any refund/delete/chargeback/amount
     # signal kills the boost so refund-leaning tickets still escalate.
+    #
+    # FIX 2026-06-30 (#152536): require body to have at least *some* text —
+    # truly empty body (0 chars after strip) means EITHER (a) the chat
+    # widget submitted a form field that ended up in a custom field rather
+    # than a comment, OR (b) the messaging-classify delay was too short for
+    # the customer's first comment to arrive. Both cases need a human, not
+    # a confidence boost: ticket #152536 was a refund request whose text
+    # ("Refund money autodebt IDR 499,990 from my card") never reached
+    # body, the disqualifiers had nothing to match on, and the bot
+    # auto-cancelled. A 1-char floor keeps the boost available for every
+    # ticket where the chat actually wrote SOMETHING (even an emoji or
+    # "解約") while killing it for the literally-empty race-condition path.
     elif (subject.lower().startswith("conversation with")
-            and len(body.strip()) < 80
+            and 1 <= len(body.strip()) < 80
             and intent == "TRIAL_CANCELLATION"
             and confidence < 0.80
             and not _contains_strong_refund_signal(_all_text_for_refund)
