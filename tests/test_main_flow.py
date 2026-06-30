@@ -974,3 +974,124 @@ class TestResolveIntentLegacyWCMode:
         # classifier returned.
         cancel_result = {"status": "not_found_anywhere"}
         assert main._resolve_intent("REFUND_REQUEST", cancel_result) == "REFUND_REQUEST"
+
+
+# ── Tests: amount+currency disqualifier (regression for #152536) ────────── #
+# Bot auto-cancelled a customer who wrote "Refund money autodebt IDR 499,990
+# from my card" because the original regex was suffix-only AND didn't carry
+# IDR / Rp / ฿ / ₱ / MYR / SGD / etc. These tests pin the expanded coverage
+# so any future regex edit fails fast instead of silently letting refund-
+# leaning tickets through the cancel boost.
+
+class TestAmountCurrencyDetection:
+    """Unit tests for main._contains_amount_with_currency."""
+
+    def test_152536_real_body_matches(self):
+        # The exact text that slipped through the disqualifier in prod.
+        body = "Refund money autodebt IDR 499,990 from my card"
+        assert main._contains_amount_with_currency(body) is True
+
+    def test_idr_both_orders(self):
+        assert main._contains_amount_with_currency("IDR 499,990") is True
+        assert main._contains_amount_with_currency("499,990 IDR") is True
+        assert main._contains_amount_with_currency("Rp 499.990") is True
+        assert main._contains_amount_with_currency("Rp499.990") is True
+
+    def test_prefix_style_symbols(self):
+        # All prefix-style currencies the original suffix-only regex missed.
+        for s in ("$5,490", "€49", "£25", "¥499", "₹999", "₱990",
+                  "฿1,990", "₽1500", "₴800"):
+            assert main._contains_amount_with_currency(s) is True, s
+
+    def test_suffix_style_codes(self):
+        for s in ("5490円", "1990 jpy", "1990 THB", "MYR 49", "49 SGD",
+                  "PHP 990", "MXN 1500", "1500 zł", "1500 EUR"):
+            assert main._contains_amount_with_currency(s) is True, s
+
+    def test_does_not_match_random_text(self):
+        # Negative cases — must not falsely flag every digit/letter combo.
+        for s in ("no money here", "Hello, can you help?",
+                  "rpm engine", "I have 3 cats", "version 1.2.3"):
+            assert main._contains_amount_with_currency(s) is False, s
+
+
+# ── Tests: live-chat boost regression for #152536 ───────────────────────── #
+# Ticket #152536 produced a SUB_CANCELLATION (boosted 0.32→0.85) on a
+# Messaging ticket whose body was EMPTY at classification time (the chat
+# widget's "Request Description" field never landed in body/comments
+# before the 45s delay elapsed). The customer was actually asking for a
+# refund. Two fixes pinned here:
+#   1. Live-chat boost no longer fires on a strictly-empty body.
+#   2. Even if body had landed, "IDR 499,990" is now an amount-currency
+#      disqualifier that blocks the boost.
+
+class TestLiveChatBoostEmptyBody:
+    """Live-chat boost must NOT auto-cancel an empty-body ticket."""
+
+    @patch.dict(os.environ, {"MESSAGING_CLASSIFY_DELAY_SEC": "0"})
+    @patch("time.sleep")
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="OK")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.32, language="EN"))
+    @patch.object(main, "zendesk")
+    def test_empty_body_does_not_boost(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log,
+        mock_sleep,
+    ):
+        # Exactly the #152536 shape: subject="Conversation with X", body="".
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Conversation with Zefira",
+            body="",
+        ))
+        # Body stays empty after the messaging-delay fallback — comments
+        # are empty too (the chat-widget submission only filled a custom
+        # field, which the bot doesn't currently read).
+        mock_zd.get_all_customer_comments_text.return_value = ""
+        mock_zd.get_first_customer_comment.return_value = ""
+
+        result = main._process("152536")
+
+        # Must NOT have auto-cancelled. Confidence stays at the classifier
+        # output (0.32), low-confidence path takes over.
+        assert result["status"] == "escalated_low_confidence", result
+        mock_woo.cancel_subscription.assert_not_called()
+
+
+class TestLiveChatBoostIDRRefund:
+    """Live-chat boost must drop on amount+currency in body (IDR coverage)."""
+
+    @patch.dict(os.environ, {"MESSAGING_CLASSIFY_DELAY_SEC": "0"})
+    @patch("time.sleep")
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="OK")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(confidence=0.45, language="EN"))
+    @patch.object(main, "zendesk")
+    def test_idr_amount_blocks_boost(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log,
+        mock_sleep,
+    ):
+        # Same Conversation-with header, but THIS time the chat-widget text
+        # did land in body — bot must see the IDR amount and route to a human.
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Conversation with Zefira",
+            body="Refund money autodebt IDR 499,990 from my card",
+        ))
+        mock_zd.get_all_customer_comments_text.return_value = ""
+
+        result = main._process("152536b")
+
+        # The expanded refund-keyword detector catches "Refund" in body
+        # BEFORE the cancel boost can fire → ticket routes to a human as a
+        # refund request. (Even if that path were skipped, the IDR amount-
+        # currency disqualifier would still block the boost — belt and
+        # suspenders, both verified by other tests in this module.)
+        assert result["status"] in (
+            "skipped_refund_request", "escalated_low_confidence",
+        ), result
+        mock_woo.cancel_subscription.assert_not_called()
