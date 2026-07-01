@@ -441,6 +441,59 @@ class ZendeskClient:
         results = resp.json().get("results", [])
         return [t for t in results if str(t.get("id")) != exclude]
 
+    def find_active_tickets_for_requester(
+        self,
+        requester_id: str,
+        exclude_ticket_id: str = "",
+        days: int = 14,
+    ) -> list[dict]:
+        """
+        Real-time counterpart to `find_active_tickets_for_email`. Same shape
+        of return, but reads `/users/{id}/tickets/requested.json` (the
+        canonical DB endpoint) instead of Zendesk Search — so it sees
+        siblings that Search hasn't indexed yet.
+
+        BUG-3 fixed the search-index lag INSIDE the merger by having
+        `ticket_merger.merge_user_tickets` call `get_requester_tickets`. But
+        the gate that decides whether to invoke the merger at all still
+        went through `find_active_tickets_for_email` → Search, so cross-
+        brand siblings with the same requester silently slipped past the
+        gate (#149852 → #149859 on 2026-06-26 was the recorded case). This
+        method closes that gap by using the same real-time endpoint at
+        the gate.
+
+        Returns [] on any API error (fail-open: caller can fall back to
+        the email search path).
+        """
+        if not requester_id:
+            return []
+        from datetime import datetime, timezone, timedelta
+
+        all_tickets = self.get_requester_tickets(requester_id)
+        if not all_tickets:
+            return []
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        exclude = str(exclude_ticket_id)
+        out: list[dict] = []
+        for t in all_tickets.values():
+            if str(t.get("id")) == exclude:
+                continue
+            if t.get("status") == "closed":
+                continue
+            created = t.get("created_at") or ""
+            if created:
+                try:
+                    created_dt = datetime.fromisoformat(
+                        created.replace("Z", "+00:00")
+                    )
+                    if created_dt < cutoff:
+                        continue
+                except ValueError:
+                    pass
+            out.append(t)
+        return out
+
     def add_internal_note(self, ticket_id: str, note: str):
         if self.dry_run:
             log.info(f"[DRY] note → #{ticket_id}: {note[:80]}")
