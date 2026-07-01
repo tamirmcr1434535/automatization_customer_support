@@ -1198,13 +1198,31 @@ def _process(ticket_id: str) -> dict:
     #      skipped_merge_candidate path stays as a fallback for cases
     #      where the merger refused to act (blacklisted email, errors).
     if email:
-        active_siblings = zendesk.find_active_tickets_for_email(
-            email, exclude_ticket_id=ticket_id, days=14,
-        )
+        # Prefer real-time discovery via `/users/{id}/tickets/requested.json`
+        # over Zendesk Search — the search index can lag 10+ minutes
+        # (empirically longer for cross-brand siblings), which lets pairs
+        # like #149852 → #149859 (cross-brand, 9m 36s gap, 2026-06-26)
+        # slip past the gate and the bot double-processes. Fall back to
+        # the email-based search when we don't have a requester_id or the
+        # real-time endpoint fails.
+        requester_id = ticket.get("requester_id")
+        if requester_id:
+            active_siblings = zendesk.find_active_tickets_for_requester(
+                str(requester_id), exclude_ticket_id=ticket_id, days=14,
+            )
+            if not active_siblings:
+                # Real-time saw no siblings — cross-check via email search
+                # in case the ticket's requester_id is somehow stale.
+                active_siblings = zendesk.find_active_tickets_for_email(
+                    email, exclude_ticket_id=ticket_id, days=14,
+                )
+        else:
+            active_siblings = zendesk.find_active_tickets_for_email(
+                email, exclude_ticket_id=ticket_id, days=14,
+            )
 
         if active_siblings:
             sibling_ids_pre = [str(t.get("id")) for t in active_siblings if t.get("id")]
-            requester_id = ticket.get("requester_id")
             log.info(
                 f"[{ticket_id}] {len(sibling_ids_pre)} active sibling(s) "
                 f"({', '.join('#' + s for s in sibling_ids_pre)}) — "
@@ -1250,9 +1268,20 @@ def _process(ticket_id: str) -> dict:
                     result["status"] = "skipped_closed"
                     return result
             # Merger may have folded siblings INTO this ticket; re-check.
-            active_siblings = zendesk.find_active_tickets_for_email(
-                email, exclude_ticket_id=ticket_id, days=14,
-            )
+            # Same real-time-first strategy as the initial detection.
+            requester_id_after = ticket.get("requester_id") or requester_id
+            if requester_id_after:
+                active_siblings = zendesk.find_active_tickets_for_requester(
+                    str(requester_id_after), exclude_ticket_id=ticket_id, days=14,
+                )
+                if not active_siblings:
+                    active_siblings = zendesk.find_active_tickets_for_email(
+                        email, exclude_ticket_id=ticket_id, days=14,
+                    )
+            else:
+                active_siblings = zendesk.find_active_tickets_for_email(
+                    email, exclude_ticket_id=ticket_id, days=14,
+                )
 
         if active_siblings:
             sibling_ids = [str(t.get("id")) for t in active_siblings if t.get("id")]
