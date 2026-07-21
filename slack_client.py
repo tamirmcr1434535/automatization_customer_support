@@ -256,6 +256,18 @@ class SlackClient:
             detail_lines.append(f"*WC error:* `{err_k}` at step `{err_s}`")
             if err_d:
                 detail_lines.append(f"```{err_d[:400]}```")
+        if result.get("refund_decision"):
+            # AN-192 would-be refund signal. Nexus-only, disputes NOT checked —
+            # a YES is a draft signal for review, NOT "safe to refund".
+            rd = result.get("refund_decision")
+            rc = result.get("refund_reason_code") or "—"
+            amt = result.get("refund_amount")
+            cur = result.get("refund_currency") or ""
+            amt_s = f" ({amt} {cur})".rstrip() if amt else ""
+            detail_lines.append(
+                f"*Would be refunded (Nexus-only, disputes NOT checked):* "
+                f"{rd} — `{rc}`{amt_s}"
+            )
         if result.get("reason"):
             detail_lines.append(f"*Reason:* {str(result['reason'])[:400]}")
         if result.get("validation_fail_reason"):
