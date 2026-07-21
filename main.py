@@ -1409,6 +1409,15 @@ def _process(ticket_id: str) -> dict:
         )
         zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
         result["intent"] = "REFUND_REQUEST"
+        # AN-192 would-be eval (deterministic subject-keyword detection → treat as
+        # high-confidence refund intent). Strictly additive; never moves money.
+        try:
+            _refund_would_be_eval(
+                ticket_id, email, "REFUND_REQUEST",
+                {"confidence": 0.95, "language": "EN"}, result,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
         result["status"] = "skipped_refund_request"
         result["reason"] = "Refund keyword detected in subject — refund disputes require a human"
         log_result(result)
@@ -1739,6 +1748,15 @@ def _process(ticket_id: str) -> dict:
         )
         intent = "REFUND_REQUEST"
         result["intent"] = intent
+        # AN-192 would-be eval (deterministic body-keyword detection → treat as
+        # high-confidence refund intent). Strictly additive; never moves money.
+        try:
+            _refund_would_be_eval(
+                ticket_id, email, "REFUND_REQUEST",
+                {"confidence": 0.95, "language": language}, result,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
         result["status"] = "skipped_refund_request"
         result["reason"] = (
             f"Refund keywords detected in body ({_refund_context}) — human must handle any refund"

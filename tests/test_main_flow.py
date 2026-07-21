@@ -1232,3 +1232,14 @@ class TestRefundWouldBe:
         _setup_zd(mock_zd)
         result = main._process("an192_4")
         assert result["status"] == "skipped_refund_request"
+
+    # Early SUBJECT-keyword refund exit (fires BEFORE classification) also records
+    # the would-be decision — this is the path ticket #165074 hit in prod.
+    @patch.object(main, "log_result")
+    @patch.object(main, "zendesk")
+    def test_subject_refund_keyword_records_decision(self, mock_zd, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(subject="I want a refund please"))
+        result = main._process("an192_5")
+        assert result["status"] == "skipped_refund_request"
+        assert "refund_decision" in result
+        assert result["refund_decision"] in ("YES", "NO")
