@@ -1183,3 +1183,52 @@ class TestLiveChatBoostIDRRefund:
             "skipped_refund_request", "escalated_low_confidence",
         ), result
         mock_woo.cancel_subscription.assert_not_called()
+
+
+class TestRefundWouldBe:
+    """AN-192 — would-be refund evaluation is strictly additive and never
+    moves money. Behaviour for the customer is unchanged (still escalate)."""
+
+    # Default env (REFUNDS_ENABLED=false): behaviour unchanged, refund_decision recorded.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
+    @patch.object(main, "zendesk")
+    def test_refund_intent_records_decision_and_still_skips(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd)
+        result = main._process("an192_1")
+        assert result["status"] == "skipped_refund_request"       # unchanged behaviour
+        assert "refund_decision" in result                         # new signal recorded
+        assert result["refund_decision"] in ("YES", "NO")
+        assert "refund_reason_code" in result
+
+    # Even with REFUNDS_ENABLED=true, no money-op is attempted (no live path).
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
+    @patch.object(main, "zendesk")
+    def test_refunds_enabled_true_still_never_executes(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd)
+        with patch.object(main, "REFUNDS_ENABLED", True), \
+             patch.object(main, "refund_client") as mock_refund_client:
+            result = main._process("an192_2")
+        assert result["status"] == "skipped_refund_request"
+        # The money boundary is NEVER called on this branch.
+        mock_refund_client.create_refund.assert_not_called()
+
+    # R3: if the would-be eval raises, the escalate-to-human path is unaffected.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
+    @patch.object(main, "zendesk")
+    def test_eval_exception_is_non_blocking(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd)
+        with patch.object(main, "_refund_would_be_eval", side_effect=RuntimeError("boom")):
+            result = main._process("an192_3")
+        assert result["status"] == "skipped_refund_request"        # unchanged despite error
+
+    # PAYPAL_DISPUTE still hard-escalates (pure-dispute branch untouched).
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification(intent="PAYPAL_DISPUTE"))
+    @patch.object(main, "zendesk")
+    def test_paypal_dispute_still_hard_escalates(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd)
+        result = main._process("an192_4")
+        assert result["status"] == "skipped_refund_request"

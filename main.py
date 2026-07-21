@@ -38,6 +38,8 @@ import logging
 import functions_framework
 
 from classifier import classify_ticket
+import refund_engine
+from refund_client import RefundClient
 from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
@@ -129,6 +131,69 @@ SHADOW_MODE        = os.getenv("SHADOW_MODE", "false").lower() == "true"
 DRY_RUN            = os.getenv("DRY_RUN", "true").lower() == "true"
 TEST_MODE          = os.getenv("TEST_MODE", "true").lower() == "true"
 TEST_TAG           = "automation_test"
+
+# ── Refund would-be evaluation (AN-192) ─────────────────────────────────── #
+# The bot computes a *would-be* refund decision (would_be_refunded YES/NO +
+# reason) on real refund tickets, logs it for learning, and STILL escalates the
+# refund to a human exactly as before. It NEVER moves money on this branch —
+# there is no live refund path (see refund_client.py).
+#
+# REFUNDS_ENABLED is the single toggle for the RIGHT to really process refunds.
+# It is inert today (no live path exists) and does NOT affect the would-be
+# computation, which always runs. Default false.
+REFUNDS_ENABLED       = os.getenv("REFUNDS_ENABLED", "false").lower() == "true"
+REFUND_MIN_CONFIDENCE = float(os.getenv("REFUND_MIN_CONFIDENCE", "0.90"))
+REFUND_CONFIG = refund_engine.RefundConfig(
+    min_confidence=REFUND_MIN_CONFIDENCE,
+    refunds_enabled=REFUNDS_ENABLED,
+)
+# Money-op boundary. STUB only — never moves money on this branch (see refund_client.py).
+refund_client = RefundClient(provider="nexus", enabled=REFUNDS_ENABLED)
+
+
+def _refund_would_be_eval(ticket_id, email, intent, classification, result):
+    """Compute the would-be refund decision (Nexus-only) and record it on
+    `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
+    Never moves money. Caller wraps this in try/except (strictly additive)."""
+    nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
+    nexus_data = None
+    if nexus_available:
+        try:
+            nexus_data = nexus_client.search_subscription(email)  # read-only
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[{ticket_id}] refund eval: Nexus lookup error: {e}")
+            nexus_data = None
+
+    ctx = refund_engine.RefundContext(
+        intent=intent,
+        confidence=classification.get("confidence", 0.0),
+        language=classification.get("language", "EN"),
+        nexus_available=nexus_available,
+        nexus_data=nexus_data,
+        customer_stated_amount=None,  # ticket-amount parsing deferred; audit-only field
+    )
+    decision = refund_engine.decide(ctx, REFUND_CONFIG)
+
+    # Map onto result (refund_* keys → bq_logger + slack). Additive only.
+    result["refund_decision"]              = "YES" if decision.would_be_refunded else "NO"
+    result["refund_reason_code"]           = decision.reason_code
+    result["refund_amount"]                = decision.computed_amount
+    result["refund_currency"]              = decision.currency
+    result["refund_amount_is_split"]       = decision.amount_is_split
+    result["refund_customer_stated_amount"] = decision.customer_stated_amount
+    result["refund_source"]                = decision.source
+    result["refund_engine_version"]        = decision.engine_version
+    result["refund_guard_trail"]           = json.dumps(decision.guard_trail)
+    result["refund_human_message"]         = decision.human_message
+
+    log.info(
+        f"[{ticket_id}] would_be_refunded={result['refund_decision']} "
+        f"reason={decision.reason_code}"
+    )
+
+    # REFUNDS_ENABLED is inert on this branch: there is NO live refund path.
+    # Even if true, nothing here calls refund_client.create_refund to execute.
+    return decision
 
 # SHADOW_MODE: process ALL tickets, skip ALL writes, send Slack report per ticket.
 # Overrides: DRY_RUN=true (no writes), TEST_MODE=false (all tickets), Slack stays live.
@@ -1795,6 +1860,16 @@ def _process(ticket_id: str) -> dict:
         log.info(
             f"[{ticket_id}] {intent} — refund intent, always escalate to human"
         )
+
+        # AN-192 would-be evaluation. STRICTLY ADDITIVE and fully isolated:
+        # any failure here must NOT change the escalate-to-human behaviour below.
+        # This only COMPUTES + LOGS a would_be_refunded signal; it never moves
+        # money (no live refund path exists — see refund_client.py).
+        try:
+            _refund_would_be_eval(ticket_id, email, intent, classification, result)
+        except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
+            log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
+
         result["status"] = "skipped_refund_request"
         result["reason"] = f"{intent} — refund intents always go to a human"
         zendesk.add_tag(ticket_id, "bot_handled")

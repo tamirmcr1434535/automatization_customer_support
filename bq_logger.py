@@ -59,6 +59,18 @@ SCHEMA = [
     bigquery.SchemaField("shadow_decision",  "STRING"),          # SHADOW: would_cancel / would_escalate / etc.
     bigquery.SchemaField("refund_requested", "BOOLEAN"),         # SHADOW: refund_also_requested flag
 
+    # Refund would-be evaluation (AN-192) — dataset for learning. Nexus-only,
+    # disputes NOT checked; a YES is a DRAFT signal, not a payout permission.
+    bigquery.SchemaField("refund_decision",       "STRING"),   # YES / NO (would_be_refunded)
+    bigquery.SchemaField("refund_reason_code",    "STRING"),   # level where it stopped
+    bigquery.SchemaField("refund_amount",         "NUMERIC"),  # verified amount (never customer-stated)
+    bigquery.SchemaField("refund_currency",       "STRING"),
+    bigquery.SchemaField("refund_amount_is_split","BOOLEAN"),  # A/B "150+150" summed
+    bigquery.SchemaField("refund_customer_stated_amount", "NUMERIC"),  # AUDIT ONLY, never paid
+    bigquery.SchemaField("refund_source",         "STRING"),   # Nexus `source` (brand/site)
+    bigquery.SchemaField("refund_engine_version", "STRING"),
+    bigquery.SchemaField("refund_guard_trail",    "STRING"),   # JSON list of guard levels
+
     # Error info
     bigquery.SchemaField("error",            "STRING"),
 
@@ -148,6 +160,17 @@ def log_result(result: dict):
             "shadow_mode":        result.get("shadow_mode", False),
             "shadow_decision":    result.get("shadow_decision") or "",
             "refund_requested":   result.get("refund_also_requested", False),
+
+            # Refund would-be evaluation (AN-192)
+            "refund_decision":       result.get("refund_decision") or "",
+            "refund_reason_code":    result.get("refund_reason_code") or "",
+            "refund_amount":         result.get("refund_amount"),          # str/NUMERIC or None
+            "refund_currency":       result.get("refund_currency") or "",
+            "refund_amount_is_split": bool(result.get("refund_amount_is_split", False)),
+            "refund_customer_stated_amount": result.get("refund_customer_stated_amount"),
+            "refund_source":         result.get("refund_source") or "",
+            "refund_engine_version": result.get("refund_engine_version") or "",
+            "refund_guard_trail":    result.get("refund_guard_trail") or "",
 
             # Error
             "error":              result.get("error") or "",
