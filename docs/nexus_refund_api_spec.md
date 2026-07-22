@@ -1,63 +1,67 @@
-# Nexus API — refund endpoint (spec for backend)
+# Nexus refund — two-API design (IQTEST-1431 / AN-192)
 
-**Type:** Story · **Component:** Nexus API (`apinexus.cellon.ai`) · **Related:** AN-192
+**Decided in huddle (Jar Halst + Harshad Patel, 2026-07-21).** Refund is split into
+**two separate APIs** on purpose — validation is read-only and separate from execution,
+so a mistake or retry can never move money wrongly.
 
-## Context
-The support-automation bot is adding a refund flow. Refund **execution must go
-through Nexus** (the way operators do it manually) so state and reporting stay
-authoritative. The current Nexus API is read-only (`/api/v1/customer/search-subscription`);
-there is no refund capability. A new endpoint is required. **Critical:** the
-endpoint must be safe on its own — even if the client (bot) makes a mistake or
-retries, money must never go negative or be refunded twice.
+## Flow
 
-## Endpoint
-`POST /api/v1/customer/refund` · auth: `Authorization: Bearer <token>` (dedicated refund scope).
+1. **Validate (read-only):** bot calls the enhanced **search-subscription** API by email,
+   gets the list of charges, and compares them against what the customer wrote in the
+   ticket (amount, date, card last4) to detect fraud / discrepancies and pick the correct
+   charge. No money moves.
+2. **Execute (gated):** only after a clean match, bot calls the **refund** API with the
+   `charge_id`. Full-amount refund only. One refund request may trigger these two calls.
 
-## Request
+---
 
-**Mandatory**
-| Field | Type | Purpose |
-|-------|------|---------|
-| `idempotency_key` | string | Unique per refund attempt. Server dedups: a repeat with the same key must **not** issue a second refund — it returns the original result. |
-| `order_id` | string/int | The **specific** charge/order to refund (NOT `subscription_id` — a sub has many renewal charges). |
-| `amount` | integer (minor units) | Amount to refund. Server validates against what was actually charged. |
-| `currency` | string (ISO-4217) | Must match the charge currency. |
-| `reason` | string | Reason (for audit). |
+## API 1 — Search subscription (enhanced, read-only)
 
-**Optional (recommended)**
-| Field | Type | Purpose |
-|-------|------|---------|
-| `refund_type` | enum `full`\|`partial` | Default `full`. For `partial`, `amount` required. |
-| `dry_run` | boolean | Server-side validation with **no money movement** (returns whether it would pass + amount). Lets the bot test end-to-end safely. |
-| `brand` | string | If the server can't derive it from `order_id`. |
-| `ticket_id` | string | Zendesk ticket, for traceability. |
-| `requested_by` | string | Who initiated (bot/agent id) — for audit. |
+`POST /api/v1/customer/search-subscription` — add a new **`charges`** key: an array of
+charge objects with all available metadata from Stripe and PayPal, each with:
 
-## Response
+- `charge_id`
+- `amount` (minor units) + `currency`
+- `date` — transaction / DB record date (a stable date, **not** a continuously-updated
+  charge-creation timestamp)
+- `provider` (`stripe` / `paypal`)
+- `card_last4` — **last 4 digits only** (never the full card number — PCI/privacy)
+- `status` (`paid` / `already_refunded`)
 
-**Mandatory**
-| Field | Type | Purpose |
-|-------|------|---------|
-| `status` | enum | `refunded` \| `already_refunded` \| `rejected` \| `failed` |
-| `refund_id` | string | Refund id (Nexus and/or provider). |
-| `refunded_amount` | integer (minor units) | The **actual** amount refunded. |
-| `currency` | string | Refund currency. |
-| `provider` | enum `stripe`\|`paypal` | Which provider processed the charge. |
-| `charge_id` / `transaction_id` | string | Original charge id — for cross-check against Stripe. |
-| `idempotency_key` | string | Echo. |
-| `reason_code` | string | On `rejected`/`failed` (e.g. `DISPUTE_OPEN`, `AMOUNT_EXCEEDS_CHARGE`, `ALREADY_REFUNDED`). |
+Purpose: the bot matches the amount + date (+ card last4 if the customer gave it) from the
+ticket against these charges. Today the lookup returns only `subscription_id` (no charge,
+no amount), which makes validation impossible.
 
-## Mandatory server-side logic (safety)
-1. **Idempotency** — atomic dedup on `idempotency_key`; repeat returns original result, never a second refund.
-2. **Amount validation** — `refunded_amount ≤ (charged − already_refunded)`; else `rejected / AMOUNT_EXCEEDS_CHARGE`. Never refund more than charged.
-3. **Already-refunded / partial state** — account for prior refunds correctly.
-4. **Dispute guard** — open Stripe/PayPal dispute/chargeback → **reject** with `DISPUTE_OPEN` (second line of defense; Nexus is closer to the provider than the bot).
-5. **Atomicity** — on timeout/retry, do not double-refund; safely repeatable.
-6. **Audit** — log who/when/how much/idempotency_key/result.
+**Matching logic (bot side):**
+- Primary key = **amount + currency** (+ **date** to disambiguate — a customer may cite
+  several charges, e.g. "5490 on 7/21", "199 + 1990 on 7/14").
+- `card_last4` = optional secondary key when the customer sends it from a receipt.
+- Amounts may differ slightly (bank / FX fees) → a mismatch means **"send to a human"**,
+  not fraud.
+- One clean unique match → candidate charge. No match or several → human. Fail-closed.
 
-## Acceptance criteria
-- Two calls with the same `idempotency_key` → exactly one refund.
-- `amount` > refundable → `rejected / AMOUNT_EXCEEDS_CHARGE`, no money moves.
-- Open dispute → `rejected / DISPUTE_OPEN`.
-- `dry_run=true` → validation with no money movement, returns predicted amount/status.
-- Response always includes `provider` and `charge_id` for cross-verification.
+## API 2 — Refund (execute)
+
+`POST /api/v1/customer/refund` · Bearer auth.
+
+**Request:** `charge_id` (only) + `reason`. No amount/currency — system always refunds the
+**full** charge (no partial). Idempotency handled server-side by charge.
+
+**Response:** `status` (`refunded` / `already_refunded` / `rejected` / `failed`),
+`refunded_amount`, `currency`, `provider`.
+
+**Server-side safety:** idempotency + already-refunded (no double refund), atomicity on
+retry/timeout, audit (reason + who).
+
+---
+
+## STILL OPEN — hard prerequisite before enabling execution
+
+**Dispute guard — for Stripe AND PayPal.** An open dispute/chargeback must make the refund
+API **refuse** (e.g. `rejected` / `DISPUTE_OPEN`). Refunding a disputed charge = paying
+twice (going negative). Nexus can't see disputes (especially PayPal), so this must be
+enforced server-side in the refund API. Not covered in the huddle — needs confirmation.
+Refunds stay disabled (`REFUNDS_ENABLED=false`) until this is implemented and confirmed.
+
+Also confirm: what the refund API returns when it does **not** refund (distinct
+`rejected`/`failed` status + reason), so the bot can tell success from refusal.
