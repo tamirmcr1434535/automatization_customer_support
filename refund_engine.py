@@ -24,6 +24,7 @@ Fail-closed: any unexpected error → would_be_refunded = False (NO).
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Optional
@@ -102,7 +103,9 @@ def _to_decimal(raw) -> Optional[Decimal]:
     is not mistaken for a thousands separator (bug: "9,99" € must be 9.99, not 999)."""
     if raw is None:
         return None
-    s = str(raw).strip().replace(" ", "").replace(" ", "")
+    # NFKC folds full-width (zenkaku) digits/punctuation to ASCII ("１，９９０"→"1,990"),
+    # so a full-width comma no longer truncates the number (was "１，９９０円" → 990).
+    s = unicodedata.normalize("NFKC", str(raw)).strip().replace(" ", "").replace(" ", "")
     if not s:
         return None
     has_dot, has_comma = "." in s, "," in s
@@ -131,6 +134,7 @@ def parse_stated_amounts(text: str) -> list[Decimal]:
     don't pick up dates/quantities. Returns distinct amounts in order seen."""
     if not text:
         return []
+    text = unicodedata.normalize("NFKC", text)  # full-width → ASCII before matching
     out: list[Decimal] = []
     seen = set()
     for m in _STATED_RE.finditer(text):

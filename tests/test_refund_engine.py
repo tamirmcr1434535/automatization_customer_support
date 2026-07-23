@@ -146,6 +146,13 @@ def test_parse_amount_currency_anchored():
     assert re_.parse_stated_amounts("respond within 24 hours, ticket 165573") == []
 
 
+def test_fullwidth_japanese_digits_and_comma():
+    # Zenkaku digits + full-width comma must normalise to ASCII (was truncated to 990).
+    assert re_.parse_stated_amounts("１，９９０円") == [Decimal("1990")]
+    assert re_.parse_stated_amounts("５４９０円請求") == [Decimal("5490")]
+    assert re_.parse_stated_amounts("金額は１２，３４５円です") == [Decimal("12345")]
+
+
 def test_number_parsing_locales():
     # comma decimal (EU) vs comma thousands vs dot decimal
     assert re_._to_decimal("9,99") == Decimal("9.99")     # EU decimal
