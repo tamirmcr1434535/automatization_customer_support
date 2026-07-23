@@ -91,9 +91,29 @@ def test_already_refunded_charge_match():
     assert d.would_be_refunded is False and d.reason_code == re_.RC_ALREADY_REFUNDED
 
 
-def test_multiple_stated_amounts_ambiguous():
+def test_multiple_stated_amounts():
     d = decide(_ctx(ticket_text="charged $30.99 and $9.99, why?"), CFG)
-    assert d.would_be_refunded is False and d.reason_code == re_.RC_CHARGE_AMBIGUOUS
+    assert d.would_be_refunded is False
+    assert d.reason_code == re_.RC_MULTIPLE_AMOUNTS_STATED
+    assert d.customer_stated_amounts == "30.99,9.99"  # all stated amounts logged
+
+
+def test_european_decimal_comma_matches():
+    # "9,99" (EU decimal comma) must parse to 9.99, not 999 → matches ch_B.
+    charges = [{"charge_id": "ch_B", "amount": 9.99, "currency": "EUR",
+                "type": "cross_sale", "status": "success", "refundable": True}]
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": charges},
+                    ticket_text="ich wurde 9,99€ berechnet, bitte erstatten"), CFG)
+    assert d.would_be_refunded is True
+    assert d.computed_amount == "9.99" and d.candidate_charge_id == "ch_B"
+
+
+def test_turkish_lira_amount_parsed():
+    charges = [{"charge_id": "ch_T", "amount": 199, "currency": "TRY",
+                "type": "first_sale", "status": "success", "refundable": True}]
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": charges},
+                    ticket_text="199 TL ödeme iade"), CFG)
+    assert d.would_be_refunded is True and d.candidate_charge_id == "ch_T"
 
 
 def test_multiple_refundable_charges_same_amount_ambiguous():
@@ -124,3 +144,13 @@ def test_parse_amount_currency_anchored():
     assert re_.parse_stated_amounts(txt) == [Decimal("5490"), Decimal("199"), Decimal("1990")]
     # No currency anchor → nothing (avoid dates / "24 hours").
     assert re_.parse_stated_amounts("respond within 24 hours, ticket 165573") == []
+
+
+def test_number_parsing_locales():
+    # comma decimal (EU) vs comma thousands vs dot decimal
+    assert re_._to_decimal("9,99") == Decimal("9.99")     # EU decimal
+    assert re_._to_decimal("9.99") == Decimal("9.99")     # US decimal
+    assert re_._to_decimal("1,990") == Decimal("1990")    # comma thousands
+    assert re_._to_decimal("1.234,56") == Decimal("1234.56")  # EU full
+    assert re_._to_decimal("1,234.56") == Decimal("1234.56")  # US full
+    assert re_._to_decimal("5490") == Decimal("5490")

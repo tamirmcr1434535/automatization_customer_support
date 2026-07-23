@@ -183,6 +183,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result, tick
     result["refund_amount"]                = decision.computed_amount
     result["refund_currency"]              = decision.currency
     result["refund_customer_stated_amount"] = decision.customer_stated_amount
+    result["refund_stated_amounts"]        = decision.customer_stated_amounts
     result["refund_charge_id"]             = decision.candidate_charge_id
     result["refund_charge_type"]           = decision.charge_type
     result["refund_source"]                = decision.source

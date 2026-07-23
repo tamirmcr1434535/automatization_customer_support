@@ -66,7 +66,8 @@ SCHEMA = [
     bigquery.SchemaField("refund_amount",         "NUMERIC"),  # verified amount (never customer-stated)
     bigquery.SchemaField("refund_currency",       "STRING"),
     bigquery.SchemaField("refund_amount_is_split","BOOLEAN"),  # A/B "150+150" summed
-    bigquery.SchemaField("refund_customer_stated_amount", "NUMERIC"),  # AUDIT ONLY, never paid
+    bigquery.SchemaField("refund_customer_stated_amount", "NUMERIC"),  # AUDIT ONLY, never paid (first)
+    bigquery.SchemaField("refund_stated_amounts",  "STRING"),  # ALL stated amounts, comma-joined
     bigquery.SchemaField("refund_source",         "STRING"),   # Nexus `source` (brand/site)
     bigquery.SchemaField("refund_charge_id",      "STRING"),   # candidate charge matched
     bigquery.SchemaField("refund_charge_type",    "STRING"),   # first_sale / cross_sale / subscription
@@ -170,6 +171,7 @@ def log_result(result: dict):
             "refund_currency":       result.get("refund_currency") or "",
             "refund_amount_is_split": bool(result.get("refund_amount_is_split", False)),
             "refund_customer_stated_amount": result.get("refund_customer_stated_amount"),
+            "refund_stated_amounts": result.get("refund_stated_amounts") or "",
             "refund_source":         result.get("refund_source") or "",
             "refund_charge_id":      result.get("refund_charge_id") or "",
             "refund_charge_type":    result.get("refund_charge_type") or "",
