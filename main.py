@@ -151,10 +151,13 @@ REFUND_CONFIG = refund_engine.RefundConfig(
 refund_client = RefundClient(provider="nexus", enabled=REFUNDS_ENABLED)
 
 
-def _refund_would_be_eval(ticket_id, email, intent, classification, result):
+def _refund_would_be_eval(ticket_id, email, intent, classification, result, ticket_text=""):
     """Compute the would-be refund decision (Nexus-only) and record it on
     `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
-    Never moves money. Caller wraps this in try/except (strictly additive)."""
+    Never moves money. Caller wraps this in try/except (strictly additive).
+
+    `ticket_text` = subject + body (+ comments) — used to read the amount the
+    customer states, which the engine matches against the real Nexus charges."""
     nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
     nexus_data = None
     if nexus_available:
@@ -170,7 +173,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result):
         language=classification.get("language", "EN"),
         nexus_available=nexus_available,
         nexus_data=nexus_data,
-        customer_stated_amount=None,  # ticket-amount parsing deferred; audit-only field
+        ticket_text=ticket_text or "",
     )
     decision = refund_engine.decide(ctx, REFUND_CONFIG)
 
@@ -179,8 +182,9 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result):
     result["refund_reason_code"]           = decision.reason_code
     result["refund_amount"]                = decision.computed_amount
     result["refund_currency"]              = decision.currency
-    result["refund_amount_is_split"]       = decision.amount_is_split
     result["refund_customer_stated_amount"] = decision.customer_stated_amount
+    result["refund_charge_id"]             = decision.candidate_charge_id
+    result["refund_charge_type"]           = decision.charge_type
     result["refund_source"]                = decision.source
     result["refund_engine_version"]        = decision.engine_version
     result["refund_guard_trail"]           = json.dumps(decision.guard_trail)
@@ -188,7 +192,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result):
 
     log.info(
         f"[{ticket_id}] would_be_refunded={result['refund_decision']} "
-        f"reason={decision.reason_code}"
+        f"reason={decision.reason_code} charge={decision.candidate_charge_id}"
     )
 
     # REFUNDS_ENABLED is inert on this branch: there is NO live refund path.
@@ -1415,6 +1419,7 @@ def _process(ticket_id: str) -> dict:
             _refund_would_be_eval(
                 ticket_id, email, "REFUND_REQUEST",
                 {"confidence": 0.95, "language": "EN"}, result,
+                ticket_text=subject,
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -1754,6 +1759,7 @@ def _process(ticket_id: str) -> dict:
             _refund_would_be_eval(
                 ticket_id, email, "REFUND_REQUEST",
                 {"confidence": 0.95, "language": language}, result,
+                ticket_text=f"{subject}\n{body}",
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -1884,7 +1890,10 @@ def _process(ticket_id: str) -> dict:
         # This only COMPUTES + LOGS a would_be_refunded signal; it never moves
         # money (no live refund path exists — see refund_client.py).
         try:
-            _refund_would_be_eval(ticket_id, email, intent, classification, result)
+            _refund_would_be_eval(
+                ticket_id, email, intent, classification, result,
+                ticket_text=f"{subject}\n{body}",
+            )
         except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
 
