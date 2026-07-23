@@ -1,18 +1,22 @@
 """
-Refund decision engine — PURE, would-be-only (AN-192)
-======================================================
-Given Nexus-lookup data + classifier output, computes a *would-be* refund
-decision: **would_be_refunded YES / NO + reason_code**. It does NOT move
-money and has NO I/O — it is a pure function over plain data, so it is
-trivially testable and can never call a payment API.
+Refund decision engine — PURE, would-be-only (AN-192 / IQTEST-1431)
+====================================================================
+Given the Nexus `charges[]` list + the customer's ticket text, computes a
+*would-be* refund decision: **would_be_refunded YES / NO + reason_code**, and
+which charge would be the candidate. It does NOT move money and has NO I/O — it
+is a pure function over plain data, so it is trivially testable and can never
+call a payment API.
 
-Scope of THIS iteration (see plan glowing-churning-steele.md):
-  - Data source is ONLY Nexus `search_subscription` + the classifier.
-    No Stripe verification, no two-source check, no PayPal/dispute check.
-  - The result is a *draft signal for learning*, NOT a permission to pay.
-    Nexus cannot see disputes / PayPal / non-Nexus payments (Slack #2/#3/#4),
-    so a YES here does NOT mean "safe to refund". Dispute/PayPal checks are a
-    hard prerequisite before any real execution (future iteration).
+Validation logic (matches the two-API design agreed 2026-07-21):
+  - Read the amount(s) the customer states in the ticket.
+  - Match them against the real `charges[]` from Nexus (amount + currency).
+  - Exactly one *refundable* charge matches one stated amount → candidate (YES).
+  - No match / already-refunded / several matches / several stated amounts →
+    NO with a specific reason → human decides.
+
+The result is a *draft signal for learning*, NOT permission to pay. Execution
+(refund by charge_id) is a separate, gated API. Nexus cannot see disputes, so a
+YES here still requires the refund-API dispute guard before any real refund.
 
 Fail-closed: any unexpected error → would_be_refunded = False (NO).
 """
@@ -24,39 +28,40 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-nexus-v1"
+ENGINE_VERSION = "wb-charges-v2"
 
-# Intents that represent a refund request (the only ones in scope).
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
-# ── Reason codes ─────────────────────────────────────────────────────────── #
-# Stable strings — logged to BQ and shown in Slack. Each NO/blocked code marks
-# the LEVEL of check at which the decision stopped (the "рівні перевірок").
-RC_WOULD_BE_REFUNDED = "WOULD_BE_REFUNDED"   # YES (Nexus-only)
-RC_UNABLE_TO_EVAL    = "UNABLE_TO_EVAL"      # Nexus not available — cannot even evaluate
-RC_OUT_OF_SCOPE      = "OUT_OF_SCOPE"        # not a refund intent
-RC_LOW_CONFIDENCE    = "LOW_CONFIDENCE"      # classifier below threshold
-RC_NOT_FOUND_IN_NEXUS = "NOT_FOUND_IN_NEXUS" # no subscription/order found
-RC_CHARGE_AMBIGUOUS  = "CHARGE_AMBIGUOUS"    # multi-site/multi-email/cross-sell
-RC_AMOUNT_UNAVAILABLE = "AMOUNT_UNAVAILABLE" # no verifiable amount from Nexus
-RC_EVAL_ERROR        = "EVAL_ERROR"          # fail-closed on unexpected error
+# ── Reason codes (level at which the decision stopped) ───────────────────── #
+RC_WOULD_BE_REFUNDED = "WOULD_BE_REFUNDED"    # YES — one clean refundable match
+RC_UNABLE_TO_EVAL    = "UNABLE_TO_EVAL"       # Nexus not available
+RC_OUT_OF_SCOPE      = "OUT_OF_SCOPE"         # not a refund intent
+RC_LOW_CONFIDENCE    = "LOW_CONFIDENCE"       # classifier below threshold
+RC_NOT_FOUND_IN_NEXUS = "NOT_FOUND_IN_NEXUS"  # no charges for this customer
+RC_NOTHING_REFUNDABLE = "NOTHING_REFUNDABLE"  # charges exist but none refundable
+RC_AMOUNT_NOT_STATED = "AMOUNT_NOT_STATED"    # customer gave no amount → can't validate
+RC_AMOUNT_MISMATCH   = "AMOUNT_MISMATCH"      # stated amount matches no charge (FX/fees?) → human
+RC_ALREADY_REFUNDED  = "ALREADY_REFUNDED"     # stated amount matches an already-refunded charge
+RC_CHARGE_AMBIGUOUS  = "CHARGE_AMBIGUOUS"     # several matches / several stated amounts
+RC_EVAL_ERROR        = "EVAL_ERROR"           # fail-closed on unexpected error
 
-# Candidate keys under which a numeric charge amount MIGHT appear in Nexus data.
-# Nexus `search_subscription` currently returns subscription *state* (not a
-# charge amount), so this is defensive: if a future/undocumented field carries
-# an amount we pick it up; otherwise the engine reports AMOUNT_UNAVAILABLE.
-_AMOUNT_KEYS = (
-    "amount", "total", "price", "renewal_amount", "subscription_total",
-    "last_charge_amount", "charge_amount", "order_total",
+# Currency indicators — used to extract amounts the customer *states* (anchored
+# to a currency so we don't pick up dates like "7/21" or "24 hours").
+_CUR = (
+    r"(?:¥|￥|\$|€|£|₩|円|圆|元|원|USD|JPY|EUR|GBP|KRW|IDR|THB|VND|PHP|MXN|BRL|"
+    r"dollars?|yen|won|евро|долл?)"
 )
-_CURRENCY_KEYS = ("currency", "currency_code", "curr")
+_NUM = r"\d[\d,]*(?:\.\d+)?"
+_STATED_RE = re.compile(
+    rf"(?:{_CUR}\s*({_NUM}))|(?:({_NUM})\s*{_CUR})",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
 class RefundConfig:
-    """Immutable snapshot of config, passed in by the caller (no env reads here)."""
     min_confidence: float = 0.90
-    refunds_enabled: bool = False   # informational only this iteration (no live path)
+    refunds_enabled: bool = False   # informational only — no live path exists
     engine_version: str = ENGINE_VERSION
 
 
@@ -66,9 +71,9 @@ class RefundContext:
     intent: str
     confidence: float
     language: str = "EN"
-    nexus_available: bool = False        # was a Nexus client configured & queried?
-    nexus_data: Optional[dict] = None    # raw search_subscription `data` dict, or None
-    customer_stated_amount: Optional[str] = None  # parsed from ticket — AUDIT ONLY
+    nexus_available: bool = False
+    nexus_data: Optional[dict] = None   # includes "charges", "subscription_id", "source"
+    ticket_text: str = ""               # subject + body (+ comments) for amount parsing
 
 
 @dataclass
@@ -77,130 +82,84 @@ class RefundDecision:
     reason_code: str
     human_message: str
     guard_trail: list = field(default_factory=list)
-    computed_amount: Optional[str] = None     # str(Decimal) or None — verified amount
+    computed_amount: Optional[str] = None       # candidate charge amount (verified)
     currency: Optional[str] = None
-    amount_is_split: bool = False             # A/B "150+150" was summed
-    amount_source: str = "unavailable"        # "nexus" / "unavailable"
     customer_stated_amount: Optional[str] = None  # audit only, NEVER used for payout
-    source: Optional[str] = None              # Nexus `source` (brand/site), for analytics
+    candidate_charge_id: Optional[str] = None
+    charge_type: Optional[str] = None           # first_sale / cross_sale / subscription
+    source: Optional[str] = None                # Nexus `source` (brand/site)
     engine_version: str = ENGINE_VERSION
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────── #
 
-def parse_amount(raw) -> tuple[Optional[Decimal], bool]:
-    """Parse an amount that may be an A/B split like "150+150".
-
-    Returns (summed_amount, is_split). SUMS split components (Slack #1 — admin
-    shows A/B price as "150+150"; we never quote the split, we sum it).
-    Returns (None, False) if nothing parseable.
-    """
+def _to_decimal(raw) -> Optional[Decimal]:
     if raw is None:
-        return None, False
-    if isinstance(raw, (int, float, Decimal)):
-        try:
-            return Decimal(str(raw)), False
-        except (InvalidOperation, ValueError):
-            return None, False
-
-    s = str(raw)
-    # Grab all numeric tokens (handles "¥150+¥150", "150 + 150", "1,500").
-    tokens = re.findall(r"\d[\d,]*(?:\.\d+)?", s)
-    if not tokens:
-        return None, False
-    total = Decimal("0")
-    ok = False
-    for t in tokens:
-        try:
-            total += Decimal(t.replace(",", ""))
-            ok = True
-        except (InvalidOperation, ValueError):
-            continue
-    if not ok:
-        return None, False
-    is_split = len(tokens) > 1
-    return total, is_split
+        return None
+    try:
+        return Decimal(str(raw).replace(",", "").strip())
+    except (InvalidOperation, ValueError):
+        return None
 
 
-def _extract_amount(nexus_data: Optional[dict]) -> tuple[Optional[Decimal], bool, Optional[str]]:
-    """Best-effort amount + currency extraction from Nexus data.
-
-    Nexus `search_subscription` does not currently expose a charge amount, so
-    this usually returns (None, False, None) → AMOUNT_UNAVAILABLE. Kept
-    defensive so an undocumented/future amount field is picked up automatically.
-    """
-    if not isinstance(nexus_data, dict):
-        return None, False, None
-    amount, is_split = None, False
-    for k in _AMOUNT_KEYS:
-        if k in nexus_data and nexus_data[k] not in (None, "", 0, "0"):
-            amount, is_split = parse_amount(nexus_data[k])
-            if amount is not None:
-                break
-    currency = None
-    for k in _CURRENCY_KEYS:
-        val = nexus_data.get(k)
-        if val:
-            currency = str(val).upper()
-            break
-    return amount, is_split, currency
+def parse_stated_amounts(text: str) -> list[Decimal]:
+    """Extract amounts the customer states, anchored to a currency token so we
+    don't pick up dates/quantities. Returns distinct amounts in order seen."""
+    if not text:
+        return []
+    out: list[Decimal] = []
+    seen = set()
+    for m in _STATED_RE.finditer(text):
+        tok = m.group(1) or m.group(2)
+        d = _to_decimal(tok)
+        if d is not None and d > 0 and d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
 
 
-def _is_charge_ambiguous(nexus_data: dict) -> bool:
-    """More than one distinct chargeable subscription/order in Nexus → ambiguous
-    (multi-site / multi-email-per-card / legacy cross-sell — Slack #8/#9/#10).
+def _charge_amount(charge: dict) -> Optional[Decimal]:
+    return _to_decimal(charge.get("amount"))
 
-    `renewal_subscriptions` is a COUNT of renewals on the SAME sub (not separate
-    charges), so it does NOT make a case ambiguous. We look for evidence of
-    multiple distinct subscriptions when Nexus exposes a list.
-    """
-    for list_key in ("subscriptions", "matches", "all_subscriptions"):
-        val = nexus_data.get(list_key)
-        if isinstance(val, list) and len(val) > 1:
-            return True
-    return bool(nexus_data.get("ambiguous"))
+
+def _is_refundable(charge: dict) -> bool:
+    # Trust the explicit flag; fall back to status if the flag is absent.
+    if "refundable" in charge:
+        return charge.get("refundable") is True
+    return str(charge.get("status", "")).lower() == "success"
 
 
 def _decision(would: bool, code: str, msg: str, trail: list, **kw) -> RefundDecision:
-    trail = trail + [code]
     return RefundDecision(
         would_be_refunded=would, reason_code=code, human_message=msg,
-        guard_trail=trail, **kw,
+        guard_trail=trail + [code], **kw,
     )
 
 
 # ── The pipeline ─────────────────────────────────────────────────────────── #
 
 def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
-    """Compute the would-be refund decision. PURE. Never raises (fail-closed).
-
-    Ordered, fail-closed guards. Returns would_be_refunded=True ONLY if every
-    guard passes; otherwise False with the reason_code of the level it stopped at.
-    """
+    """Compute the would-be refund decision. PURE. Never raises (fail-closed)."""
     trail: list = []
     try:
-        # Data we can annotate regardless of verdict.
         nexus = ctx.nexus_data if isinstance(ctx.nexus_data, dict) else {}
         source = nexus.get("source") or None
-        amount, is_split, currency = _extract_amount(nexus)
+        charges = nexus.get("charges") if isinstance(nexus.get("charges"), list) else []
+        stated = parse_stated_amounts(ctx.ticket_text)
         common = dict(
-            computed_amount=(str(amount) if amount is not None else None),
-            currency=currency,
-            amount_is_split=is_split,
-            amount_source=("nexus" if amount is not None else "unavailable"),
-            customer_stated_amount=ctx.customer_stated_amount,
             source=source,
+            customer_stated_amount=(str(stated[0]) if stated else None),
             engine_version=cfg.engine_version,
         )
 
-        # 0. Nexus available? (else we cannot evaluate at all — distinct from NO)
+        # 0. Nexus available?
+        trail.append("nexus_available")
         if not ctx.nexus_available:
-            trail.append("nexus_available")
             return _decision(False, RC_UNABLE_TO_EVAL,
                              "Nexus lookup unavailable — cannot evaluate refund.",
                              trail, **common)
 
-        # 1. Scope — must be a refund intent.
+        # 1. Scope.
         trail.append("scope")
         if ctx.intent not in REFUND_INTENTS:
             return _decision(False, RC_OUT_OF_SCOPE,
@@ -218,36 +177,72 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                              f"Classifier confidence {conf:.2f} < {cfg.min_confidence:.2f}.",
                              trail, **common)
 
-        # 3. Found in Nexus?
-        trail.append("found_in_nexus")
-        if not nexus.get("subscription_id"):
+        # 3. Charges present?
+        trail.append("charges_present")
+        if not charges:
             return _decision(False, RC_NOT_FOUND_IN_NEXUS,
-                             "No subscription/order found in Nexus for this customer.",
+                             "No charges found in Nexus for this customer.",
                              trail, **common)
 
-        # 4. Unambiguous charge?
-        trail.append("unambiguous")
-        if _is_charge_ambiguous(nexus):
+        # 4. Anything refundable?
+        trail.append("refundable_exists")
+        refundable = [c for c in charges if _is_refundable(c)]
+        if not refundable:
+            return _decision(False, RC_NOTHING_REFUNDABLE,
+                             "Charges exist but none are refundable (already refunded / not eligible).",
+                             trail, **common)
+
+        # 5. Customer stated an amount?
+        trail.append("amount_stated")
+        if not stated:
+            return _decision(False, RC_AMOUNT_NOT_STATED,
+                             "Customer did not state a verifiable amount — cannot pick a charge.",
+                             trail, **common)
+
+        # 6. Match stated amount(s) against charges.
+        trail.append("match")
+        stated_set = set(stated)
+        matched_all = [c for c in charges if _charge_amount(c) in stated_set]
+        matched_refundable = [c for c in matched_all if _is_refundable(c)]
+
+        # Several stated amounts → customer is asking about multiple charges → human.
+        if len(stated) > 1:
             return _decision(False, RC_CHARGE_AMBIGUOUS,
-                             "Multiple candidate charges — needs human (multi-site / "
-                             "multi-email / cross-sell).",
+                             f"Customer cited {len(stated)} amounts — multiple charges, human decides.",
                              trail, **common)
 
-        # 5. Verifiable amount?
-        trail.append("amount")
-        if amount is None:
-            return _decision(False, RC_AMOUNT_UNAVAILABLE,
-                             "No verifiable charge amount from Nexus (customer-stated "
-                             "amount is never trusted).",
+        if not matched_all:
+            return _decision(False, RC_AMOUNT_MISMATCH,
+                             "Stated amount matches no charge (may be bank/FX fees) — human decides.",
                              trail, **common)
 
-        # 6. All Nexus-only checks pass → would-be refund YES (draft, not a payout).
+        if not matched_refundable:
+            return _decision(False, RC_ALREADY_REFUNDED,
+                             "Stated amount matches a charge that is already refunded / not refundable.",
+                             trail, **common)
+
+        if len(matched_refundable) > 1:
+            return _decision(False, RC_CHARGE_AMBIGUOUS,
+                             f"{len(matched_refundable)} refundable charges match the amount — human decides.",
+                             trail, **common)
+
+        # 7. Exactly one refundable charge matches one stated amount → candidate.
+        c = matched_refundable[0]
+        amt = _charge_amount(c)
+        cur = c.get("currency")
         trail.append("would_be")
-        return _decision(True, RC_WOULD_BE_REFUNDED,
-                         f"Would be refunded (Nexus-only, disputes NOT checked): "
-                         f"{amount}{(' ' + currency) if currency else ''}"
-                         f"{' [A/B summed]' if is_split else ''}.",
-                         trail, **common)
+        return _decision(
+            True, RC_WOULD_BE_REFUNDED,
+            f"Would be refunded (Nexus-only, disputes NOT checked): "
+            f"{amt}{(' ' + str(cur)) if cur else ''} "
+            f"charge {c.get('charge_id')} ({c.get('type')}).",
+            trail,
+            computed_amount=(str(amt) if amt is not None else None),
+            currency=(str(cur) if cur else None),
+            candidate_charge_id=c.get("charge_id"),
+            charge_type=c.get("type"),
+            **common,
+        )
 
     except Exception as e:  # noqa: BLE001 — fail-closed on ANYTHING
         return RefundDecision(
