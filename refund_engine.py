@@ -42,16 +42,18 @@ RC_NOTHING_REFUNDABLE = "NOTHING_REFUNDABLE"  # charges exist but none refundabl
 RC_AMOUNT_NOT_STATED = "AMOUNT_NOT_STATED"    # customer gave no amount → can't validate
 RC_AMOUNT_MISMATCH   = "AMOUNT_MISMATCH"      # stated amount matches no charge (FX/fees?) → human
 RC_ALREADY_REFUNDED  = "ALREADY_REFUNDED"     # stated amount matches an already-refunded charge
-RC_CHARGE_AMBIGUOUS  = "CHARGE_AMBIGUOUS"     # several matches / several stated amounts
+RC_CHARGE_AMBIGUOUS  = "CHARGE_AMBIGUOUS"     # several refundable charges match one amount
+RC_MULTIPLE_AMOUNTS_STATED = "MULTIPLE_AMOUNTS_STATED"  # customer cited several amounts
 RC_EVAL_ERROR        = "EVAL_ERROR"           # fail-closed on unexpected error
 
 # Currency indicators — used to extract amounts the customer *states* (anchored
 # to a currency so we don't pick up dates like "7/21" or "24 hours").
 _CUR = (
-    r"(?:¥|￥|\$|€|£|₩|円|圆|元|원|USD|JPY|EUR|GBP|KRW|IDR|THB|VND|PHP|MXN|BRL|"
-    r"dollars?|yen|won|евро|долл?)"
+    r"(?:¥|￥|\$|€|£|₩|₺|₹|₴|₪|₽|zł|Kč|円|圆|元|원|"
+    r"USD|JPY|EUR|GBP|KRW|IDR|THB|VND|PHP|MXN|BRL|TRY|TL|INR|PLN|UAH|ILS|CHF|RUB|"
+    r"dollars?|yen|won|lira|евро|долл?|грн)"
 )
-_NUM = r"\d[\d,]*(?:\.\d+)?"
+_NUM = r"\d[\d.,]*\d|\d"   # must start and end with a digit (no trailing separator)
 _STATED_RE = re.compile(
     rf"(?:{_CUR}\s*({_NUM}))|(?:({_NUM})\s*{_CUR})",
     re.IGNORECASE,
@@ -84,7 +86,8 @@ class RefundDecision:
     guard_trail: list = field(default_factory=list)
     computed_amount: Optional[str] = None       # candidate charge amount (verified)
     currency: Optional[str] = None
-    customer_stated_amount: Optional[str] = None  # audit only, NEVER used for payout
+    customer_stated_amount: Optional[str] = None  # first stated amount (audit only)
+    customer_stated_amounts: Optional[str] = None  # ALL stated amounts, comma-joined (audit)
     candidate_charge_id: Optional[str] = None
     charge_type: Optional[str] = None           # first_sale / cross_sale / subscription
     source: Optional[str] = None                # Nexus `source` (brand/site)
@@ -94,10 +97,31 @@ class RefundDecision:
 # ── Pure helpers ─────────────────────────────────────────────────────────── #
 
 def _to_decimal(raw) -> Optional[Decimal]:
+    """Locale-aware numeric parse. Handles both US ("1,234.56", "9.99") and
+    European ("1.234,56", "9,99") notation so a comma used as a DECIMAL separator
+    is not mistaken for a thousands separator (bug: "9,99" € must be 9.99, not 999)."""
     if raw is None:
         return None
+    s = str(raw).strip().replace(" ", "").replace(" ", "")
+    if not s:
+        return None
+    has_dot, has_comma = "." in s, "," in s
+    if has_dot and has_comma:
+        # The separator that appears LAST is the decimal one.
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "").replace(",", ".")   # EU: 1.234,56 → 1234.56
+        else:
+            s = s.replace(",", "")                       # US: 1,234.56 → 1234.56
+    elif has_comma:
+        parts = s.split(",")
+        # single comma + exactly 2 trailing digits → decimal (9,99 → 9.99);
+        # otherwise treat comma(s) as thousands separators (1,990 → 1990).
+        if len(parts) == 2 and len(parts[1]) == 2:
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
     try:
-        return Decimal(str(raw).replace(",", "").strip())
+        return Decimal(s)
     except (InvalidOperation, ValueError):
         return None
 
@@ -149,6 +173,7 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         common = dict(
             source=source,
             customer_stated_amount=(str(stated[0]) if stated else None),
+            customer_stated_amounts=(",".join(str(a) for a in stated) if stated else None),
             engine_version=cfg.engine_version,
         )
 
@@ -207,8 +232,9 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
 
         # Several stated amounts → customer is asking about multiple charges → human.
         if len(stated) > 1:
-            return _decision(False, RC_CHARGE_AMBIGUOUS,
-                             f"Customer cited {len(stated)} amounts — multiple charges, human decides.",
+            return _decision(False, RC_MULTIPLE_AMOUNTS_STATED,
+                             f"Customer cited {len(stated)} amounts "
+                             f"({', '.join(str(a) for a in stated)}) — human decides.",
                              trail, **common)
 
         if not matched_all:
