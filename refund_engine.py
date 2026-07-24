@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v7"  # v7: flow #1 (subscription) + flow #2 (report=non-refundable) + routing
+ENGINE_VERSION = "wb-flow12-v8"  # v8: date-based routing (Anna) resolves AMBIGUOUS_FLOW by stated/"same-day" date
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -211,6 +211,89 @@ def _parse_iso_date(s) -> Optional[date]:
         return None
 
 
+# ── Date-based routing (Anna's rule) ─────────────────────────────────────── #
+# Customers rarely name WHICH charge they want back; humans disambiguate by the
+# DATE they mention ("charged on 24.07" / "the payment that same day"). We parse
+# a date from the ticket, match it to a charge, and route to that charge's flow.
+
+# Date like "2026年7月21日", "2026/7/21", "2026-07-21", "7/21", "7月21日", "21.07.2026".
+_DATE_RE = re.compile(r"(?:(\d{4})[年/\-.])?(\d{1,2})[月/\-.](\d{1,2})日?")
+
+# "same day / today" markers across the bot's main languages → the ticket date.
+_SAME_DAY_MARKERS = (
+    "same day", "same-day", "that day", "today",          # EN
+    "selben tag", "gleichen tag", "heute",                # DE
+    "même jour", "meme jour", "aujourd'hui", "aujourdhui",  # FR
+    "mismo día", "mismo dia", "hoy",                       # ES
+    "mesmo dia", "hoje",                                   # PT
+    "aynı gün", "ayni gun", "bugün", "bugun",              # TR
+    "同じ日", "本日", "今日",                               # JA
+    "той самий день", "того ж дня", "сьогодні",            # UK
+    "тот же день", "того же дня", "сегодня",               # RU
+)
+
+
+def parse_stated_dates(text: str):
+    """Candidate dates the customer states → list of (year|None, month, day).
+    Emits BOTH JP/ISO (M/D) and EU (D/M) interpretations so matching against the
+    real charge date resolves the order. Full-width safe (NFKC)."""
+    if not text:
+        return []
+    text = unicodedata.normalize("NFKC", text)
+    out = []
+    for m in _DATE_RE.finditer(text):
+        y = int(m.group(1)) if m.group(1) else None
+        a, b = int(m.group(2)), int(m.group(3))
+        if 1 <= a <= 12 and 1 <= b <= 31:               # (month=a, day=b) — JP / ISO order
+            out.append((y, a, b))
+        if 1 <= b <= 12 and 1 <= a <= 31 and a != b:    # (month=b, day=a) — EU order
+            out.append((y, b, a))
+    return out
+
+
+def _mentions_same_day(text: str) -> bool:
+    if not text:
+        return False
+    t = unicodedata.normalize("NFKC", text).lower()
+    return any(mk in t for mk in _SAME_DAY_MARKERS)
+
+
+def _charge_ymd(charge: dict):
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(charge.get("date") or ""))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _charge_matches_date(charge: dict, dates) -> bool:
+    ymd = _charge_ymd(charge)
+    if not ymd:
+        return False
+    cy, cm, cd = ymd
+    return any(mo == cm and d == cd and (y is None or y == cy) for (y, mo, d) in dates)
+
+
+def _type_group(charge: dict) -> Optional[str]:
+    """Charge type → the routing group label ('subscription'/'report'/'first_sale')."""
+    t = str(charge.get("type", "")).lower()
+    return {"subscription": "subscription", "cross_sale": "report",
+            "first_sale": "first_sale"}.get(t)
+
+
+def _route_by_date(ctx: "RefundContext", refundable: list) -> Optional[str]:
+    """Anna's rule: when the amount can't tell which flow, match a stated (or
+    'same-day') date to a charge. Returns the target group iff every date-matched
+    refundable charge is the SAME type (one flow); else None (stays ambiguous)."""
+    dates = list(parse_stated_dates(ctx.ticket_text))
+    if _mentions_same_day(ctx.ticket_text):
+        adate = _parse_iso_date(ctx.as_of_date)
+        if adate:
+            dates.append((adate.year, adate.month, adate.day))
+    if not dates:
+        return None
+    matched = [c for c in refundable if _charge_matches_date(c, dates)]
+    types = {g for g in (_type_group(c) for c in matched) if g}
+    return next(iter(types)) if len(types) == 1 else None
+
+
 def window_for(country: str, currency: str, language: str) -> tuple[int, str]:
     """Refund window (days) + source. Priority: explicit billing country → charge
     currency proxy → language proxy → default 14."""
@@ -300,20 +383,26 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
 
         stated_set = set(parse_stated_amounts(ctx.ticket_text))
         _groups = (("subscription", subs), ("report", reports), ("first_sale", firsts))
+        present = [t for t, chs in _groups if chs]
         by_amount = [t for t, chs in _groups if chs and any(_charge_amount(c) in stated_set for c in chs)]
-        if len(by_amount) == 1:
+        target_type = None
+        if len(by_amount) == 1:                       # A: stated amount picks one flow
             target_type = by_amount[0]
-        elif len(by_amount) > 1:
-            return _decision(False, RC_AMBIGUOUS_FLOW,
-                             "Stated amount matches more than one charge type — human decides.",
-                             trail, candidate_charges=_charges_summary(refundable), **common)
-        else:
-            present = [t for t, chs in _groups if chs]
-            if len(present) != 1:
-                return _decision(False, RC_AMBIGUOUS_FLOW,
-                                 "Multiple refundable charge types, no amount to disambiguate — human decides.",
-                                 trail, candidate_charges=_charges_summary(refundable), **common)
+        elif len(by_amount) == 0 and len(present) == 1:  # B: only one refundable type present
             target_type = present[0]
+
+        if target_type is None:
+            # Amount didn't disambiguate → try DATE (Anna's rule: "same day" / "on <date>").
+            dated = _route_by_date(ctx, refundable)
+            if dated is not None:
+                target_type = dated
+                trail.append("date_routed")
+
+        if target_type is None:                       # C: still ambiguous → human decides
+            return _decision(False, RC_AMBIGUOUS_FLOW,
+                             "Multiple refundable charge types, no amount/date to "
+                             "disambiguate — human decides.",
+                             trail, candidate_charges=_charges_summary(refundable), **common)
         trail.append(f"route:{target_type}")
 
         # ── Flow #2 — IQ Test Report (cross_sale): NON-refundable per Terms of Use ──

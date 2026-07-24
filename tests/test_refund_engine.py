@@ -188,3 +188,52 @@ def test_parse_stated_amounts_currency_anchored():
     assert re_.parse_stated_amounts("charged $30.99") == [Decimal("30.99")]
     assert re_.parse_stated_amounts("5490円と199円") == [Decimal("5490"), Decimal("199")]
     assert re_.parse_stated_amounts("respond within 24 hours") == []  # no currency anchor
+
+
+# ── Date-based routing (Anna's rule) ─────────────────────────────────────── #
+
+def test_parse_stated_dates_both_orders():
+    # "17.07" is unambiguously month 7 day 17 (17 can't be a month); "5/6" emits both.
+    assert (None, 7, 17) in re_.parse_stated_dates("на 17.07")
+    both = re_.parse_stated_dates("5/6")
+    assert (None, 5, 6) in both and (None, 6, 5) in both
+    assert re_.parse_stated_dates("2026年7月24日") == [(2026, 7, 24)]
+
+
+def test_date_routes_to_subscription_same_day_166905():
+    # Ticket 166905: 3 refundable charges, NO amount stated. Customer says the
+    # payment was "the same day" → the ticket-date charge (the subscription).
+    charges = [_sub("ch_sub", 5490, "2026-07-24"),
+               _report(cid="ch_rep", amount=1990, dt="2026-07-17"),
+               _first(cid="ch_first", amount=199, dt="2026-07-17")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="I want a refund for the payment I made the same day"), CFG)
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
+    assert "date_routed" in d.guard_trail
+
+
+def test_date_routes_by_explicit_date_to_report():
+    # Explicit date uniquely matches the report charge → routes to flow #2 (non-refundable).
+    charges = [_sub("ch_sub", 5490, "2026-07-24"),
+               _report(cid="ch_rep", amount=1990, dt="2026-07-17"),
+               _first(cid="ch_first", amount=199, dt="2026-07-15")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-25T10:00:00Z",
+                    ticket_text="refund the charge from 17.07 please"), CFG)
+    assert d.reason_code == re_.RC_REPORT_NOT_REFUNDABLE and d.refund_flow == "flow2_report"
+    assert "date_routed" in d.guard_trail
+
+
+def test_date_matches_two_types_stays_ambiguous():
+    # Same-day date matches BOTH a report and a first_sale on that date → can't
+    # tell which flow → human decides (no date_routed).
+    charges = [_report(cid="ch_rep", amount=1990, dt="2026-07-17"),
+               _first(cid="ch_first", amount=199, dt="2026-07-17")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-17T10:00:00Z",
+                    ticket_text="refund the payment from today"), CFG)
+    assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "date_routed" not in d.guard_trail
+
+
+def test_no_date_multiple_types_stays_ambiguous():
+    charges = [_sub("ch_sub", 5490, "2026-07-24"), _report()]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund my money"), CFG)
+    assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "date_routed" not in d.guard_trail
