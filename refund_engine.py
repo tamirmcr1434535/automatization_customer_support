@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-charges-v2"
+ENGINE_VERSION = "wb-charges-v3"   # v3: date disambiguation for same-amount charges
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -157,6 +157,47 @@ def _is_refundable(charge: dict) -> bool:
     return str(charge.get("status", "")).lower() == "success"
 
 
+# Date like "2026年7月21日", "2026/7/21", "2026-07-21", "7/21", "7月21日", "21.07.2026".
+_DATE_RE = re.compile(
+    r"(?:(\d{4})[年/\-.])?(\d{1,2})[月/\-.](\d{1,2})日?"
+)
+
+
+def parse_stated_dates(text: str):
+    """Extract candidate dates the customer states → list of (year|None, month, day).
+    Handles JP M/D order and EU D/M order by emitting both valid interpretations,
+    so matching against the real charge date resolves the order. Full-width safe."""
+    if not text:
+        return []
+    text = unicodedata.normalize("NFKC", text)
+    out = []
+    for m in _DATE_RE.finditer(text):
+        y = int(m.group(1)) if m.group(1) else None
+        a, b = int(m.group(2)), int(m.group(3))
+        if 1 <= a <= 12 and 1 <= b <= 31:      # (month=a, day=b) — JP / ISO order
+            out.append((y, a, b))
+        if 1 <= b <= 12 and 1 <= a <= 31 and a != b:  # (month=b, day=a) — EU order
+            out.append((y, b, a))
+    return out
+
+
+def _charge_ymd(charge: dict):
+    """(year, month, day) from a charge's ISO date, or None."""
+    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(charge.get("date") or ""))
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+
+
+def _charge_matches_date(charge: dict, dates) -> bool:
+    ymd = _charge_ymd(charge)
+    if not ymd:
+        return False
+    cy, cm, cd = ymd
+    for (y, mo, d) in dates:
+        if mo == cm and d == cd and (y is None or y == cy):
+            return True
+    return False
+
+
 def _decision(would: bool, code: str, msg: str, trail: list, **kw) -> RefundDecision:
     return RefundDecision(
         would_be_refunded=would, reason_code=code, human_message=msg,
@@ -251,13 +292,27 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                              "Stated amount matches a charge that is already refunded / not refundable.",
                              trail, **common)
 
-        if len(matched_refundable) > 1:
-            return _decision(False, RC_CHARGE_AMBIGUOUS,
-                             f"{len(matched_refundable)} refundable charges match the amount — human decides.",
-                             trail, **common)
+        # Resolve to a single refundable candidate.
+        if len(matched_refundable) == 1:
+            c = matched_refundable[0]
+        else:
+            # Several refundable charges share the amount → try to disambiguate by a
+            # DATE the customer stated (e.g. "7/21付けで5490円"). A date+amount match is
+            # MORE specific, so this only tightens the decision, never loosens it.
+            dates = parse_stated_dates(ctx.ticket_text)
+            date_hits = [ch for ch in matched_refundable if _charge_matches_date(ch, dates)]
+            if len(date_hits) == 1:
+                c = date_hits[0]
+                trail.append("date_disambiguated")
+            else:
+                return _decision(
+                    False, RC_CHARGE_AMBIGUOUS,
+                    f"{len(matched_refundable)} refundable charges match the amount"
+                    + ("; stated date not unique among them" if dates else "; no date to disambiguate")
+                    + " — human decides.",
+                    trail, **common)
 
-        # 7. Exactly one refundable charge matches one stated amount → candidate.
-        c = matched_refundable[0]
+        # 7. Single refundable candidate (direct or date-disambiguated).
         amt = _charge_amount(c)
         cur = c.get("currency")
         trail.append("would_be")
