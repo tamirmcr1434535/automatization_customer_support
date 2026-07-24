@@ -98,6 +98,16 @@ def test_japan_window_8_days():
     assert outside.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW
 
 
+def test_currency_proxy_sets_window():
+    # JPY charge + EN language + no country → currency proxy → 8-day window.
+    within = decide(_ctx(language="EN", country="",
+                         nexus_data=_data([_sub("ch", 5490, "2026-07-15")])), CFG)  # 5d ≤ 8
+    outside = decide(_ctx(language="EN", country="",
+                          nexus_data=_data([_sub("ch", 5490, "2026-07-08")])), CFG)  # 12d > 8
+    assert within.would_be_refunded is True
+    assert outside.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW
+
+
 def test_country_overrides_language():
     # Korea window 7; sub 10d old → outside even though language default would be 14.
     d = decide(_ctx(country="Korea", language="EN",
@@ -125,11 +135,13 @@ def test_guard_exception_fails_closed():
 
 # ── Pure helper unit tests ────────────────────────────────────────────────── #
 
-def test_window_for():
-    assert re_.window_for("JP", "EN") == (8, "country")
-    assert re_.window_for("Turkey", "EN") == (14, "country")
-    assert re_.window_for("", "JP") == (8, "language")
-    assert re_.window_for("", "EN") == (14, "default")
+def test_window_for_priority():
+    # country → currency → language → default
+    assert re_.window_for("JP", "USD", "EN") == (8, "country")     # country wins
+    assert re_.window_for("", "JPY", "EN") == (8, "currency")      # currency proxy
+    assert re_.window_for("", "BRL", "EN") == (10, "currency")     # LATAM currency
+    assert re_.window_for("", "USD", "JP") == (8, "language")      # USD not mapped → language
+    assert re_.window_for("", "USD", "EN") == (14, "default")      # all fall through
 
 
 def test_number_parsing_locales():

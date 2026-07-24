@@ -68,8 +68,16 @@ _COUNTRY_WINDOW = {
     "UK": 14, "UNITED KINGDOM": 14, "GB": 14, "AUSTRALIA": 14, "AU": 14,
     "NEW ZEALAND": 14, "NZ": 14,
 }
-# Language proxy for country when the billing country is unknown at would-be time
-# (only reliably-mappable short-window markets; everything else → default 14).
+# Charge-currency proxy for country when billing country is unknown (these brands
+# charge in local currency, so currency ≈ country). Already present in Nexus charges,
+# so this needs no extra call. Only short-window currencies matter; else → default 14.
+_CURRENCY_WINDOW = {
+    "JPY": 8,
+    "KRW": 7, "VND": 7, "IDR": 7, "TWD": 7, "HKD": 7, "SAR": 7,
+    "TRY": 14,
+    "BRL": 10, "MXN": 10, "ARS": 10, "CLP": 10, "COP": 10, "PEN": 10, "UYU": 10, "GTQ": 10,
+}
+# Language proxy (last resort before default): reliably-mappable short-window markets.
 _LANG_WINDOW = {"JP": 8, "KR": 7, "VI": 7, "ID": 7}
 
 
@@ -200,11 +208,15 @@ def _parse_iso_date(s) -> Optional[date]:
         return None
 
 
-def window_for(country: str, language: str) -> tuple[int, str]:
-    """Refund window in days + its source ('country' | 'language' | 'default')."""
+def window_for(country: str, currency: str, language: str) -> tuple[int, str]:
+    """Refund window (days) + source. Priority: explicit billing country → charge
+    currency proxy → language proxy → default 14."""
     c = (country or "").strip().upper()
     if c in _COUNTRY_WINDOW:
         return _COUNTRY_WINDOW[c], "country"
+    cur = (currency or "").strip().upper()
+    if cur in _CURRENCY_WINDOW:
+        return _CURRENCY_WINDOW[cur], "currency"
     lang = (language or "").strip().upper()
     if lang in _LANG_WINDOW:
         return _LANG_WINDOW[lang], "language"
@@ -298,10 +310,10 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                              candidate_charges=_charges_summary(subs), **common)
 
         # 6. Is the last payment within the country's refund window?
-        window, wsrc = window_for(ctx.country, ctx.language)
+        amt, cur = _charge_amount(target), target.get("currency")
+        window, wsrc = window_for(ctx.country, cur, ctx.language)
         days = (adate - cdate).days
         trail.append(f"window[{wsrc}={window}d,age={days}d]")
-        amt, cur = _charge_amount(target), target.get("currency")
         base = dict(
             computed_amount=(str(amt) if amt is not None else None),
             currency=(str(cur) if cur else None),
