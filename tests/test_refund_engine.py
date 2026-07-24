@@ -128,6 +128,43 @@ def test_multiple_refundable_charges_same_amount_ambiguous():
     assert d.would_be_refunded is False and d.reason_code == re_.RC_CHARGE_AMBIGUOUS
 
 
+def _two_same_amount():
+    return [
+        {"charge_id": "ch_JUL", "amount": 5490, "currency": "JPY", "type": "subscription",
+         "status": "success", "refundable": True, "date": "2026-07-21T09:00:00Z"},
+        {"charge_id": "ch_AUG", "amount": 5490, "currency": "JPY", "type": "subscription",
+         "status": "success", "refundable": True, "date": "2026-08-21T09:00:00Z"},
+    ]
+
+
+def test_date_disambiguates_same_amount_charges():
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": _two_same_amount()},
+                    ticket_text="7/21付けで5490円請求、返金してください"), CFG)
+    assert d.would_be_refunded is True
+    assert d.candidate_charge_id == "ch_JUL"       # July charge picked by date
+    assert "date_disambiguated" in d.guard_trail
+
+
+def test_same_amount_no_date_stays_ambiguous():
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": _two_same_amount()},
+                    ticket_text="5490円を返金してください"), CFG)
+    assert d.would_be_refunded is False and d.reason_code == re_.RC_CHARGE_AMBIGUOUS
+
+
+def test_same_amount_wrong_date_stays_ambiguous():
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": _two_same_amount()},
+                    ticket_text="9/15付けで5490円"), CFG)  # no charge on 9/15
+    assert d.would_be_refunded is False and d.reason_code == re_.RC_CHARGE_AMBIGUOUS
+
+
+def test_parse_stated_dates():
+    assert (None, 7, 21) in re_.parse_stated_dates("7/21付けで5490円")
+    assert (None, 7, 21) in re_.parse_stated_dates("7月21日に請求")
+    assert (2026, 7, 21) in re_.parse_stated_dates("2026年7月21日")
+    assert (None, 7, 21) in re_.parse_stated_dates("７／２１")          # full-width
+    assert (None, 7, 21) in re_.parse_stated_dates("charged on 21.07.2026")  # EU D/M order (month+day)
+
+
 def test_guard_exception_fails_closed():
     with patch.object(re_, "_is_refundable", side_effect=RuntimeError("boom")):
         d = decide(_ctx(), CFG)
