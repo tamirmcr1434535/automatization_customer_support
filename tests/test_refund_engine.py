@@ -206,6 +206,24 @@ def test_parse_stated_dates():
     assert (None, 7, 21) in re_.parse_stated_dates("charged on 21.07.2026")  # EU D/M order (month+day)
 
 
+def test_duplicate_charge_id_deduped_not_ambiguous():
+    # Nexus returns the SAME charge twice → must NOT be treated as ambiguous.
+    dup = {"charge_id": "ch_DUP", "amount": 5490, "currency": "JPY", "type": "subscription",
+           "status": "success", "refundable": True, "date": "2026-07-21T09:00:00Z"}
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": [dup, dict(dup)]},
+                    ticket_text="5490円を返金してください"), CFG)
+    assert d.would_be_refunded is True and d.candidate_charge_id == "ch_DUP"
+
+
+def test_ambiguous_logs_candidate_charges():
+    # Two DIFFERENT 5490 charges, no date → ambiguous, and the candidates are logged.
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": _two_same_amount()},
+                    ticket_text="5490円を返金してください"), CFG)
+    assert d.reason_code == re_.RC_CHARGE_AMBIGUOUS
+    assert d.candidate_charges and "ch_JUL" in d.candidate_charges and "ch_AUG" in d.candidate_charges
+    assert "2026-07-21" in d.candidate_charges  # dates included for review
+
+
 def test_guard_exception_fails_closed():
     with patch.object(re_, "_is_refundable", side_effect=RuntimeError("boom")):
         d = decide(_ctx(), CFG)

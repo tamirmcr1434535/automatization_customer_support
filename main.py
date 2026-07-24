@@ -186,6 +186,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result, tick
     result["refund_stated_amounts"]        = decision.customer_stated_amounts
     result["refund_charge_id"]             = decision.candidate_charge_id
     result["refund_charge_type"]           = decision.charge_type
+    result["refund_candidate_charges"]     = decision.candidate_charges
     result["refund_source"]                = decision.source
     result["refund_engine_version"]        = decision.engine_version
     result["refund_guard_trail"]           = json.dumps(decision.guard_trail)
