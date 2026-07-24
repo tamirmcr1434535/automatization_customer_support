@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-charges-v4"   # v4: multi-amount resolve (repetition + refund-proximity)
+ENGINE_VERSION = "wb-charges-v5"   # v5: dedup charges by id + log candidate charges
 
 # Multilingual refund keywords — used for proximity resolution of multiple amounts.
 _REFUND_KW = re.compile(
@@ -100,6 +100,7 @@ class RefundDecision:
     customer_stated_amounts: Optional[str] = None  # ALL stated amounts, comma-joined (audit)
     candidate_charge_id: Optional[str] = None
     charge_type: Optional[str] = None           # first_sale / cross_sale / subscription
+    candidate_charges: Optional[str] = None     # on ambiguity: "id:amount:date;…" for review
     source: Optional[str] = None                # Nexus `source` (brand/site)
     engine_version: str = ENGINE_VERSION
 
@@ -187,6 +188,30 @@ def _charge_amount(charge: dict) -> Optional[Decimal]:
     return _to_decimal(charge.get("amount"))
 
 
+def _dedup_charges(charges: list) -> list:
+    """Drop duplicate charge objects sharing the same charge_id (Nexus sometimes
+    returns the same charge twice → would cause a FALSE CHARGE_AMBIGUOUS). Charges
+    without a charge_id are kept as-is."""
+    out, seen = [], set()
+    for ch in charges:
+        cid = ch.get("charge_id")
+        if cid and cid in seen:
+            continue
+        if cid:
+            seen.add(cid)
+        out.append(ch)
+    return out
+
+
+def _charges_summary(charge_list: list) -> str:
+    """Compact 'charge_id:amount:date;…' for logging on ambiguous decisions."""
+    parts = []
+    for ch in charge_list:
+        d = str(ch.get("date") or "")[:10]
+        parts.append(f"{ch.get('charge_id')}:{ch.get('amount')}:{d}")
+    return ";".join(parts)
+
+
 def _is_refundable(charge: dict) -> bool:
     # Trust the explicit flag; fall back to status if the flag is absent.
     if "refundable" in charge:
@@ -251,6 +276,7 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         nexus = ctx.nexus_data if isinstance(ctx.nexus_data, dict) else {}
         source = nexus.get("source") or None
         charges = nexus.get("charges") if isinstance(nexus.get("charges"), list) else []
+        charges = _dedup_charges(charges)  # drop duplicate charge_ids (false-ambiguity guard)
         stated = parse_stated_amounts(ctx.ticket_text)
         common = dict(
             source=source,
@@ -343,17 +369,19 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                         f"{len(matched_refundable)} refundable charges match the amount"
                         + ("; stated date not unique" if dates else "; no date to disambiguate")
                         + " — human decides.",
-                        trail, **common)
+                        trail, candidate_charges=_charges_summary(matched_refundable), **common)
         else:
             # Multiple stated amounts. Resolve ONLY if repetition AND refund-proximity
             # agree on the same amount — otherwise hand to a human (conservative).
             detailed = _amounts_detailed(ctx.ticket_text)
+            _multi_summary = _charges_summary(
+                [ch for ch in refundable if _charge_amount(ch) in set(stated)])
             cand = [a for a in stated if len(_refundable_for(a)) == 1]  # each maps to 1 refundable charge
             if not cand:
                 return _decision(False, RC_MULTIPLE_AMOUNTS_STATED,
                                  f"Customer cited {len(stated)} amounts ({_amounts_csv()}); none maps to a "
                                  "single refundable charge — human decides.",
-                                 trail, **common)
+                                 trail, candidate_charges=_multi_summary, **common)
             if len(cand) == 1:
                 c = _refundable_for(cand[0])[0]
                 trail.append("multi_single_candidate")
@@ -370,7 +398,7 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                     return _decision(False, RC_MULTIPLE_AMOUNTS_STATED,
                                      f"Customer cited {len(stated)} amounts ({_amounts_csv()}); repetition "
                                      "and refund-proximity disagree — human decides.",
-                                     trail, **common)
+                                     trail, candidate_charges=_multi_summary, **common)
 
         # 7. Single refundable candidate (direct / date / multi-resolved).
         amt = _charge_amount(c)

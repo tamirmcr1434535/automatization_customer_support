@@ -71,6 +71,7 @@ SCHEMA = [
     bigquery.SchemaField("refund_source",         "STRING"),   # Nexus `source` (brand/site)
     bigquery.SchemaField("refund_charge_id",      "STRING"),   # candidate charge matched
     bigquery.SchemaField("refund_charge_type",    "STRING"),   # first_sale / cross_sale / subscription
+    bigquery.SchemaField("refund_candidate_charges", "STRING"),# on ambiguity: id:amount:date;… for review
     bigquery.SchemaField("refund_engine_version", "STRING"),
     bigquery.SchemaField("refund_guard_trail",    "STRING"),   # JSON list of guard levels
 
@@ -175,6 +176,7 @@ def log_result(result: dict):
             "refund_source":         result.get("refund_source") or "",
             "refund_charge_id":      result.get("refund_charge_id") or "",
             "refund_charge_type":    result.get("refund_charge_type") or "",
+            "refund_candidate_charges": result.get("refund_candidate_charges") or "",
             "refund_engine_version": result.get("refund_engine_version") or "",
             "refund_guard_trail":    result.get("refund_guard_trail") or "",
 
