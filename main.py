@@ -1420,7 +1420,7 @@ def _process(ticket_id: str) -> dict:
             _refund_would_be_eval(
                 ticket_id, email, "REFUND_REQUEST",
                 {"confidence": 0.95, "language": "EN"}, result,
-                ticket_text=subject,
+                ticket_text=f"{subject}\n{body}",  # body holds the amount (subject rarely does)
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")

@@ -1243,3 +1243,19 @@ class TestRefundWouldBe:
         assert result["status"] == "skipped_refund_request"
         assert "refund_decision" in result
         assert result["refund_decision"] in ("YES", "NO")
+
+    # BUG FIX: subject-keyword exit must pass the BODY to the eval, else amounts
+    # stated only in the body are lost (ticket #166748: subject "Refund Request",
+    # body "1,990 JPY" → was wrongly AMOUNT_NOT_STATED).
+    @patch.object(main, "log_result")
+    @patch.object(main, "zendesk")
+    def test_subject_refund_exit_passes_body_amount(self, mock_zd, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Cancellation Request and Refund Request",
+            body="I request a full refund for the upcoming charge of 1,990 JPY."))
+        captured = {}
+        def fake_eval(tid, email, intent, cls, result, ticket_text=""):
+            captured["text"] = ticket_text
+        with patch.object(main, "_refund_would_be_eval", side_effect=fake_eval):
+            main._process("an192_6")
+        assert "1,990 JPY" in captured.get("text", "")  # body reached the eval
