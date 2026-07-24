@@ -1,22 +1,25 @@
 """
-Refund decision engine — PURE, would-be-only (AN-192 / IQTEST-1431)
-====================================================================
-Given the Nexus `charges[]` list + the customer's ticket text, computes a
-*would-be* refund decision: **would_be_refunded YES / NO + reason_code**, and
-which charge would be the candidate. It does NOT move money and has NO I/O — it
-is a pure function over plain data, so it is trivially testable and can never
-call a payment API.
+Refund decision engine — PURE, would-be-only (AN-192, Flow #1: Subscription fee)
+================================================================================
+Implements the Figma "IQ Booster Subscription — Refund Flow" decision tree for the
+**subscription-fee** refund (flow #1), as a *would-be* signal only. It computes
+`would_be_refunded YES/NO + reason_code`; it has NO I/O and NEVER moves money.
 
-Validation logic (matches the two-API design agreed 2026-07-21):
-  - Read the amount(s) the customer states in the ticket.
-  - Match them against the real `charges[]` from Nexus (amount + currency).
-  - Exactly one *refundable* charge matches one stated amount → candidate (YES).
-  - No match / already-refunded / several matches / several stated amounts →
-    NO with a specific reason → human decides.
+Flow #1 rule (Figma + Anna's business rules):
+  refund request → find account & charges (Nexus) → found? →
+    dispute (Stripe/PayPal)? → yes: do NOT refund (wait for dispute) →
+    no dispute → is the **LAST subscription payment** within the **country refund
+    window**? → yes: refund that last payment (earlier months NOT refunded) → no: decline.
 
-The result is a *draft signal for learning*, NOT permission to pay. Execution
-(refund by charge_id) is a separate, gated API. Nexus cannot see disputes, so a
-YES here still requires the refund-API dispute guard before any real refund.
+Key points:
+  - Target = the **latest refundable `subscription` renewal** charge (rule-selected,
+    NOT chosen by the amount the customer typed). Earlier renewals are never refunded.
+  - One-time charges (`first_sale`=IQ Test fee, `cross_sale`=IQ Test Report) are out of
+    scope for flow #1 (handled by other flows / a human).
+  - Window is measured from the charge date to the TICKET date (`as_of_date`).
+  - Customer-stated amount is INFORMATIONAL (logged, never used to pick/gate).
+  - Disputes are invisible to Nexus → this is a would-be draft, NOT a payout permit; a
+    real refund still requires the dispute guard (separate, gated iteration).
 
 Fail-closed: any unexpected error → would_be_refunded = False (NO).
 """
@@ -25,49 +28,57 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from collections import Counter
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-charges-v5"   # v5: dedup charges by id + log candidate charges
-
-# Multilingual refund keywords — used for proximity resolution of multiple amounts.
-_REFUND_KW = re.compile(
-    r"refund|money\s*back|reimburs|返金|払い戻し|返して|환불|erstatt|rückerstatt|"
-    r"rembours|reembols|reembolso|devoluci|devolver|estorno|rimbors|terugbetal|"
-    r"hoàn\s*tiền|hoàn\s*lại|возврат|верн|поверн|iade|pengembalian|kembalikan",
-    re.IGNORECASE,
-)
+ENGINE_VERSION = "wb-flow1-v6"   # v6: Figma flow #1 (latest subscription + country window)
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
-# ── Reason codes (level at which the decision stopped) ───────────────────── #
-RC_WOULD_BE_REFUNDED = "WOULD_BE_REFUNDED"    # YES — one clean refundable match
-RC_UNABLE_TO_EVAL    = "UNABLE_TO_EVAL"       # Nexus not available
-RC_OUT_OF_SCOPE      = "OUT_OF_SCOPE"         # not a refund intent
-RC_LOW_CONFIDENCE    = "LOW_CONFIDENCE"       # classifier below threshold
-RC_NOT_FOUND_IN_NEXUS = "NOT_FOUND_IN_NEXUS"  # no charges for this customer
-RC_NOTHING_REFUNDABLE = "NOTHING_REFUNDABLE"  # charges exist but none refundable
-RC_AMOUNT_NOT_STATED = "AMOUNT_NOT_STATED"    # customer gave no amount → can't validate
-RC_AMOUNT_MISMATCH   = "AMOUNT_MISMATCH"      # stated amount matches no charge (FX/fees?) → human
-RC_ALREADY_REFUNDED  = "ALREADY_REFUNDED"     # stated amount matches an already-refunded charge
-RC_CHARGE_AMBIGUOUS  = "CHARGE_AMBIGUOUS"     # several refundable charges match one amount
-RC_MULTIPLE_AMOUNTS_STATED = "MULTIPLE_AMOUNTS_STATED"  # customer cited several amounts
-RC_EVAL_ERROR        = "EVAL_ERROR"           # fail-closed on unexpected error
+# ── Reason codes ─────────────────────────────────────────────────────────── #
+RC_WOULD_BE_REFUNDED  = "WOULD_BE_REFUNDED"    # YES — latest sub renewal within window
+RC_UNABLE_TO_EVAL     = "UNABLE_TO_EVAL"       # Nexus not available
+RC_OUT_OF_SCOPE       = "OUT_OF_SCOPE"         # not a refund intent
+RC_LOW_CONFIDENCE     = "LOW_CONFIDENCE"       # classifier below threshold
+RC_NOT_FOUND_IN_NEXUS = "NOT_FOUND_IN_NEXUS"   # no charges for this customer
+RC_NOTHING_REFUNDABLE = "NOTHING_REFUNDABLE"   # charges exist but none refundable
+RC_ONE_TIME_OUT_OF_SCOPE = "ONE_TIME_OUT_OF_SCOPE"  # only one-time charges (flow #1 = subscription)
+RC_OUTSIDE_REFUND_WINDOW = "OUTSIDE_REFUND_WINDOW"  # last payment older than the country window
+RC_WINDOW_UNKNOWN     = "WINDOW_UNKNOWN"       # missing charge/ticket date → can't compute window
+RC_EVAL_ERROR         = "EVAL_ERROR"           # fail-closed on unexpected error
 
-# Currency indicators — used to extract amounts the customer *states* (anchored
-# to a currency so we don't pick up dates like "7/21" or "24 hours").
-_CUR = (
-    r"(?:¥|￥|\$|€|£|₩|₺|₹|₴|₪|₽|zł|Kč|円|圆|元|원|"
-    r"USD|JPY|EUR|GBP|KRW|IDR|THB|VND|PHP|MXN|BRL|TRY|TL|INR|PLN|UAH|ILS|CHF|RUB|"
-    r"dollars?|yen|won|lira|евро|долл?|грн)"
-)
-_NUM = r"\d[\d.,]*\d|\d"   # must start and end with a digit (no trailing separator)
-_STATED_RE = re.compile(
-    rf"(?:{_CUR}\s*({_NUM}))|(?:({_NUM})\s*{_CUR})",
-    re.IGNORECASE,
-)
+# ── Country → refund window (days). Only entries differing from the 14-day
+# default really matter; everything else falls through to DEFAULT_WINDOW. ──── #
+DEFAULT_WINDOW = 14
+_COUNTRY_WINDOW = {
+    "JAPAN": 8, "JP": 8,
+    "KOREA": 7, "SOUTH KOREA": 7, "KR": 7,
+    "VIETNAM": 7, "VN": 7,
+    "HONG KONG": 7, "HK": 7,
+    "INDONESIA": 7, "ID": 7,
+    "TAIWAN": 7, "TW": 7,
+    "SAUDI ARABIA": 7, "SA": 7,
+    "TURKEY": 14, "TR": 14,
+    "BRAZIL": 10, "BR": 10, "MEXICO": 10, "MX": 10, "ARGENTINA": 10, "AR": 10,
+    "CHILE": 10, "CL": 10, "COLOMBIA": 10, "CO": 10, "PERU": 10, "PE": 10,
+    "URUGUAY": 10, "UY": 10, "ECUADOR": 10, "EC": 10, "GUATEMALA": 10, "GT": 10,
+    "USA": 14, "US": 14, "UNITED STATES": 14, "CANADA": 14, "CA": 14,
+    "UK": 14, "UNITED KINGDOM": 14, "GB": 14, "AUSTRALIA": 14, "AU": 14,
+    "NEW ZEALAND": 14, "NZ": 14,
+}
+# Charge-currency proxy for country when billing country is unknown (these brands
+# charge in local currency, so currency ≈ country). Already present in Nexus charges,
+# so this needs no extra call. Only short-window currencies matter; else → default 14.
+_CURRENCY_WINDOW = {
+    "JPY": 8,
+    "KRW": 7, "VND": 7, "IDR": 7, "TWD": 7, "HKD": 7, "SAR": 7,
+    "TRY": 14,
+    "BRL": 10, "MXN": 10, "ARS": 10, "CLP": 10, "COP": 10, "PEN": 10, "UYU": 10, "GTQ": 10,
+}
+# Language proxy (last resort before default): reliably-mappable short-window markets.
+_LANG_WINDOW = {"JP": 8, "KR": 7, "VI": 7, "ID": 7}
 
 
 @dataclass(frozen=True)
@@ -83,9 +94,11 @@ class RefundContext:
     intent: str
     confidence: float
     language: str = "EN"
+    country: str = ""                    # billing country if known (else language proxy)
+    as_of_date: Optional[str] = None     # ISO date to measure the window from (ticket created)
     nexus_available: bool = False
-    nexus_data: Optional[dict] = None   # includes "charges", "subscription_id", "source"
-    ticket_text: str = ""               # subject + body (+ comments) for amount parsing
+    nexus_data: Optional[dict] = None     # includes "charges", "subscription_id", "source"
+    ticket_text: str = ""                 # subject + body — for informational amount logging
 
 
 @dataclass
@@ -94,104 +107,68 @@ class RefundDecision:
     reason_code: str
     human_message: str
     guard_trail: list = field(default_factory=list)
-    computed_amount: Optional[str] = None       # candidate charge amount (verified)
+    computed_amount: Optional[str] = None       # candidate (latest sub) charge amount
     currency: Optional[str] = None
-    customer_stated_amount: Optional[str] = None  # first stated amount (audit only)
-    customer_stated_amounts: Optional[str] = None  # ALL stated amounts, comma-joined (audit)
+    customer_stated_amount: Optional[str] = None  # informational (audit), never used to pick
+    customer_stated_amounts: Optional[str] = None
     candidate_charge_id: Optional[str] = None
-    charge_type: Optional[str] = None           # first_sale / cross_sale / subscription
-    candidate_charges: Optional[str] = None     # on ambiguity: "id:amount:date;…" for review
-    source: Optional[str] = None                # Nexus `source` (brand/site)
+    charge_type: Optional[str] = None
+    candidate_charges: Optional[str] = None     # relevant charges "id:amount:date;…"
+    source: Optional[str] = None
     engine_version: str = ENGINE_VERSION
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────── #
 
 def _to_decimal(raw) -> Optional[Decimal]:
-    """Locale-aware numeric parse. Handles both US ("1,234.56", "9.99") and
-    European ("1.234,56", "9,99") notation so a comma used as a DECIMAL separator
-    is not mistaken for a thousands separator (bug: "9,99" € must be 9.99, not 999)."""
+    """Locale-aware numeric parse (US "1,234.56"/"9.99" and EU "1.234,56"/"9,99"),
+    NFKC-folding full-width digits/punctuation first."""
     if raw is None:
         return None
-    # NFKC folds full-width (zenkaku) digits/punctuation to ASCII ("１，９９０"→"1,990"),
-    # so a full-width comma no longer truncates the number (was "１，９９０円" → 990).
-    s = unicodedata.normalize("NFKC", str(raw)).strip().replace(" ", "").replace(" ", "")
+    s = unicodedata.normalize("NFKC", str(raw)).strip().replace(" ", "").replace(" ", "")
     if not s:
         return None
     has_dot, has_comma = "." in s, "," in s
     if has_dot and has_comma:
-        # The separator that appears LAST is the decimal one.
         if s.rfind(",") > s.rfind("."):
-            s = s.replace(".", "").replace(",", ".")   # EU: 1.234,56 → 1234.56
-        else:
-            s = s.replace(",", "")                       # US: 1,234.56 → 1234.56
-    elif has_comma:
-        parts = s.split(",")
-        # single comma + exactly 2 trailing digits → decimal (9,99 → 9.99);
-        # otherwise treat comma(s) as thousands separators (1,990 → 1990).
-        if len(parts) == 2 and len(parts[1]) == 2:
-            s = s.replace(",", ".")
+            s = s.replace(".", "").replace(",", ".")
         else:
             s = s.replace(",", "")
+    elif has_comma:
+        parts = s.split(",")
+        s = s.replace(",", ".") if (len(parts) == 2 and len(parts[1]) == 2) else s.replace(",", "")
     try:
         return Decimal(s)
     except (InvalidOperation, ValueError):
         return None
 
 
-def _amounts_detailed(text: str):
-    """All stated amounts WITH their positions (repeats kept), on NFKC-normalised
-    text → list of (Decimal, position). Position is used for refund-proximity."""
-    if not text:
-        return []
-    text = unicodedata.normalize("NFKC", text)  # full-width → ASCII before matching
-    out = []
-    for m in _STATED_RE.finditer(text):
-        tok = m.group(1) or m.group(2)
-        d = _to_decimal(tok)
-        if d is not None and d > 0:
-            out.append((d, m.start()))
-    return out
+_CUR = (
+    r"(?:¥|￥|\$|€|£|₩|₺|₹|₴|₪|₽|zł|Kč|円|圆|元|원|"
+    r"USD|JPY|EUR|GBP|KRW|IDR|THB|VND|PHP|MXN|BRL|TRY|TL|INR|PLN|UAH|ILS|CHF|RUB|"
+    r"dollars?|yen|won|lira|евро|долл?|грн)"
+)
+_NUM = r"\d[\d.,]*\d|\d"
+_STATED_RE = re.compile(rf"(?:{_CUR}\s*({_NUM}))|(?:({_NUM})\s*{_CUR})", re.IGNORECASE)
 
 
 def parse_stated_amounts(text: str) -> list[Decimal]:
-    """Distinct amounts the customer states, in order seen (currency-anchored)."""
+    """Distinct amounts the customer states (currency-anchored). INFORMATIONAL only."""
+    if not text:
+        return []
+    text = unicodedata.normalize("NFKC", text)
     out, seen = [], set()
-    for d, _ in _amounts_detailed(text):
-        if d not in seen:
+    for m in _STATED_RE.finditer(text):
+        d = _to_decimal(m.group(1) or m.group(2))
+        if d is not None and d > 0 and d not in seen:
             seen.add(d)
             out.append(d)
     return out
 
 
-def _amount_nearest_refund(text: str, candidates: set, detailed):
-    """Among `candidates`, the amount whose occurrence is closest to a refund
-    keyword. Returns that amount, or None if there's no refund keyword or a tie."""
-    norm = unicodedata.normalize("NFKC", text or "")
-    kw_pos = [m.start() for m in _REFUND_KW.finditer(norm)]
-    if not kw_pos:
-        return None
-    best_amt, best_dist = None, None
-    ties = False
-    for amt, pos in detailed:
-        if amt not in candidates:
-            continue
-        dist = min(abs(pos - k) for k in kw_pos)
-        if best_dist is None or dist < best_dist:
-            best_amt, best_dist, ties = amt, dist, False
-        elif dist == best_dist and amt != best_amt:
-            ties = True
-    return None if ties else best_amt
-
-
-def _charge_amount(charge: dict) -> Optional[Decimal]:
-    return _to_decimal(charge.get("amount"))
-
-
 def _dedup_charges(charges: list) -> list:
-    """Drop duplicate charge objects sharing the same charge_id (Nexus sometimes
-    returns the same charge twice → would cause a FALSE CHARGE_AMBIGUOUS). Charges
-    without a charge_id are kept as-is."""
+    """Drop duplicate charge objects sharing the same charge_id (Nexus can return the
+    same charge twice)."""
     out, seen = [], set()
     for ch in charges:
         cid = ch.get("charge_id")
@@ -203,61 +180,55 @@ def _dedup_charges(charges: list) -> list:
     return out
 
 
-def _charges_summary(charge_list: list) -> str:
-    """Compact 'charge_id:amount:date;…' for logging on ambiguous decisions."""
-    parts = []
-    for ch in charge_list:
-        d = str(ch.get("date") or "")[:10]
-        parts.append(f"{ch.get('charge_id')}:{ch.get('amount')}:{d}")
-    return ";".join(parts)
+def _charge_amount(charge: dict) -> Optional[Decimal]:
+    return _to_decimal(charge.get("amount"))
 
 
 def _is_refundable(charge: dict) -> bool:
-    # Trust the explicit flag; fall back to status if the flag is absent.
     if "refundable" in charge:
         return charge.get("refundable") is True
     return str(charge.get("status", "")).lower() == "success"
 
 
-# Date like "2026年7月21日", "2026/7/21", "2026-07-21", "7/21", "7月21日", "21.07.2026".
-_DATE_RE = re.compile(
-    r"(?:(\d{4})[年/\-.])?(\d{1,2})[月/\-.](\d{1,2})日?"
-)
+def _is_subscription(charge: dict) -> bool:
+    return str(charge.get("type", "")).lower() == "subscription"
 
 
-def parse_stated_dates(text: str):
-    """Extract candidate dates the customer states → list of (year|None, month, day).
-    Handles JP M/D order and EU D/M order by emitting both valid interpretations,
-    so matching against the real charge date resolves the order. Full-width safe."""
-    if not text:
-        return []
-    text = unicodedata.normalize("NFKC", text)
-    out = []
-    for m in _DATE_RE.finditer(text):
-        y = int(m.group(1)) if m.group(1) else None
-        a, b = int(m.group(2)), int(m.group(3))
-        if 1 <= a <= 12 and 1 <= b <= 31:      # (month=a, day=b) — JP / ISO order
-            out.append((y, a, b))
-        if 1 <= b <= 12 and 1 <= a <= 31 and a != b:  # (month=b, day=a) — EU order
-            out.append((y, b, a))
-    return out
+def _charge_date(charge: dict) -> Optional[date]:
+    return _parse_iso_date(charge.get("date"))
 
 
-def _charge_ymd(charge: dict):
-    """(year, month, day) from a charge's ISO date, or None."""
-    m = re.search(r"(\d{4})[-/](\d{1,2})[-/](\d{1,2})", str(charge.get("date") or ""))
-    return (int(m.group(1)), int(m.group(2)), int(m.group(3))) if m else None
+def _parse_iso_date(s) -> Optional[date]:
+    m = re.search(r"(\d{4})-(\d{1,2})-(\d{1,2})", str(s or ""))
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
 
 
-def _charge_matches_date(charge: dict, dates) -> bool:
-    ymd = _charge_ymd(charge)
-    if not ymd:
-        return False
-    cy, cm, cd = ymd
-    for (y, mo, d) in dates:
-        if mo == cm and d == cd and (y is None or y == cy):
-            return True
-    return False
+def window_for(country: str, currency: str, language: str) -> tuple[int, str]:
+    """Refund window (days) + source. Priority: explicit billing country → charge
+    currency proxy → language proxy → default 14."""
+    c = (country or "").strip().upper()
+    if c in _COUNTRY_WINDOW:
+        return _COUNTRY_WINDOW[c], "country"
+    cur = (currency or "").strip().upper()
+    if cur in _CURRENCY_WINDOW:
+        return _CURRENCY_WINDOW[cur], "currency"
+    lang = (language or "").strip().upper()
+    if lang in _LANG_WINDOW:
+        return _LANG_WINDOW[lang], "language"
+    return DEFAULT_WINDOW, "default"
+
+
+def _charges_summary(charge_list: list) -> str:
+    parts = []
+    for ch in charge_list:
+        d = str(ch.get("date") or "")[:10]
+        parts.append(f"{ch.get('charge_id')}:{ch.get('amount')}:{d}")
+    return ";".join(parts)
 
 
 def _decision(would: bool, code: str, msg: str, trail: list, **kw) -> RefundDecision:
@@ -267,19 +238,18 @@ def _decision(would: bool, code: str, msg: str, trail: list, **kw) -> RefundDeci
     )
 
 
-# ── The pipeline ─────────────────────────────────────────────────────────── #
+# ── The pipeline (Figma flow #1) ─────────────────────────────────────────── #
 
 def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
-    """Compute the would-be refund decision. PURE. Never raises (fail-closed)."""
+    """Compute the would-be refund decision for the subscription-fee flow. PURE;
+    never raises (fail-closed to NO)."""
     trail: list = []
     try:
         nexus = ctx.nexus_data if isinstance(ctx.nexus_data, dict) else {}
-        source = nexus.get("source") or None
-        charges = nexus.get("charges") if isinstance(nexus.get("charges"), list) else []
-        charges = _dedup_charges(charges)  # drop duplicate charge_ids (false-ambiguity guard)
+        charges = _dedup_charges(nexus.get("charges") if isinstance(nexus.get("charges"), list) else [])
         stated = parse_stated_amounts(ctx.ticket_text)
         common = dict(
-            source=source,
+            source=nexus.get("source") or None,
             customer_stated_amount=(str(stated[0]) if stated else None),
             customer_stated_amounts=(",".join(str(a) for a in stated) if stated else None),
             engine_version=cfg.engine_version,
@@ -289,15 +259,13 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         trail.append("nexus_available")
         if not ctx.nexus_available:
             return _decision(False, RC_UNABLE_TO_EVAL,
-                             "Nexus lookup unavailable — cannot evaluate refund.",
-                             trail, **common)
+                             "Nexus lookup unavailable — cannot evaluate refund.", trail, **common)
 
-        # 1. Scope.
+        # 1. Scope — refund intent.
         trail.append("scope")
         if ctx.intent not in REFUND_INTENTS:
             return _decision(False, RC_OUT_OF_SCOPE,
-                             f"Intent {ctx.intent} is not a refund request.",
-                             trail, **common)
+                             f"Intent {ctx.intent} is not a refund request.", trail, **common)
 
         # 2. Confidence.
         trail.append("confidence")
@@ -310,111 +278,62 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                              f"Classifier confidence {conf:.2f} < {cfg.min_confidence:.2f}.",
                              trail, **common)
 
-        # 3. Charges present?
-        trail.append("charges_present")
+        # 3. Found in Nexus (charges present)?
+        trail.append("found")
         if not charges:
             return _decision(False, RC_NOT_FOUND_IN_NEXUS,
-                             "No charges found in Nexus for this customer.",
-                             trail, **common)
+                             "No charges found in Nexus for this customer.", trail, **common)
 
-        # 4. Anything refundable?
-        trail.append("refundable_exists")
+        # 4. Refundable subscription charge exists? (flow #1 = subscription only)
+        trail.append("refundable_subscription")
         refundable = [c for c in charges if _is_refundable(c)]
-        if not refundable:
+        subs = [c for c in refundable if _is_subscription(c)]
+        if not subs:
+            if refundable:
+                return _decision(False, RC_ONE_TIME_OUT_OF_SCOPE,
+                                 "Only one-time charges (IQ Test fee / Report) — out of scope for "
+                                 "the subscription refund flow; human handles.",
+                                 trail, candidate_charges=_charges_summary(refundable), **common)
             return _decision(False, RC_NOTHING_REFUNDABLE,
-                             "Charges exist but none are refundable (already refunded / not eligible).",
-                             trail, **common)
+                             "Charges exist but none are refundable (already refunded).",
+                             trail, candidate_charges=_charges_summary(charges), **common)
 
-        # 5. Customer stated an amount?
-        trail.append("amount_stated")
-        if not stated:
-            return _decision(False, RC_AMOUNT_NOT_STATED,
-                             "Customer did not state a verifiable amount — cannot pick a charge.",
-                             trail, **common)
+        # 5. Target = the LATEST refundable subscription renewal (rule-selected).
+        trail.append("latest_subscription")
+        target = max(subs, key=lambda c: (_charge_date(c) or date.min))
+        cdate = _charge_date(target)
+        adate = _parse_iso_date(ctx.as_of_date)
+        if cdate is None or adate is None:
+            return _decision(False, RC_WINDOW_UNKNOWN,
+                             "Cannot determine charge/ticket date to check the refund window.",
+                             trail, candidate_charge_id=target.get("charge_id"),
+                             candidate_charges=_charges_summary(subs), **common)
 
-        # 6. Match stated amount(s) against charges → resolve to a single candidate.
-        trail.append("match")
+        # 6. Is the last payment within the country's refund window?
+        amt, cur = _charge_amount(target), target.get("currency")
+        window, wsrc = window_for(ctx.country, cur, ctx.language)
+        days = (adate - cdate).days
+        trail.append(f"window[{wsrc}={window}d,age={days}d]")
+        base = dict(
+            computed_amount=(str(amt) if amt is not None else None),
+            currency=(str(cur) if cur else None),
+            candidate_charge_id=target.get("charge_id"),
+            charge_type=target.get("type"),
+        )
+        if days > window:
+            return _decision(False, RC_OUTSIDE_REFUND_WINDOW,
+                             f"Last subscription payment is {days}d old > {window}d window "
+                             f"({wsrc}) — previous months are non-refundable.",
+                             trail, candidate_charges=_charges_summary(subs), **base, **common)
 
-        def _refundable_for(a):
-            return [ch for ch in refundable if _charge_amount(ch) == a]
-
-        def _amounts_csv():
-            return ", ".join(str(a) for a in stated)
-
-        c = None
-        if len(stated) == 1:
-            amt1 = stated[0]
-            matched_all = [ch for ch in charges if _charge_amount(ch) == amt1]
-            matched_refundable = _refundable_for(amt1)
-            if not matched_all:
-                return _decision(False, RC_AMOUNT_MISMATCH,
-                                 "Stated amount matches no charge (may be bank/FX fees) — human decides.",
-                                 trail, **common)
-            if not matched_refundable:
-                return _decision(False, RC_ALREADY_REFUNDED,
-                                 "Stated amount matches a charge already refunded / not refundable.",
-                                 trail, **common)
-            if len(matched_refundable) == 1:
-                c = matched_refundable[0]
-            else:
-                # Same-amount charges → disambiguate by a stated DATE ("7/21付けで5490円").
-                dates = parse_stated_dates(ctx.ticket_text)
-                hits = [ch for ch in matched_refundable if _charge_matches_date(ch, dates)]
-                if len(hits) == 1:
-                    c = hits[0]
-                    trail.append("date_disambiguated")
-                else:
-                    return _decision(
-                        False, RC_CHARGE_AMBIGUOUS,
-                        f"{len(matched_refundable)} refundable charges match the amount"
-                        + ("; stated date not unique" if dates else "; no date to disambiguate")
-                        + " — human decides.",
-                        trail, candidate_charges=_charges_summary(matched_refundable), **common)
-        else:
-            # Multiple stated amounts. Resolve ONLY if repetition AND refund-proximity
-            # agree on the same amount — otherwise hand to a human (conservative).
-            detailed = _amounts_detailed(ctx.ticket_text)
-            _multi_summary = _charges_summary(
-                [ch for ch in refundable if _charge_amount(ch) in set(stated)])
-            cand = [a for a in stated if len(_refundable_for(a)) == 1]  # each maps to 1 refundable charge
-            if not cand:
-                return _decision(False, RC_MULTIPLE_AMOUNTS_STATED,
-                                 f"Customer cited {len(stated)} amounts ({_amounts_csv()}); none maps to a "
-                                 "single refundable charge — human decides.",
-                                 trail, candidate_charges=_multi_summary, **common)
-            if len(cand) == 1:
-                c = _refundable_for(cand[0])[0]
-                trail.append("multi_single_candidate")
-            else:
-                freq = Counter(a for a, _ in detailed)
-                mx = max(freq[a] for a in cand)
-                top = [a for a in cand if freq[a] == mx]
-                a_win = top[0] if len(top) == 1 else None                    # A: repetition
-                b_win = _amount_nearest_refund(ctx.ticket_text, set(cand), detailed)  # B: proximity
-                if a_win is not None and a_win == b_win:
-                    c = _refundable_for(a_win)[0]
-                    trail.append("multi_resolved_repetition_proximity")
-                else:
-                    return _decision(False, RC_MULTIPLE_AMOUNTS_STATED,
-                                     f"Customer cited {len(stated)} amounts ({_amounts_csv()}); repetition "
-                                     "and refund-proximity disagree — human decides.",
-                                     trail, candidate_charges=_multi_summary, **common)
-
-        # 7. Single refundable candidate (direct / date / multi-resolved).
-        amt = _charge_amount(c)
-        cur = c.get("currency")
+        # 7. Within window → would-be refund the latest subscription charge.
         trail.append("would_be")
         return _decision(
             True, RC_WOULD_BE_REFUNDED,
-            f"Would be refunded (Nexus-only, disputes NOT checked): "
-            f"{amt}{(' ' + str(cur)) if cur else ''} "
-            f"charge {c.get('charge_id')} ({c.get('type')}).",
-            trail,
-            computed_amount=(str(amt) if amt is not None else None),
-            currency=(str(cur) if cur else None),
-            candidate_charge_id=c.get("charge_id"),
-            charge_type=c.get("type"),
-            **common,
+            f"Would be refunded (Nexus-only, disputes NOT checked): latest subscription "
+            f"{amt}{(' ' + str(cur)) if cur else ''} charge {target.get('charge_id')} "
+            f"({days}d ago, within {window}d {wsrc} window).",
+            trail, **base, **common,
         )
 
     except Exception as e:  # noqa: BLE001 — fail-closed on ANYTHING

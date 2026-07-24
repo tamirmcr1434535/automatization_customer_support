@@ -151,13 +151,15 @@ REFUND_CONFIG = refund_engine.RefundConfig(
 refund_client = RefundClient(provider="nexus", enabled=REFUNDS_ENABLED)
 
 
-def _refund_would_be_eval(ticket_id, email, intent, classification, result, ticket_text=""):
-    """Compute the would-be refund decision (Nexus-only) and record it on
+def _refund_would_be_eval(ticket_id, email, intent, classification, result,
+                          ticket_text="", country="", as_of_date=None):
+    """Compute the would-be refund decision (flow #1, Nexus-only) and record it on
     `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
     Never moves money. Caller wraps this in try/except (strictly additive).
 
-    `ticket_text` = subject + body (+ comments) — used to read the amount the
-    customer states, which the engine matches against the real Nexus charges."""
+    `ticket_text` = subject + body (informational amount logging).
+    `country` = billing country if known (else engine uses language as proxy).
+    `as_of_date` = ISO date the refund window is measured from (ticket created)."""
     nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
     nexus_data = None
     if nexus_available:
@@ -171,6 +173,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result, tick
         intent=intent,
         confidence=classification.get("confidence", 0.0),
         language=classification.get("language", "EN"),
+        country=country or "",
+        as_of_date=as_of_date,
         nexus_available=nexus_available,
         nexus_data=nexus_data,
         ticket_text=ticket_text or "",
@@ -1422,6 +1426,7 @@ def _process(ticket_id: str) -> dict:
                 ticket_id, email, "REFUND_REQUEST",
                 {"confidence": 0.95, "language": "EN"}, result,
                 ticket_text=f"{subject}\n{body}",  # body holds the amount (subject rarely does)
+                as_of_date=ticket.get("created_at"),
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -1762,6 +1767,7 @@ def _process(ticket_id: str) -> dict:
                 ticket_id, email, "REFUND_REQUEST",
                 {"confidence": 0.95, "language": language}, result,
                 ticket_text=f"{subject}\n{body}",
+                as_of_date=ticket.get("created_at"),
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -1895,6 +1901,7 @@ def _process(ticket_id: str) -> dict:
             _refund_would_be_eval(
                 ticket_id, email, intent, classification, result,
                 ticket_text=f"{subject}\n{body}",
+                as_of_date=ticket.get("created_at"),
             )
         except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
