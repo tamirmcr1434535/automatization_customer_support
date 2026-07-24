@@ -1254,7 +1254,7 @@ class TestRefundWouldBe:
             subject="Cancellation Request and Refund Request",
             body="I request a full refund for the upcoming charge of 1,990 JPY."))
         captured = {}
-        def fake_eval(tid, email, intent, cls, result, ticket_text=""):
+        def fake_eval(tid, email, intent, cls, result, ticket_text="", **kw):
             captured["text"] = ticket_text
         with patch.object(main, "_refund_would_be_eval", side_effect=fake_eval):
             main._process("an192_6")
