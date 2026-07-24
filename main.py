@@ -39,6 +39,7 @@ import functions_framework
 
 from classifier import classify_ticket
 import refund_engine
+import refund_ocr
 from refund_client import RefundClient
 from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
@@ -169,6 +170,31 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             log.warning(f"[{ticket_id}] refund eval: Nexus lookup error: {e}")
             nexus_data = None
 
+    # ── OCR fallback: amount only in an attached screenshot ──────────────── #
+    # If the customer stated NO amount in the text but attached an image (a
+    # payment/bank screenshot), read the amount out of the image and feed it to
+    # the engine as another stated-amount source. Fail-closed & non-blocking:
+    # any failure leaves the text-only path unchanged.
+    eff_text = ticket_text or ""
+    try:
+        if (refund_ocr.is_enabled()
+                and not refund_engine.parse_stated_amounts(eff_text)):
+            images = zendesk.get_ticket_image_attachments(ticket_id)
+            if images:
+                ocr = refund_ocr.extract_amount_from_images(images)
+                if ocr and ocr.get("amount"):
+                    result["refund_ocr_amount"] = ocr.get("amount")
+                    result["refund_ocr_source"] = "screenshot"
+                    cur = ocr.get("currency") or ""
+                    if cur:  # currency anchor lets the engine parse the amount
+                        eff_text = f"{eff_text}\n{ocr['amount']} {cur}".strip()
+                    log.info(
+                        f"[{ticket_id}] refund OCR read amount "
+                        f"{ocr['amount']}{(' ' + cur) if cur else ''} from screenshot"
+                    )
+    except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
+        log.warning(f"[{ticket_id}] refund OCR failed (non-blocking): {e}")
+
     ctx = refund_engine.RefundContext(
         intent=intent,
         confidence=classification.get("confidence", 0.0),
@@ -177,7 +203,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         as_of_date=as_of_date,
         nexus_available=nexus_available,
         nexus_data=nexus_data,
-        ticket_text=ticket_text or "",
+        ticket_text=eff_text,
     )
     decision = refund_engine.decide(ctx, REFUND_CONFIG)
 

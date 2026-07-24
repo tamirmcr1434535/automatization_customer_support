@@ -20,6 +20,7 @@ Scenarios:
 
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 # ── Set env vars before any import ───────────────────────────────────────────
@@ -1321,3 +1322,104 @@ def test_dispute_remap_false_for_non_dispute_intent():
     # Only CHARGEBACK_THREAT / PAYPAL_DISPUTE are remappable; a plain refund is not.
     assert main._dispute_is_really_cancellation(
         "REFUND_REQUEST", "please cancel my subscription") is False
+
+
+# ── AN-192 OCR fallback: amount only in an attached screenshot ────────────── #
+
+def _nexus_two_types():
+    """Nexus result with a subscription (5490) + a first_sale (199) — two
+    refundable types, so with NO stated amount the flow is ambiguous."""
+    return {
+        "subscription_id": "1", "source": "stripe",
+        "charges": [
+            {"charge_id": "ch_sub", "amount": 5490, "currency": "JPY",
+             "type": "subscription", "status": "success", "refundable": True,
+             "date": "2026-07-20"},
+            {"charge_id": "ch_fee", "amount": 199, "currency": "JPY",
+             "type": "first_sale", "status": "success", "refundable": True,
+             "date": "2026-07-18"},
+        ],
+    }
+
+
+def test_refund_ocr_recovers_amount_from_screenshot():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="JP")
+    result = {}
+    nexus = MagicMock()
+    nexus.search_subscription.return_value = _nexus_two_types()
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=True), \
+         patch.object(main.refund_ocr, "extract_amount_from_images",
+                      return_value={"amount": "5490", "currency": "JPY",
+                                    "card_last4": "7905", "txn_id": "T1"}):
+        zd.get_ticket_image_attachments.return_value = [(b"img", "image/png")]
+        # No amount in the text — only in the (mocked) screenshot.
+        main._refund_would_be_eval(
+            "9001", "u@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="返金お願いします", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_ocr_amount"] == "5490"
+    assert result["refund_ocr_source"] == "screenshot"
+    assert result["refund_decision"] == "YES"          # OCR'd 5490 → subscription flow
+    assert result["refund_flow"] == "flow1_subscription"
+    assert result["refund_charge_id"] == "ch_sub"
+
+
+def test_refund_no_image_leaves_flow_ambiguous():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="JP")
+    result = {}
+    nexus = MagicMock()
+    nexus.search_subscription.return_value = _nexus_two_types()
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=True), \
+         patch.object(main.refund_ocr, "extract_amount_from_images") as extract:
+        zd.get_ticket_image_attachments.return_value = []  # no screenshot
+        main._refund_would_be_eval(
+            "9002", "u@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="返金お願いします", as_of_date="2026-07-24T00:00:00Z")
+    extract.assert_not_called()                        # no image → no OCR call
+    assert "refund_ocr_amount" not in result
+    assert result["refund_reason_code"] == "AMBIGUOUS_FLOW"
+
+
+def test_refund_ocr_skipped_when_text_already_has_amount():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="JP")
+    result = {}
+    nexus = MagicMock()
+    nexus.search_subscription.return_value = _nexus_two_types()
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=True), \
+         patch.object(main.refund_ocr, "extract_amount_from_images") as extract:
+        main._refund_would_be_eval(
+            "9003", "u@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund 5490 JPY", as_of_date="2026-07-24T00:00:00Z")
+    # Amount already in text → skip attachment fetch + OCR entirely.
+    zd.get_ticket_image_attachments.assert_not_called()
+    extract.assert_not_called()
+    assert result["refund_decision"] == "YES"
+
+
+# ── zendesk_client.get_ticket_image_attachments ───────────────────────────── #
+
+def test_get_ticket_image_attachments_filters_and_downloads():
+    from zendesk_client import ZendeskClient
+    zc = ZendeskClient("sub", "e@e.com", "tok", dry_run=True)
+    comments = [
+        {"public": True, "author_id": 1, "attachments": [
+            {"content_type": "image/png", "content_url": "https://x/img.png", "size": 1000},
+            {"content_type": "application/pdf", "content_url": "https://x/doc.pdf", "size": 1000},
+        ]},
+        {"public": True, "author_id": 99, "attachments": [  # agent comment — skip
+            {"content_type": "image/jpeg", "content_url": "https://x/agent.jpg", "size": 10}]},
+    ]
+    with patch.object(zc, "_fetch_comments_with_agent_ids", return_value=(comments, {99})), \
+         patch("zendesk_client.requests.get") as get:
+        get.return_value = SimpleNamespace(content=b"PNGDATA", raise_for_status=lambda: None)
+        out = zc.get_ticket_image_attachments("1")
+    assert out == [(b"PNGDATA", "image/png")]           # pdf + agent image excluded
+    get.assert_called_once_with("https://x/img.png", auth=zc.auth, timeout=15)

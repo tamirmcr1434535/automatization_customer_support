@@ -199,6 +199,45 @@ class ZendeskClient:
             if comment.get("public") and comment.get("author_id") not in agent_ids
         )
 
+    def get_ticket_image_attachments(
+        self, ticket_id: str, max_images: int = 3, max_bytes: int = 5_000_000
+    ):
+        """Download image attachments from the customer's PUBLIC comments (oldest
+        first). Returns a list of (bytes, content_type). Read-only and best-effort:
+        returns [] on any error, and skips non-image or oversized attachments.
+        Used by the AN-192 refund would-be eval to OCR payment screenshots."""
+        try:
+            comments, agent_ids = self._fetch_comments_with_agent_ids(ticket_id)
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[{ticket_id}] could not fetch comments for attachments: {e}")
+            return []
+        out: list = []
+        for comment in comments:  # oldest first
+            if not comment.get("public") or comment.get("author_id") in agent_ids:
+                continue
+            for att in comment.get("attachments", []) or []:
+                ctype = (att.get("content_type") or "").lower()
+                if not ctype.startswith("image/"):
+                    continue
+                size = att.get("size")
+                if isinstance(size, int) and size > max_bytes:
+                    continue
+                url = att.get("content_url")
+                if not url:
+                    continue
+                try:
+                    resp = requests.get(url, auth=self.auth, timeout=15)
+                    resp.raise_for_status()
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"[{ticket_id}] attachment download failed: {e}")
+                    continue
+                if len(resp.content) > max_bytes:
+                    continue
+                out.append((resp.content, ctype))
+                if len(out) >= max_images:
+                    return out
+        return out
+
     def last_public_comment_is_from_agent(self, ticket_id: str) -> bool:
         """
         Return True if the most recent PUBLIC comment was posted by an agent or admin.

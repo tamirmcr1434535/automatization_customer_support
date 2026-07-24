@@ -75,6 +75,8 @@ SCHEMA = [
     bigquery.SchemaField("refund_flow",           "STRING"),   # flow1_subscription / flow2_report / flow3_pending
     bigquery.SchemaField("refund_engine_version", "STRING"),
     bigquery.SchemaField("refund_guard_trail",    "STRING"),   # JSON list of guard levels
+    bigquery.SchemaField("refund_ocr_amount",     "STRING"),   # amount read from an attached screenshot (AN-192 OCR)
+    bigquery.SchemaField("refund_ocr_source",     "STRING"),   # provenance, e.g. "screenshot"
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -181,6 +183,8 @@ def log_result(result: dict):
             "refund_flow":           result.get("refund_flow") or "",
             "refund_engine_version": result.get("refund_engine_version") or "",
             "refund_guard_trail":    result.get("refund_guard_trail") or "",
+            "refund_ocr_amount":     result.get("refund_ocr_amount") or "",
+            "refund_ocr_source":     result.get("refund_ocr_source") or "",
 
             # Error
             "error":              result.get("error") or "",
