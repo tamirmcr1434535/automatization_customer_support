@@ -224,10 +224,11 @@ def test_date_routes_by_explicit_date_to_report():
 
 
 def test_date_matches_two_types_stays_ambiguous():
-    # Same-day date matches BOTH a report and a first_sale on that date → can't
-    # tell which flow → human decides (no date_routed).
-    charges = [_report(cid="ch_rep", amount=1990, dt="2026-07-17"),
-               _first(cid="ch_first", amount=199, dt="2026-07-17")]
+    # Same-day date matches BOTH a subscription and a report on that date → can't
+    # tell which flow → human decides (no date_routed). A subscription is present
+    # so the one-time-collapse must NOT fire.
+    charges = [_sub("ch_sub", 5490, "2026-07-17"),
+               _report(cid="ch_rep", amount=1990, dt="2026-07-17")]
     d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-17T10:00:00Z",
                     ticket_text="refund the payment from today"), CFG)
     assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "date_routed" not in d.guard_trail
@@ -237,3 +238,63 @@ def test_no_date_multiple_types_stays_ambiguous():
     charges = [_sub("ch_sub", 5490, "2026-07-24"), _report()]
     d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund my money"), CFG)
     assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "date_routed" not in d.guard_trail
+
+
+# ── Type-keyword routing + one-time-collapse (Anna's rule, v9) ───────────── #
+
+def test_type_keyword_routes_to_subscription_166931():
+    # JP: no amount, no date; customer names the subscription ("サブスク"). sub + IQ-fee.
+    charges = [_sub("ch_sub", 5490, "2026-07-24"), _first(cid="ch_first", amount=199, dt="2026-07-17")]
+    d = decide(_ctx(language="JP", nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="サブスクは登録した認識はありません。返金お願い致します"), CFG)
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
+    assert "type_routed" in d.guard_trail
+
+
+def test_type_keyword_routes_to_subscription_en():
+    charges = [_sub("ch_sub", 4990, "2026-07-18"), _first(cid="ch_first", amount=199, dt="2026-07-10")]
+    d = decide(_ctx(nexus_data=_data(charges),
+                    ticket_text="I have no recollection of signing up for this recurring subscription"), CFG)
+    assert d.would_be_refunded is True and "type_routed" in d.guard_trail
+
+
+def test_type_keyword_routes_to_report():
+    charges = [_sub("ch_sub", 5490, "2026-07-18"), _report(cid="ch_rep", amount=1990, dt="2026-07-17")]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund my report, I don't need it"), CFG)
+    assert d.reason_code == re_.RC_REPORT_NOT_REFUNDABLE and "type_routed" in d.guard_trail
+
+
+def test_type_keyword_conflict_stays_ambiguous():
+    # Customer names BOTH a subscription and a report → can't resolve by word → human.
+    charges = [_sub("ch_sub", 5490, "2026-07-18"), _report(cid="ch_rep", amount=1990, dt="2026-07-17")]
+    d = decide(_ctx(nexus_data=_data(charges),
+                    ticket_text="refund the subscription and the report"), CFG)
+    assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "type_routed" not in d.guard_trail
+
+
+def test_one_time_collapse_no_subscription_166906():
+    # DE: no subscription at all; only one-time charges (report + IQ fee), no amount/date/word.
+    # One-time is never refundable → definite NO (not ambiguous).
+    charges = [_report(cid="ch_rep", amount=1.90, dt="2026-07-24"),
+               _first(cid="ch_first", amount=9.99, dt="2026-07-24")]
+    d = decide(_ctx(language="DE", nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="Ich möchte eine vollständige Rückerstattung, versehentliche Zahlung"), CFG)
+    assert d.would_be_refunded is False
+    assert d.reason_code == re_.RC_REPORT_NOT_REFUNDABLE and "one_time_collapsed" in d.guard_trail
+
+
+def test_first_sale_only_multi_is_not_refundable():
+    # Two first_sale charges = ONE type (single-type path B, not the collapse) → NO.
+    charges = [_first(cid="ch_a", amount=199, dt="2026-07-20"),
+               _first(cid="ch_b", amount=299, dt="2026-07-10")]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund"), CFG)
+    assert d.would_be_refunded is False and d.refund_flow == "flow3_pending"
+
+
+def test_subscription_plus_one_time_no_signal_stays_ambiguous():
+    # subscription present (could be YES) + one-time, but no amount/date/word → genuinely
+    # can't tell → human (collapse must NOT fire when a subscription is present).
+    charges = [_sub("ch_sub", 5490, "2026-07-18"), _first(cid="ch_first", amount=199, dt="2026-07-10")]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund my money"), CFG)
+    assert d.reason_code == re_.RC_AMBIGUOUS_FLOW
+    assert "one_time_collapsed" not in d.guard_trail and "type_routed" not in d.guard_trail

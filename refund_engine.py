@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v8"  # v8: date-based routing (Anna) resolves AMBIGUOUS_FLOW by stated/"same-day" date
+ENGINE_VERSION = "wb-flow12-v9"  # v9: type-keyword routing + one-time-collapse cut AMBIGUOUS_FLOW (Anna)
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -294,6 +294,41 @@ def _route_by_date(ctx: "RefundContext", refundable: list) -> Optional[str]:
     return next(iter(types)) if len(types) == 1 else None
 
 
+# ── Type-keyword routing (Anna's rule, words) ────────────────────────────── #
+# Customers frequently NAME the charge type in words ("I didn't sign up for the
+# subscription", "サブスク", "recurring charge", "my report"). When the amount
+# and date can't disambiguate, the word they used can. Only "subscription" and
+# "report" are matched — a bare "test" is far too noisy (the product IS an IQ
+# test), so first_sale is never keyword-routed.
+_TYPE_KEYWORDS = {
+    "subscription": (
+        "subscription", "subscrib", "recurring", "recurrent", "monthly", "renewal",
+        "renew", "membership", "sign up", "signed up", "signup", "signing up",
+        "abonnement", "abonelik", "abonament", "suscrip", "assinatura", "mensual",
+        "mensal", "maandelijks", "terugkerend", "abbonamento",
+        "подписк", "підписк", "サブスク", "定期", "月額", "毎月", "구독", "정기", "langganan",
+    ),
+    "report": (
+        "full report", "results report", "the report", "my report", "test report",
+        "レポート", "診断結果", "検査結果", "informe", "relatório", "rapport", "bericht",
+        "отчёт", "отчет", "звіт", "보고서",
+    ),
+}
+
+
+def _route_by_type_keyword(ctx: "RefundContext", groups) -> Optional[str]:
+    """Route to the group whose type-word the customer used, iff exactly ONE
+    group's keywords hit AND that group has refundable charges present. If both
+    'subscription' and 'report' words appear → not resolvable here → None."""
+    text = unicodedata.normalize("NFKC", ctx.ticket_text or "").lower()
+    if not text:
+        return None
+    present = {t for t, chs in groups if chs}
+    hit = [t for t, kws in _TYPE_KEYWORDS.items()
+           if t in present and any(k in text for k in kws)]
+    return hit[0] if len(hit) == 1 else None
+
+
 def window_for(country: str, currency: str, language: str) -> tuple[int, str]:
     """Refund window (days) + source. Priority: explicit billing country → charge
     currency proxy → language proxy → default 14."""
@@ -391,17 +426,29 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         elif len(by_amount) == 0 and len(present) == 1:  # B: only one refundable type present
             target_type = present[0]
 
-        if target_type is None:
-            # Amount didn't disambiguate → try DATE (Anna's rule: "same day" / "on <date>").
+        if target_type is None:                       # C: date ("same day" / "on <date>")
             dated = _route_by_date(ctx, refundable)
             if dated is not None:
                 target_type = dated
                 trail.append("date_routed")
 
-        if target_type is None:                       # C: still ambiguous → human decides
+        if target_type is None:                       # D: explicit charge-type word in the text
+            typed = _route_by_type_keyword(ctx, _groups)
+            if typed is not None:
+                target_type = typed
+                trail.append("type_routed")
+
+        if target_type is None and not subs:          # E: no subscription → only one-time charges
+            # first_sale (IQ Test fee) and cross_sale (Report) are never refundable, so
+            # even without an amount/date/word the money outcome is a definite NO — decline
+            # via the report flow (per-ToS NO) if a report is present, else the one-time flow.
+            target_type = "report" if reports else "first_sale"
+            trail.append("one_time_collapsed")
+
+        if target_type is None:                       # F: still ambiguous → human decides
             return _decision(False, RC_AMBIGUOUS_FLOW,
-                             "Multiple refundable charge types, no amount/date to "
-                             "disambiguate — human decides.",
+                             "Multiple refundable charge types, no amount/date/type-word "
+                             "to disambiguate — human decides.",
                              trail, candidate_charges=_charges_summary(refundable), **common)
         trail.append(f"route:{target_type}")
 
