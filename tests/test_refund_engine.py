@@ -62,13 +62,45 @@ def test_nothing_refundable():
     assert d.reason_code == re_.RC_NOTHING_REFUNDABLE
 
 
-def test_one_time_only_out_of_scope():
-    charges = [{"charge_id": "ch_f", "amount": 199, "currency": "JPY", "type": "first_sale",
-                "status": "success", "refundable": True, "date": "2026-07-18"},
-               {"charge_id": "ch_c", "amount": 990, "currency": "JPY", "type": "cross_sale",
-                "status": "success", "refundable": True, "date": "2026-07-18"}]
-    d = decide(_ctx(nexus_data=_data(charges)), CFG)
-    assert d.would_be_refunded is False and d.reason_code == re_.RC_ONE_TIME_OUT_OF_SCOPE
+def _report(cid="ch_rep", amount=990, dt="2026-07-18"):
+    return {"charge_id": cid, "amount": amount, "currency": "JPY", "type": "cross_sale",
+            "status": "success", "refundable": True, "date": dt}
+
+
+def _first(cid="ch_first", amount=199, dt="2026-07-18"):
+    return {"charge_id": cid, "amount": amount, "currency": "JPY", "type": "first_sale",
+            "status": "success", "refundable": True, "date": dt}
+
+
+def test_flow2_report_not_refundable():
+    d = decide(_ctx(nexus_data=_data([_report()])), CFG)
+    assert d.would_be_refunded is False
+    assert d.reason_code == re_.RC_REPORT_NOT_REFUNDABLE
+    assert d.refund_flow == "flow2_report"
+
+
+def test_first_sale_flow_pending():
+    d = decide(_ctx(nexus_data=_data([_first()])), CFG)
+    assert d.reason_code == re_.RC_ONE_TIME_OUT_OF_SCOPE and d.refund_flow == "flow3_pending"
+
+
+def test_ambiguous_flow_when_multiple_types_no_amount():
+    d = decide(_ctx(nexus_data=_data([_sub("ch_sub", 5490, "2026-07-18"), _report()]),
+                    ticket_text="please refund"), CFG)
+    assert d.reason_code == re_.RC_AMBIGUOUS_FLOW
+
+
+def test_route_by_amount_to_report():
+    # sub 5490 + report 990; customer names 990円 → routes to report flow (non-refundable).
+    d = decide(_ctx(nexus_data=_data([_sub("ch_sub", 5490, "2026-07-18"), _report(amount=990)]),
+                    ticket_text="refund my 990円 charge"), CFG)
+    assert d.reason_code == re_.RC_REPORT_NOT_REFUNDABLE and d.refund_flow == "flow2_report"
+
+
+def test_route_by_amount_to_subscription():
+    d = decide(_ctx(nexus_data=_data([_sub("ch_sub", 5490, "2026-07-18"), _report(amount=990)]),
+                    ticket_text="refund my 5490円 charge"), CFG)
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
 
 
 def test_would_be_refunded_within_window():
@@ -77,6 +109,7 @@ def test_would_be_refunded_within_window():
     assert d.would_be_refunded is True
     assert d.reason_code == re_.RC_WOULD_BE_REFUNDED
     assert d.candidate_charge_id == "ch_sub" and d.computed_amount == "5490"
+    assert d.refund_flow == "flow1_subscription"
 
 
 def test_outside_refund_window():
