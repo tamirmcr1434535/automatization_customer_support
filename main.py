@@ -218,6 +218,16 @@ HANDLED_INTENTS = {
     "SUB_RENEWAL_CANCELLATION",
 }
 
+# Intents the classifier assigns on an explicit payment-dispute OR legal-threat.
+# A pure dispute (customer wants their money back / has opened a bank dispute) is
+# human-only. But a legal-threat wording ("lawyer", "訴える", "消費者センター") is
+# NOT a payment dispute — if the customer's real ask is to cancel, it is a routine
+# cancellation (see _dispute_is_really_cancellation + the skip in _process).
+_PURE_DISPUTE_INTENTS = {
+    "CHARGEBACK_THREAT",  # customer threatening / filing chargeback, or legal threat
+    "PAYPAL_DISPUTE",     # PayPal dispute already opened
+}
+
 # Tags set by the retired card-digits flow. A ticket carrying any of these
 # is an old-pipeline leftover — we escalate it to a human instead of
 # re-entering the flow, which would have sent a public reply to the customer.
@@ -299,6 +309,15 @@ def _contains_cancel_signal(text: str) -> bool:
     """Return True if text contains any cancel/stop-subscription keyword."""
     text_lower = text.lower()
     return any(kw in text_lower for kw in _CANCEL_SIGNALS)
+
+
+def _dispute_is_really_cancellation(intent: str, customer_text: str) -> bool:
+    """A CHARGEBACK_THREAT / PAYPAL_DISPUTE intent is often triggered by legal-
+    threat wording ("lawyer", "訴える", "消費者センター"), which is NOT a payment
+    dispute. If the customer's actual ask is to cancel, treat it as a normal
+    cancellation — cancellation is always the priority, and any refund keyword
+    found later in the full comment thread still bounces it to a human."""
+    return intent in _PURE_DISPUTE_INTENTS and _contains_cancel_signal(customer_text)
 
 
 # ── Delete-account signal keywords ──────────────────────────────────── #
@@ -1726,6 +1745,34 @@ def _process(ticket_id: str) -> dict:
     # the first customer comment or follow-up replies.
     _all_text_for_refund = subject + " " + body
     _customer_text_only = body  # body + comments, WITHOUT subject (for cancel check)
+
+    # ── Chargeback/PayPal-dispute intent that is really a cancellation ───── #
+    # CHARGEBACK_THREAT / PAYPAL_DISPUTE also fires on legal-threat wording
+    # ("I'll sue", "lawyer", "訴える", "消費者センター"), which is NOT a payment
+    # dispute. Per the policy below (cancellation is always the priority), if the
+    # customer's actual ask is to cancel, this is a routine cancellation — re-map
+    # to a cancellation intent so it flows through the normal cancel path (which
+    # re-resolves the exact type from account data, and the refund-keyword
+    # override right below still bounces it to a human if a refund is requested).
+    # No cancel signal → left as-is → the pure-dispute skip escalates to a human.
+    if _dispute_is_really_cancellation(intent, _customer_text_only):
+        log.info(
+            f"[{ticket_id}] {intent} but customer asks to cancel with no refund "
+            f"request → treating as a normal cancellation (dispute/legal-threat "
+            f"wording noted for the human)."
+        )
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Note: classifier flagged this ticket {intent} (chargeback/legal-"
+            f"threat wording), but the customer's request is a subscription "
+            f"cancellation with no refund ask, so the bot processed it as a normal "
+            f"cancellation. If the customer follows up about a chargeback or legal "
+            f"action, a human should take over.",
+        )
+        result["dispute_remapped_from"] = intent
+        intent = "TRIAL_CANCELLATION"  # neutral cancel; _resolve_intent fixes the type from account data
+        result["intent"] = intent
+
     if intent in HANDLED_INTENTS:
         try:
             all_comments = zendesk.get_all_customer_comments_text(ticket_id)
@@ -1873,12 +1920,10 @@ def _process(ticket_id: str) -> dict:
     #
     # If the customer asks to cancel AND mentions refund → cancel first.
     # The refund part can be handled by a human afterwards.
-    # Only skip if the ticket is a PURE payment dispute with zero cancel intent.
+    # Only skip if the ticket is a PURE payment dispute with zero cancel intent —
+    # a dispute intent that was really a cancellation was already re-mapped above
+    # (see _dispute_is_really_cancellation), so reaching here means no cancel ask.
     #
-    _PURE_DISPUTE_INTENTS = {
-        "CHARGEBACK_THREAT",  # customer threatening / filing chargeback
-        "PAYPAL_DISPUTE",     # PayPal dispute already opened
-    }
     if intent in _PURE_DISPUTE_INTENTS:
         log.info(f"[{ticket_id}] {intent} — skipping (active payment dispute, human must handle)")
         result["status"] = "skipped_refund_request"

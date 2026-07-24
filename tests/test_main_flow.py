@@ -306,6 +306,45 @@ class TestProcess:
         assert result["status"] == "skipped_refund_request"
         mock_zd.post_reply.assert_not_called()
 
+    # D5b. CHARGEBACK_THREAT fired on a legal threat, but the customer's real ask
+    # is to cancel and there is NO refund request → treat as a normal cancellation
+    # (Anna, ticket 165635). Must NOT skip as a payment dispute.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your subscription has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(intent="CHARGEBACK_THREAT"))
+    @patch.object(main, "zendesk")
+    def test_chargeback_with_cancel_remapped_to_cancellation(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Complaint",
+            body="I will contact my lawyer and take legal action. Please cancel my subscription.",
+        ))
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("1015")
+        assert result["status"] == "success"
+        assert result["dispute_remapped_from"] == "CHARGEBACK_THREAT"
+        assert result["intent"] == "TRIAL_CANCELLATION"
+
+    # D5c. CHARGEBACK_THREAT with NO cancel ask → still a pure dispute → skip to human.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(intent="CHARGEBACK_THREAT"))
+    @patch.object(main, "zendesk")
+    def test_chargeback_without_cancel_still_skipped(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Complaint",
+            body="I did not authorize this charge. I will contact my lawyer and take legal action.",
+        ))
+        result = main._process("1016b")
+        assert result["status"] == "skipped_refund_request"
+        assert "active payment dispute" in result["reason"]
+        assert "dispute_remapped_from" not in result
+        mock_zd.post_reply.assert_not_called()
+
     # D6. Ukrainian "я не отримав результат" → escalate
     @patch.object(main, "log_result")
     @patch.object(main, "classify_ticket", return_value=_classification(language="UK"))
@@ -1229,7 +1268,10 @@ class TestRefundWouldBe:
     @patch.object(main, "classify_ticket", return_value=_classification(intent="PAYPAL_DISPUTE"))
     @patch.object(main, "zendesk")
     def test_paypal_dispute_still_hard_escalates(self, mock_zd, mock_cls, mock_log):
-        _setup_zd(mock_zd)
+        # Pure dispute: NO cancel ask (else it would re-map to a cancellation).
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="PayPal dispute",
+            body="I have opened a PayPal dispute for this charge. I want my money back."))
         result = main._process("an192_4")
         assert result["status"] == "skipped_refund_request"
 
@@ -1259,3 +1301,23 @@ class TestRefundWouldBe:
         with patch.object(main, "_refund_would_be_eval", side_effect=fake_eval):
             main._process("an192_6")
         assert "1,990 JPY" in captured.get("text", "")  # body reached the eval
+
+
+# ── Unit tests: _dispute_is_really_cancellation (dispute → cancellation) ───── #
+
+def test_dispute_remap_true_when_cancel_present():
+    assert main._dispute_is_really_cancellation(
+        "CHARGEBACK_THREAT", "I will sue you. Please cancel my subscription.") is True
+    assert main._dispute_is_really_cancellation(
+        "PAYPAL_DISPUTE", "解約したいです。弁護士に相談します。") is True
+
+
+def test_dispute_remap_false_without_cancel():
+    assert main._dispute_is_really_cancellation(
+        "CHARGEBACK_THREAT", "I did not authorize this. I will take legal action.") is False
+
+
+def test_dispute_remap_false_for_non_dispute_intent():
+    # Only CHARGEBACK_THREAT / PAYPAL_DISPUTE are remappable; a plain refund is not.
+    assert main._dispute_is_really_cancellation(
+        "REFUND_REQUEST", "please cancel my subscription") is False
