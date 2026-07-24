@@ -91,11 +91,52 @@ def test_already_refunded_charge_match():
     assert d.would_be_refunded is False and d.reason_code == re_.RC_ALREADY_REFUNDED
 
 
-def test_multiple_stated_amounts():
+def test_multiple_stated_amounts_no_agreement_stays_human():
+    # Both amounts appear once and both match a refundable charge → repetition can't
+    # pick a winner → stays human.
     d = decide(_ctx(ticket_text="charged $30.99 and $9.99, why?"), CFG)
     assert d.would_be_refunded is False
     assert d.reason_code == re_.RC_MULTIPLE_AMOUNTS_STATED
     assert d.customer_stated_amounts == "30.99,9.99"  # all stated amounts logged
+
+
+def _jp_two_charges():
+    return [
+        {"charge_id": "ch_first", "amount": 199, "currency": "JPY", "type": "first_sale",
+         "status": "success", "refundable": True, "date": "2026-07-01T09:00:00Z"},
+        {"charge_id": "ch_sub", "amount": 5490, "currency": "JPY", "type": "subscription",
+         "status": "success", "refundable": True, "date": "2026-07-21T09:00:00Z"},
+    ]
+
+
+def test_multi_amount_resolved_when_repetition_and_proximity_agree():
+    # Ticket #166764 shape: 199 = context (once), 5,490 = target (repeated + near "Refund").
+    txt = ("I only intended to buy the one-time test for 199 JPY. I noticed a charge of "
+           "5,490 JPY I did not authorize. Please Refund the recent charge of 5,490 JPY.")
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": _jp_two_charges()},
+                    ticket_text=txt), CFG)
+    assert d.would_be_refunded is True
+    assert d.candidate_charge_id == "ch_sub" and d.computed_amount == "5490"
+    assert "multi_resolved_repetition_proximity" in d.guard_trail
+
+
+def test_multi_amount_disagreement_stays_human():
+    # Repetition points at 199 (twice), proximity points at 5,490 (near "refund") → disagree.
+    txt = "I intended 199 JPY, 199 JPY was fine. Please refund the 5,490 JPY charge."
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": _jp_two_charges()},
+                    ticket_text=txt), CFG)
+    assert d.would_be_refunded is False
+    assert d.reason_code == re_.RC_MULTIPLE_AMOUNTS_STATED
+
+
+def test_multi_amount_single_refundable_candidate():
+    # Two amounts stated but only 5,490 matches a refundable charge → pick it.
+    charges = [{"charge_id": "ch_sub", "amount": 5490, "currency": "JPY", "type": "subscription",
+                "status": "success", "refundable": True}]
+    d = decide(_ctx(nexus_data={"subscription_id": "1", "charges": charges},
+                    ticket_text="I paid 199 JPY but was charged 5,490 JPY, refund please"), CFG)
+    assert d.would_be_refunded is True and d.candidate_charge_id == "ch_sub"
+    assert "multi_single_candidate" in d.guard_trail
 
 
 def test_european_decimal_comma_matches():
