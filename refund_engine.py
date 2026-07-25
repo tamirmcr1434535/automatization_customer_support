@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v9"  # v9: type-keyword routing + one-time-collapse cut AMBIGUOUS_FLOW (Anna)
+ENGINE_VERSION = "wb-flow12-v10"  # v10: dispute-target=subscription on unauthorized-recurring complaints
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -329,6 +329,47 @@ def _route_by_type_keyword(ctx: "RefundContext", groups) -> Optional[str]:
     return hit[0] if len(hit) == 1 else None
 
 
+# ── Dispute-target = the surprise recurring charge (v10) ──────────────────── #
+# Audit vs Zendesk: when the flow is otherwise ambiguous, the customer is almost
+# always disputing the SUBSCRIPTION (the unexpected recurring charge) while
+# accepting the small one-time charges (IQ Test fee / Report) — and CS refunds
+# the subscription. These markers detect an "unauthorized / didn't-subscribe /
+# recurring surprise" complaint; combined with a subscription being present, we
+# route to the latest subscription. The country-window guard still gates YES, so
+# this cannot manufacture a within-window false YES.
+_UNAUTHORIZED_RECURRING_MARKERS = (
+    # EN
+    "unauthori", "did not authorize", "didn't authorize", "did not subscribe",
+    "didn't subscribe", "never subscribed", "no recollection", "don't recognize",
+    "do not recognize", "didn't sign up", "did not sign up", "without my consent",
+    "without consent", "did not agree", "didn't agree", "did not knowingly",
+    "unaware", "recurring", "auto-renew", "monthly charge", "keep charging",
+    # DE
+    "nicht bestellt", "ohne zustimmung", "nicht autorisiert", "nicht angemeldet",
+    # NL
+    "geen toestemming", "zonder toestemming", "niet besteld", "onterecht",
+    # ES / PT
+    "no autoric", "sin mi consentimiento", "no reconozco", "não autorizei",
+    "sem meu consentimento", "recurrente",
+    # JA
+    "身に覚え", "覚えのない", "承知していない", "登録した認識", "無断", "継続課金",
+    "月額", "サブスク", "毎月",
+    # KR
+    "동의하지", "승인하지", "정기결제", "구독한 적",
+    # VI
+    "không cho phép", "tự động trừ", "không đăng ký",
+    # UK / RU
+    "не підписув", "не авторизу", "без згоди", "не подписыв", "без согласия",
+)
+
+
+def _mentions_unauthorized_recurring(text: str) -> bool:
+    if not text:
+        return False
+    t = unicodedata.normalize("NFKC", text).lower()
+    return any(m in t for m in _UNAUTHORIZED_RECURRING_MARKERS)
+
+
 def window_for(country: str, currency: str, language: str) -> tuple[int, str]:
     """Refund window (days) + source. Priority: explicit billing country → charge
     currency proxy → language proxy → default 14."""
@@ -438,14 +479,22 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                 target_type = typed
                 trail.append("type_routed")
 
-        if target_type is None and not subs:          # E: no subscription → only one-time charges
+        if target_type is None and subs and _mentions_unauthorized_recurring(ctx.ticket_text):
+            # E: unauthorized/surprise-recurring complaint + a subscription is present →
+            # the dispute target is the subscription (customer accepts the one-time test/
+            # report, disputes the recurring charge). CS refunds the subscription here; the
+            # country-window guard below still decides YES/NO, so no within-window false YES.
+            target_type = "subscription"
+            trail.append("dispute_target_subscription")
+
+        if target_type is None and not subs:          # F: no subscription → only one-time charges
             # first_sale (IQ Test fee) and cross_sale (Report) are never refundable, so
             # even without an amount/date/word the money outcome is a definite NO — decline
             # via the report flow (per-ToS NO) if a report is present, else the one-time flow.
             target_type = "report" if reports else "first_sale"
             trail.append("one_time_collapsed")
 
-        if target_type is None:                       # F: still ambiguous → human decides
+        if target_type is None:                       # G: still ambiguous → human decides
             return _decision(False, RC_AMBIGUOUS_FLOW,
                              "Multiple refundable charge types, no amount/date/type-word "
                              "to disambiguate — human decides.",

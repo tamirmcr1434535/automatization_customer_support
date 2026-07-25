@@ -292,9 +292,61 @@ def test_first_sale_only_multi_is_not_refundable():
 
 
 def test_subscription_plus_one_time_no_signal_stays_ambiguous():
-    # subscription present (could be YES) + one-time, but no amount/date/word → genuinely
-    # can't tell → human (collapse must NOT fire when a subscription is present).
+    # subscription present (could be YES) + one-time, but no amount/date/word AND no
+    # unauthorized-recurring signal → genuinely can't tell → human (safety valve preserved).
     charges = [_sub("ch_sub", 5490, "2026-07-18"), _first(cid="ch_first", amount=199, dt="2026-07-10")]
     d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund my money"), CFG)
     assert d.reason_code == re_.RC_AMBIGUOUS_FLOW
     assert "one_time_collapsed" not in d.guard_trail and "type_routed" not in d.guard_trail
+    assert "dispute_target_subscription" not in d.guard_trail
+
+
+# ── Dispute-target = surprise recurring subscription (v10) ────────────────── #
+
+def test_dispute_target_subscription_167304():
+    # Ticket 167304: customer accepts 199+1990 (one-time), disputes the 5490 sub they
+    # "don't recognize". stated amounts map to 3 types → v9 was AMBIGUOUS; v10 routes to
+    # the subscription on the unauthorized signal.
+    charges = [_sub("ch_sub", 5490, "2026-07-23"),
+               _report(cid="ch_rep", amount=1990, dt="2026-07-16"),
+               _first(cid="ch_fee", amount=199, dt="2026-07-16")]
+    d = decide(_ctx(language="JP", nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="7月22日の5,490円は身に覚えがありません。199円と1,990円は了承します"), CFG)
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
+    assert "dispute_target_subscription" in d.guard_trail
+    assert d.candidate_charge_id == "ch_sub"
+
+
+def test_dispute_target_subscription_en_conflict():
+    # Both a subscription and a report exist; customer names small one-time amounts but the
+    # complaint is "never subscribed / recurring" → route to subscription despite the mix.
+    charges = [_sub("ch_sub", 5490, "2026-07-20"),
+               _report(cid="ch_rep", amount=1990, dt="2026-07-12"),
+               _first(cid="ch_fee", amount=199, dt="2026-07-12")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="I only wanted the 199 test and my report — I never subscribed "
+                                "to a recurring membership, please refund the unauthorized charge"), CFG)
+    assert d.would_be_refunded is True and "dispute_target_subscription" in d.guard_trail
+
+
+def test_dispute_target_needs_a_subscription():
+    # Unauthorized-recurring wording but NO subscription among charges → must NOT invent one;
+    # falls through to the one-time collapse (definite NO), not dispute_target.
+    charges = [_report(cid="ch_rep", amount=1990, dt="2026-07-16"),
+               _first(cid="ch_fee", amount=199, dt="2026-07-16")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="I never authorized this recurring charge"), CFG)
+    assert d.would_be_refunded is False
+    assert "dispute_target_subscription" not in d.guard_trail
+    assert "one_time_collapsed" in d.guard_trail
+
+
+def test_dispute_target_still_gated_by_window():
+    # Unauthorized-recurring + subscription, but the latest sub is OLD → routed to
+    # subscription (not ambiguous) yet correctly NO on the window (no false YES).
+    charges = [_sub("ch_old", 5490, "2026-06-20"),
+               _first(cid="ch_fee", amount=199, dt="2026-06-18")]
+    d = decide(_ctx(language="JP", nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="身に覚えのない継続課金です、返金してください"), CFG)
+    assert d.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW
+    assert "dispute_target_subscription" in d.guard_trail
