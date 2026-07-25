@@ -341,6 +341,25 @@ def test_dispute_target_needs_a_subscription():
     assert "one_time_collapsed" in d.guard_trail
 
 
+def test_dispute_target_jp_katteni_167442():
+    # Ticket 167442: JP "勝手に課金" (charged without permission) + a subscription present →
+    # v10.1 marker catches it → route to subscription (within window → YES).
+    charges = [_sub("ch_sub", 5490, "2026-07-25"),
+               _first(cid="ch_a", amount=199, dt="2026-07-18"),
+               _first(cid="ch_b", amount=199, dt="2026-07-04")]
+    d = decide(_ctx(language="JP", nexus_data=_data(charges), as_of_date="2026-07-25T10:00:00Z",
+                    ticket_text="詳細な説明もなく勝手に課金するってひどくないですか？返金してください"), CFG)
+    assert d.would_be_refunded is True and "dispute_target_subscription" in d.guard_trail
+    assert d.refund_flow == "flow1_subscription"
+
+
+def test_dispute_target_en_without_permission():
+    charges = [_sub("ch_sub", 5490, "2026-07-22"), _first(cid="ch_fee", amount=199, dt="2026-07-15")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-24T10:00:00Z",
+                    ticket_text="You charged me without permission, refund it"), CFG)
+    assert d.would_be_refunded is True and "dispute_target_subscription" in d.guard_trail
+
+
 def test_dispute_target_still_gated_by_window():
     # Unauthorized-recurring + subscription, but the latest sub is OLD → routed to
     # subscription (not ambiguous) yet correctly NO on the window (no false YES).

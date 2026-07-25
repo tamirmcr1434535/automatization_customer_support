@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v10"  # v10: dispute-target=subscription on unauthorized-recurring complaints
+ENGINE_VERSION = "wb-flow12-v10.1"  # v10.1: + JP 勝手に / EN "without permission" unauthorized markers
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -342,7 +342,8 @@ _UNAUTHORIZED_RECURRING_MARKERS = (
     "unauthori", "did not authorize", "didn't authorize", "did not subscribe",
     "didn't subscribe", "never subscribed", "no recollection", "don't recognize",
     "do not recognize", "didn't sign up", "did not sign up", "without my consent",
-    "without consent", "did not agree", "didn't agree", "did not knowingly",
+    "without consent", "without permission", "without my permission",
+    "charged me without", "did not agree", "didn't agree", "did not knowingly",
     "unaware", "recurring", "auto-renew", "monthly charge", "keep charging",
     # DE
     "nicht bestellt", "ohne zustimmung", "nicht autorisiert", "nicht angemeldet",
@@ -353,7 +354,7 @@ _UNAUTHORIZED_RECURRING_MARKERS = (
     "sem meu consentimento", "recurrente",
     # JA
     "身に覚え", "覚えのない", "承知していない", "登録した認識", "無断", "継続課金",
-    "月額", "サブスク", "毎月",
+    "月額", "サブスク", "毎月", "勝手に", "勝手に課金", "勝手に請求",
     # KR
     "동의하지", "승인하지", "정기결제", "구독한 적",
     # VI
