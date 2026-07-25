@@ -94,3 +94,43 @@ window, or a specific NO reason).
 - The would-be engine logic (unchanged; this is purely lookup coverage).
 - The separate `AMBIGUOUS_FLOW` routing improvement (tracked separately as a
   would-be engine v10 "dispute-target = surprise recurring charge" heuristic).
+
+---
+
+## UPDATE 2026-07-25 — confirmed by replay: renewal-type + loader freshness
+
+Replayed `search_subscription` live for 4 audited "bot NO → human approved"
+tickets and compared to what the bot saw at eval time (`refund_candidate_charges`)
+and what the agent refunded. Two distinct root causes surfaced:
+
+### (a) Recurring payments are `type="renewal"` — FIXED bot-side (engine v11)
+Nexus returns the first paid period as `type="subscription"` and **every recurring
+payment as `type="renewal"`**. The engine only recognized `"subscription"`, so
+renewals were invisible to flow #1. Fixed in engine **v11** (`_is_subscription`
+now accepts `renewal`). **Not a backend item** — recorded here for context.
+
+### (b) Loader freshness lag — BACKEND, still open
+Even with v11, the disputed renewal must be **present in Nexus at eval time**. In
+these tickets the recent renewal the customer disputes was NOT yet loaded when the
+bot evaluated (the bot's `candidate_charges` showed only an older/one-time charge),
+though `search_subscription` returns it now.
+
+| Ticket | Bot saw at eval | Nexus returns now | Agent refunded |
+|---|---|---|---|
+| 167485 | only `4990 first_sale @07-07` | + `39990 renewal @07-22` | 39990 renewal |
+| 167518 | only `199 first_sale @07-16` | + `5490 subscription @07-23` | 5490 subscription |
+| 167505 | only `299990 subscription @05-14` (72d) | 7 charges incl. `renewal @07-25` | latest renewal @07-25 |
+| 167508 | only `29.99 @05-30` (56d) | + `renewal @06-27`, `@07-25` | fresh renewal |
+
+Replay through engine v11 (eval-time simulation, disputed charge marked refundable):
+167505 → **YES now on live data**; 167485 & 167508 → **YES** once the fresh renewal
+is present; 167518 → still mis-routes (separate engine track: dispute-vs-accept).
+
+**Ask:** `search-subscription` must return the customer's **recent** subscription
+`renewal` charges (same-day / T-1 / T-2) at the time of the support ticket — the
+loader lag currently hides the very charge the customer is disputing.
+
+**Acceptance:** for a ticket filed the same day as a renewal charge,
+`search_subscription(email)` includes that renewal within minutes; re-running the
+refund audit, the `ONE_TIME`/`OUTSIDE_WINDOW`→`refund_approved` mismatches driven by
+missing recent renewals drop toward zero.
