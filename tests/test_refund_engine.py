@@ -72,6 +72,12 @@ def _first(cid="ch_first", amount=199, dt="2026-07-18"):
             "status": "success", "refundable": True, "date": dt}
 
 
+def _renewal(cid, amount, dt, refundable=True, status="success"):
+    # Nexus returns recurring subscription payments as type="renewal".
+    return {"charge_id": cid, "amount": amount, "currency": "JPY", "type": "renewal",
+            "status": status, "refundable": refundable, "date": dt}
+
+
 def test_flow2_report_not_refundable():
     d = decide(_ctx(nexus_data=_data([_report()])), CFG)
     assert d.would_be_refunded is False
@@ -369,3 +375,42 @@ def test_dispute_target_still_gated_by_window():
                     ticket_text="身に覚えのない継続課金です、返金してください"), CFG)
     assert d.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW
     assert "dispute_target_subscription" in d.guard_trail
+
+
+# ── type="renewal" is a subscription charge (v11) ─────────────────────────── #
+
+def test_renewal_type_treated_as_subscription():
+    # A recurring "renewal" charge alone must route through flow #1 (was invisible pre-v11).
+    d = decide(_ctx(nexus_data=_data([_renewal("ch_r", 5490, "2026-07-18")])), CFG)  # 2d, EN default 14
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
+    assert d.candidate_charge_id == "ch_r"
+
+
+def test_latest_renewal_picked_over_old_subscription():
+    # Policy target = the LATEST renewal, not the first-period "subscription".
+    charges = [_sub("ch_first", 5490, "2026-05-14"), _renewal("ch_new", 5490, "2026-07-18")]
+    d = decide(_ctx(nexus_data=_data(charges)), CFG)
+    assert d.would_be_refunded is True and d.candidate_charge_id == "ch_new"
+
+
+def test_renewal_167505_latest_within_window():
+    # Mirrors #167505: old first-period sub + several renewals; only the latest refundable
+    # renewal (within the JP 8d window) is the target → YES on that charge.
+    charges = [_sub("ch_sub", 299990, "2026-05-14"),
+               _renewal("ch_r1", 299990, "2026-06-11"),
+               _renewal("ch_r2", 299990, "2026-07-19", refundable=False, status="failed"),
+               _renewal("ch_r3", 299990, "2026-07-25")]
+    d = decide(_ctx(language="JP", nexus_data=_data(charges), as_of_date="2026-07-26T00:00:00Z"), CFG)
+    assert d.would_be_refunded is True and d.candidate_charge_id == "ch_r3"
+
+
+def test_renewal_only_outside_window_declines():
+    d = decide(_ctx(nexus_data=_data([_renewal("ch_r", 5490, "2026-06-20")])), CFG)  # 30d > 14
+    assert d.would_be_refunded is False and d.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW
+
+
+def test_renewal_plus_one_time_routes_to_renewal_by_amount():
+    # Customer names the renewal amount → routes to the subscription (renewal) group.
+    charges = [_renewal("ch_r", 5490, "2026-07-18"), _first(cid="ch_fee", amount=199, dt="2026-07-10")]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="refund my 5490円 charge"), CFG)
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"

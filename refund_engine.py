@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v10.1"  # v10.1: + JP 勝手に / EN "without permission" unauthorized markers
+ENGINE_VERSION = "wb-flow12-v11"  # v11: treat Nexus type="renewal" as a subscription charge (flow #1)
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -194,7 +194,12 @@ def _is_refundable(charge: dict) -> bool:
 
 
 def _is_subscription(charge: dict) -> bool:
-    return str(charge.get("type", "")).lower() == "subscription"
+    # Nexus returns the first paid period as "subscription" and every recurring
+    # payment as "renewal". Both are subscription-fee charges for flow #1 — and
+    # the policy target is the LATEST renewal — so treat them the same. (Missing
+    # "renewal" made every renewal invisible to flow #1: renewal-refund requests
+    # fell through to ONE_TIME / OUTSIDE_WINDOW on stale first-period data.)
+    return str(charge.get("type", "")).lower() in ("subscription", "renewal")
 
 
 def _charge_date(charge: dict) -> Optional[date]:
@@ -272,10 +277,11 @@ def _charge_matches_date(charge: dict, dates) -> bool:
 
 
 def _type_group(charge: dict) -> Optional[str]:
-    """Charge type → the routing group label ('subscription'/'report'/'first_sale')."""
+    """Charge type → the routing group label ('subscription'/'report'/'first_sale').
+    'renewal' groups with 'subscription' (both are subscription-fee charges)."""
     t = str(charge.get("type", "")).lower()
-    return {"subscription": "subscription", "cross_sale": "report",
-            "first_sale": "first_sale"}.get(t)
+    return {"subscription": "subscription", "renewal": "subscription",
+            "cross_sale": "report", "first_sale": "first_sale"}.get(t)
 
 
 def _route_by_date(ctx: "RefundContext", refundable: list) -> Optional[str]:
