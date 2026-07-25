@@ -359,102 +359,13 @@ def _contains_cancel_signal(text: str) -> bool:
     return any(kw in text_lower for kw in _CANCEL_SIGNALS)
 
 
-# ── Explicit legal / authority / chargeback threat keywords ──────────── #
-# The dispute→cancellation remap below (_dispute_is_really_cancellation)
-# exists to rescue CHARGEBACK_THREAT tickets where the classifier over-fired
-# on MILD legal-sounding wording but the real ask is just to cancel. It must
-# NOT fire when the customer makes an EXPLICIT threat — "I'll report you to
-# the authorities", "I'll file a chargeback", "I'll contact my bank / a
-# lawyer". Those are genuine disputes that a human must handle; auto-cancelling
-# + auto-replying "your trial was cancelled" ignores the threat and the money.
-#
-# Real-world failure (ticket #167445, 2026-07-25):
-#   "1990円を…キャンセルしなさい。さもなければ、日本の当局に通報します。"
-#   Classifier correctly returned CHARGEBACK_THREAT @ 91%, but the remap saw
-#   the cancel word キャンセル and auto-cancelled the trial + replied. The
-#   customer wanted the 1990円 cross-sale charge reversed and had threatened
-#   to report to the authorities; a human ultimately refunded it.
-#
-# Bias note: over-detecting a threat here only sends a ticket to a human that
-# might have been auto-cancelled (mild cost). UNDER-detecting auto-handles a
-# real legal/chargeback threat (severe cost). So the list leans toward
-# explicit threat vocabulary, not soft complaint tone.
-_EXPLICIT_LEGAL_THREAT_SIGNALS = [
-    # ── Japanese ──
-    "通報",              # report (to the authorities / police)
-    "当局",              # the authorities
-    "消費者センター",    # consumer affairs center (escalation body)
-    "消費生活センター",  # consumer affairs center (variant)
-    "国民生活センター",  # national consumer affairs center
-    "消費者庁",          # Consumer Affairs Agency
-    "弁護士",            # lawyer
-    "訴え",              # sue / lawsuit (訴える / 訴えます / 訴訟)
-    "訴訟",              # litigation
-    "法的措置",          # legal action / measures
-    "法的手段",          # legal means
-    "警察",              # police
-    "被害届",            # (criminal) damage report
-    "チャージバック",    # chargeback
-    "紛争",              # (formal) dispute
-    # ── English ──
-    "chargeback",
-    "charge back",
-    "charge-back",
-    "dispute with my bank",
-    "dispute this with my bank",
-    "contact my bank",
-    "call my bank",
-    "contact my credit card",
-    "credit card company",
-    "report you",
-    "report this to",
-    "report to the authorities",
-    "the authorities",
-    "legal action",
-    "take legal",
-    "i will sue",
-    "i'll sue",
-    "lawsuit",
-    "lawyer",
-    "attorney",
-    "consumer protection",
-    "consumer affairs",
-    "the police",
-]
-
-
-def _contains_explicit_legal_threat(text: str) -> bool:
-    """Return True if text contains an EXPLICIT legal / authority / chargeback
-    threat (see _EXPLICIT_LEGAL_THREAT_SIGNALS). Such tickets must stay with a
-    human even when a cancel word is present."""
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in _EXPLICIT_LEGAL_THREAT_SIGNALS)
-
-
-def _dispute_is_really_cancellation(
-    intent: str, customer_text: str, full_text: str | None = None
-) -> bool:
-    """A CHARGEBACK_THREAT / PAYPAL_DISPUTE intent is often triggered by MILD
-    legal-threat wording ("lawyer", "訴える", "消費者センター"), which is NOT a
-    payment dispute. If the customer's actual ask is to cancel, treat it as a
-    normal cancellation — cancellation is always the priority, and any refund
-    keyword found later in the full comment thread still bounces it to a human.
-
-    EXCEPTION (fix 2026-07-25, ticket #167445): if the customer makes an
-    EXPLICIT legal / authority / chargeback threat ("I'll report you to the
-    authorities", "chargeback", "lawyer"), do NOT remap — the ticket stays
-    CHARGEBACK_THREAT / PAYPAL_DISPUTE and escalates to a human. The threat is
-    checked against `full_text` (subject + body) when provided, falling back to
-    `customer_text`; the cancel signal is still checked on `customer_text`
-    (body only) to avoid false cancel hits from system-generated subjects."""
-    if intent not in _PURE_DISPUTE_INTENTS:
-        return False
-    if not _contains_cancel_signal(customer_text):
-        return False
-    threat_text = full_text if full_text is not None else customer_text
-    if _contains_explicit_legal_threat(threat_text):
-        return False
-    return True
+def _dispute_is_really_cancellation(intent: str, customer_text: str) -> bool:
+    """A CHARGEBACK_THREAT / PAYPAL_DISPUTE intent is often triggered by legal-
+    threat wording ("lawyer", "訴える", "消費者センター"), which is NOT a payment
+    dispute. If the customer's actual ask is to cancel, treat it as a normal
+    cancellation — cancellation is always the priority, and any refund keyword
+    found later in the full comment thread still bounces it to a human."""
+    return intent in _PURE_DISPUTE_INTENTS and _contains_cancel_signal(customer_text)
 
 
 # ── Delete-account signal keywords ──────────────────────────────────── #
@@ -1892,9 +1803,7 @@ def _process(ticket_id: str) -> dict:
     # re-resolves the exact type from account data, and the refund-keyword
     # override right below still bounces it to a human if a refund is requested).
     # No cancel signal → left as-is → the pure-dispute skip escalates to a human.
-    # An EXPLICIT legal/authority/chargeback threat also blocks the remap (the
-    # threat is checked on subject + body via _all_text_for_refund).
-    if _dispute_is_really_cancellation(intent, _customer_text_only, _all_text_for_refund):
+    if _dispute_is_really_cancellation(intent, _customer_text_only):
         log.info(
             f"[{ticket_id}] {intent} but customer asks to cancel with no refund "
             f"request → treating as a normal cancellation (dispute/legal-threat "

@@ -320,47 +320,15 @@ class TestProcess:
     def test_chargeback_with_cancel_remapped_to_cancellation(
         self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
     ):
-        # Classifier over-fired CHARGEBACK_THREAT on mild wording, but the real
-        # ask is a plain cancellation with NO explicit legal threat → remap.
         _setup_zd(mock_zd, ticket=make_zendesk_ticket(
             subject="Complaint",
-            body="This charge is a problem. Please cancel my subscription right away.",
+            body="I will contact my lawyer and take legal action. Please cancel my subscription.",
         ))
         mock_woo.cancel_subscription.return_value = _woo_trial()
         result = main._process("1015")
         assert result["status"] == "success"
         assert result["dispute_remapped_from"] == "CHARGEBACK_THREAT"
         assert result["intent"] == "TRIAL_CANCELLATION"
-
-    # D4c'. CHARGEBACK_THREAT + cancel word + EXPLICIT legal/authority threat →
-    # must NOT remap → stays a pure dispute → escalate to a human, no auto-reply.
-    # Regression guard for ticket #167445 (2026-07-25): "cancel the 1990円
-    # charge, otherwise I'll report you to the Japanese authorities" was
-    # auto-cancelled + auto-replied when it should have gone to a human.
-    @patch.object(main, "log_result")
-    @patch.object(main, "validate_reply", return_value=(True, ""))
-    @patch.object(main, "generate_reply", return_value="Your trial has been cancelled.")
-    @patch.object(main, "woo")
-    @patch.object(main, "classify_ticket",
-                  return_value=_classification(intent="CHARGEBACK_THREAT", language="JP"))
-    @patch.object(main, "zendesk")
-    def test_chargeback_with_explicit_threat_not_remapped(
-        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
-    ):
-        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
-            subject="電子メール",
-            body=(
-                "199円とは別に1990円を引き落とされました。"
-                "1990円の方を速やかにキャンセルしなさい。"
-                "さもなければ、日本の当局に通報します。"
-            ),
-        ))
-        result = main._process("167445")
-        assert result["status"] == "skipped_refund_request"
-        assert "active payment dispute" in result["reason"]
-        assert "dispute_remapped_from" not in result
-        mock_woo.cancel_subscription.assert_not_called()
-        mock_zd.post_reply.assert_not_called()
 
     # D5c. CHARGEBACK_THREAT with NO cancel ask → still a pure dispute → skip to human.
     @patch.object(main, "log_result")
@@ -1339,24 +1307,10 @@ class TestRefundWouldBe:
 # ── Unit tests: _dispute_is_really_cancellation (dispute → cancellation) ───── #
 
 def test_dispute_remap_true_when_cancel_present():
-    # Mild dispute wording (classifier over-fired) + a genuine cancel ask and
-    # NO explicit legal/authority/chargeback threat → remap to cancellation.
     assert main._dispute_is_really_cancellation(
-        "CHARGEBACK_THREAT", "Please cancel my subscription immediately.") is True
+        "CHARGEBACK_THREAT", "I will sue you. Please cancel my subscription.") is True
     assert main._dispute_is_really_cancellation(
-        "PAYPAL_DISPUTE", "解約したいです。") is True
-
-
-def test_dispute_remap_false_when_explicit_threat_present():
-    # Fix 2026-07-25 (#167445): an explicit legal/authority/chargeback threat
-    # blocks the remap even when a cancel word is present.
-    assert main._dispute_is_really_cancellation(
-        "CHARGEBACK_THREAT", "I will sue you. Please cancel my subscription.") is False
-    assert main._dispute_is_really_cancellation(
-        "PAYPAL_DISPUTE", "解約したいです。弁護士に相談します。") is False
-    assert main._dispute_is_really_cancellation(
-        "CHARGEBACK_THREAT",
-        "1990円をキャンセルしなさい。さもなければ日本の当局に通報します。") is False
+        "PAYPAL_DISPUTE", "解約したいです。弁護士に相談します。") is True
 
 
 def test_dispute_remap_false_without_cancel():
