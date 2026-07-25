@@ -1423,3 +1423,62 @@ def test_get_ticket_image_attachments_filters_and_downloads():
         out = zc.get_ticket_image_attachments("1")
     assert out == [(b"PNGDATA", "image/png")]           # pdf + agent image excluded
     get.assert_called_once_with("https://x/img.png", auth=zc.auth, timeout=15)
+
+
+# ── AN-192 alt-email retry in refund lookup ───────────────────────────────── #
+
+def test_refund_alt_email_retry_finds_charges():
+    # Primary email misses in Nexus; the paying email is in the ticket text.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock()
+    def by_email(e):
+        return _nexus_two_types() if e == "paid@stripe.com" else None
+    nexus.search_subscription.side_effect = by_email
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9101", "writes@gmail.com", "REFUND_REQUEST", cls, result,
+            ticket_text="Refund the 5490 charge. My billing email is paid@stripe.com",
+            as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_lookup_email"] == "paid@stripe.com"
+    assert result["refund_reason_code"] != "NOT_FOUND_IN_NEXUS"
+
+
+def test_refund_no_alt_email_stays_not_found():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock()
+    nexus.search_subscription.return_value = None  # nothing for any email
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9102", "writes@gmail.com", "REFUND_REQUEST", cls, result,
+            ticket_text="I was charged and want a refund",  # no alt email
+            as_of_date="2026-07-24T00:00:00Z")
+    assert "refund_lookup_email" not in result
+    assert result["refund_reason_code"] == "NOT_FOUND_IN_NEXUS"
+
+
+def test_refund_primary_email_hit_skips_alt_retry():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock()
+    nexus.search_subscription.return_value = _nexus_two_types()  # primary already has charges
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9103", "writes@gmail.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund please, other@x.com",
+            as_of_date="2026-07-24T00:00:00Z")
+    assert "refund_lookup_email" not in result           # primary hit → no alt retry
+    nexus.search_subscription.assert_called_once_with("writes@gmail.com")

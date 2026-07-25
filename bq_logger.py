@@ -77,6 +77,7 @@ SCHEMA = [
     bigquery.SchemaField("refund_guard_trail",    "STRING"),   # JSON list of guard levels
     bigquery.SchemaField("refund_ocr_amount",     "STRING"),   # amount read from an attached screenshot (AN-192 OCR)
     bigquery.SchemaField("refund_ocr_source",     "STRING"),   # provenance, e.g. "screenshot"
+    bigquery.SchemaField("refund_lookup_email",   "STRING"),   # alt email that resolved the Nexus lookup (AN-192)
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -185,6 +186,7 @@ def log_result(result: dict):
             "refund_guard_trail":    result.get("refund_guard_trail") or "",
             "refund_ocr_amount":     result.get("refund_ocr_amount") or "",
             "refund_ocr_source":     result.get("refund_ocr_source") or "",
+            "refund_lookup_email":   result.get("refund_lookup_email") or "",
 
             # Error
             "error":              result.get("error") or "",

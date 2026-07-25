@@ -163,12 +163,34 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     `as_of_date` = ISO date the refund window is measured from (ticket created)."""
     nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
     nexus_data = None
+
+    def _has_charges(d):
+        return bool(d and isinstance(d.get("charges"), list) and d.get("charges"))
+
     if nexus_available:
         try:
             nexus_data = nexus_client.search_subscription(email)  # read-only
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund eval: Nexus lookup error: {e}")
             nexus_data = None
+
+        # Alt-email retry: the customer often writes from a different address than
+        # they paid with (contact-form / PayPal). Nexus searches by the ONE email
+        # we pass, so a primary miss can hide a real, refundable charge. Retry with
+        # any other emails mentioned in the ticket text (same mechanism the cancel
+        # flow already uses). Read-only; strictly additive.
+        if not _has_charges(nexus_data):
+            for alt in _extract_emails(ticket_text or "", exclude=email)[:3]:
+                try:
+                    alt_data = nexus_client.search_subscription(alt)
+                except Exception as e:  # noqa: BLE001
+                    log.warning(f"[{ticket_id}] refund eval: alt-email lookup error: {e}")
+                    continue
+                if _has_charges(alt_data):
+                    nexus_data = alt_data
+                    result["refund_lookup_email"] = alt
+                    log.info(f"[{ticket_id}] refund eval: found charges via alt email {alt}")
+                    break
 
     # ── OCR fallback: amount only in an attached screenshot ──────────────── #
     # If the customer stated NO amount in the text but attached an image (a
