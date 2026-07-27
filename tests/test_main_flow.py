@@ -1510,6 +1510,94 @@ def test_refund_primary_email_hit_skips_alt_retry():
     nexus.search_subscription.assert_called_once_with("writes@gmail.com")
 
 
+# ── AN-192 refund reply: shadow draft + gated send ────────────────────────── #
+
+def _refund_reply_ctx(nexus_charges):
+    """Common patches for the refund-reply wiring tests."""
+    nexus = MagicMock()
+    nexus.search_subscription.return_value = {"charges": nexus_charges}
+    return nexus
+
+
+_REPORT_CHARGE = [{"charge_id": "c1", "type": "cross_sale", "amount": 1990,
+                   "currency": "JPY", "status": "success", "refundable": True,
+                   "date": "2026-07-20"}]
+_SUB_CHARGE = [{"charge_id": "s1", "type": "renewal", "amount": 5490,
+                "currency": "JPY", "status": "success", "refundable": True,
+                "date": "2026-07-22"}]
+
+_AUTO_CODES = {"WOULD_BE_REFUNDED", "REPORT_NOT_REFUNDABLE_PER_TOS", "OUTSIDE_REFUND_WINDOW"}
+
+
+def test_refund_reply_drafted_but_NOT_sent_when_disabled():
+    # SAFETY: with REFUNDS_ENABLED=false the bot drafts + logs the reply but
+    # posts NOTHING to the customer.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", False), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "BRAND_NAME", "IQ Booster"), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9200", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund the report", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "REPORT_NOT_REFUNDABLE_PER_TOS"
+    assert result.get("refund_draft_reply") == "DRAFT"   # drafted + logged
+    assert "refund_reply_sent" not in result             # never marked sent
+    zd.post_reply.assert_not_called()                    # SAFETY: nothing posted
+
+
+def test_refund_reply_sent_when_enabled_for_deny():
+    # With REFUNDS_ENABLED=true a deterministic DENY (no money movement) posts.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "BRAND_NAME", "IQ Booster"), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9201", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund the report", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "REPORT_NOT_REFUNDABLE_PER_TOS"
+    assert result.get("refund_reply_sent") is True
+    zd.post_reply.assert_called_once_with("9201", "DRAFT")
+
+
+def test_refund_approved_reply_NOT_sent_without_execution():
+    # Even with REFUNDS_ENABLED=true, an APPROVED refund does NOT post its
+    # "processed" reply unless the money actually moved (no-op stub → never).
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_SUB_CHARGE)
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "BRAND_NAME", "IQ Booster"), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9202", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund my subscription", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_decision"] == "YES"
+    assert result.get("refund_draft_reply") == "DRAFT"   # drafted + logged
+    zd.post_reply.assert_not_called()                    # not executed → not sent
+
+
 # ── AN-192 LLM disambiguation on AMBIGUOUS residual ───────────────────────── #
 
 def _nexus_sub_plus_fee(sub_date="2026-07-22"):
