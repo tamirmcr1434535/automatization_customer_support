@@ -181,7 +181,23 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         # any other emails mentioned in the ticket text (same mechanism the cancel
         # flow already uses). Read-only; strictly additive.
         if not _has_charges(nexus_data):
-            for alt in _extract_emails(ticket_text or "", exclude=email)[:3]:
+            # Widen the alt-email net to public customer comments, not just
+            # subject+body. On contact-form / messaging refund tickets the paying
+            # email the customer names ("別のメールアドレス …@docomo", "I paid with
+            # …") frequently lands in a FOLLOW-UP comment, which the eval's
+            # ticket_text (subject + description) doesn't include — so the retry
+            # never saw it and the ticket stayed NOT_FOUND even though the charge
+            # existed under that email. (3-day audit 2026-07-27: 7 of 25 genuine
+            # NOT_FOUND misses had the charge under an email present only in a
+            # comment.) Same source the cancel flow already searches; best-effort.
+            _alt_text = ticket_text or ""
+            try:
+                _cc = zendesk.get_all_customer_comments_text(ticket_id)
+                if isinstance(_cc, str) and _cc:
+                    _alt_text = f"{_alt_text}\n{_cc}"
+            except Exception:  # noqa: BLE001 — best-effort widening; never blocks
+                pass
+            for alt in _extract_emails(_alt_text, exclude=email)[:3]:
                 try:
                     alt_data = nexus_client.search_subscription(alt)
                 except Exception as e:  # noqa: BLE001
