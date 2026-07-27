@@ -1448,6 +1448,32 @@ def test_refund_alt_email_retry_finds_charges():
     assert result["refund_reason_code"] != "NOT_FOUND_IN_NEXUS"
 
 
+def test_refund_alt_email_from_comments_finds_charges():
+    # Primary email misses; the paying email is ONLY in a follow-up customer
+    # comment (not in subject/description) — the eval must still find it.
+    # (3-day audit 2026-07-27: 7 NOT_FOUND misses had this exact shape.)
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock()
+    def by_email(e):
+        return _nexus_two_types() if e == "paid@stripe.com" else None
+    nexus.search_subscription.side_effect = by_email
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        zd.get_all_customer_comments_text.return_value = (
+            "another email paid@stripe.com — that's my billing address"
+        )
+        main._refund_would_be_eval(
+            "9104", "writes@gmail.com", "REFUND_REQUEST", cls, result,
+            ticket_text="Refund the 5490 charge please",  # NO alt email in body
+            as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_lookup_email"] == "paid@stripe.com"
+    assert result["refund_reason_code"] != "NOT_FOUND_IN_NEXUS"
+
+
 def test_refund_no_alt_email_stays_not_found():
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}
