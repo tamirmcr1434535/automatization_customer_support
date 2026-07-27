@@ -1482,3 +1482,52 @@ def test_refund_primary_email_hit_skips_alt_retry():
             as_of_date="2026-07-24T00:00:00Z")
     assert "refund_lookup_email" not in result           # primary hit → no alt retry
     nexus.search_subscription.assert_called_once_with("writes@gmail.com")
+
+
+# ── AN-192 LLM disambiguation on AMBIGUOUS residual ───────────────────────── #
+
+def _nexus_sub_plus_fee(sub_date="2026-07-22"):
+    return {"subscription_id": "1", "source": "stripe", "charges": [
+        {"charge_id": "ch_sub", "amount": 5490, "currency": "JPY", "type": "subscription",
+         "status": "success", "refundable": True, "date": sub_date},
+        {"charge_id": "ch_fee", "amount": 199, "currency": "JPY", "type": "first_sale",
+         "status": "success", "refundable": True, "date": "2026-07-15"},
+    ]}
+
+
+def test_llm_disambiguation_resolves_ambiguous_to_yes():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock(); nexus.search_subscription.return_value = _nexus_sub_plus_fee()
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.refund_disambiguate, "is_enabled", return_value=True), \
+         patch.object(main.refund_disambiguate, "pick_target_charge_id", return_value="ch_sub"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9201", "u@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund everything except the first payment",
+            as_of_date="2026-07-25T00:00:00Z")
+    assert result["refund_disambig_charge"] == "ch_sub"
+    assert result["refund_decision"] == "YES"        # sub @07-22, JPY 8d window, 3d → within
+    assert result["refund_flow"] == "flow1_subscription"
+
+
+def test_llm_abstain_leaves_ambiguous():
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock(); nexus.search_subscription.return_value = _nexus_sub_plus_fee()
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.refund_disambiguate, "is_enabled", return_value=True), \
+         patch.object(main.refund_disambiguate, "pick_target_charge_id", return_value=None):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9202", "u@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="what are these charges?", as_of_date="2026-07-25T00:00:00Z")
+    assert "refund_disambig_charge" not in result
+    assert result["refund_reason_code"] == "AMBIGUOUS_FLOW"

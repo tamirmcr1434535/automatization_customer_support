@@ -40,6 +40,7 @@ import functions_framework
 from classifier import classify_ticket
 import refund_engine
 import refund_ocr
+import refund_disambiguate
 from refund_client import RefundClient
 from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
@@ -228,6 +229,25 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         ticket_text=eff_text,
     )
     decision = refund_engine.decide(ctx, REFUND_CONFIG)
+
+    # ── LLM flow disambiguation on the AMBIGUOUS residual ────────────────── #
+    # The engine couldn't pick a flow. Ask the LLM which charge the customer is
+    # disputing (as a human would), feed it back as a routing hint, and re-run
+    # the PURE engine — window/type rules still decide YES/NO, so this can't
+    # create a within-window false YES; an abstain leaves it AMBIGUOUS → human.
+    try:
+        if (decision.reason_code == refund_engine.RC_AMBIGUOUS_FLOW
+                and refund_disambiguate.is_enabled()):
+            _charges = (nexus_data or {}).get("charges") or []
+            picked = refund_disambiguate.pick_target_charge_id(eff_text, _charges)
+            if picked:
+                result["refund_disambig_charge"] = picked
+                ctx.preferred_charge_id = picked
+                decision = refund_engine.decide(ctx, REFUND_CONFIG)
+                log.info(f"[{ticket_id}] LLM disambiguated AMBIGUOUS_FLOW → charge {picked} "
+                         f"→ {decision.reason_code}")
+    except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
+        log.warning(f"[{ticket_id}] refund disambiguation failed (non-blocking): {e}")
 
     # Map onto result (refund_* keys → bq_logger + slack). Additive only.
     result["refund_decision"]              = "YES" if decision.would_be_refunded else "NO"

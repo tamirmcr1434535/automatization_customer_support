@@ -78,6 +78,7 @@ SCHEMA = [
     bigquery.SchemaField("refund_ocr_amount",     "STRING"),   # amount read from an attached screenshot (AN-192 OCR)
     bigquery.SchemaField("refund_ocr_source",     "STRING"),   # provenance, e.g. "screenshot"
     bigquery.SchemaField("refund_lookup_email",   "STRING"),   # alt email that resolved the Nexus lookup (AN-192)
+    bigquery.SchemaField("refund_disambig_charge","STRING"),   # LLM-picked disputed charge_id on AMBIGUOUS (AN-192)
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -187,6 +188,7 @@ def log_result(result: dict):
             "refund_ocr_amount":     result.get("refund_ocr_amount") or "",
             "refund_ocr_source":     result.get("refund_ocr_source") or "",
             "refund_lookup_email":   result.get("refund_lookup_email") or "",
+            "refund_disambig_charge": result.get("refund_disambig_charge") or "",
 
             # Error
             "error":              result.get("error") or "",

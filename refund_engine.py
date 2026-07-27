@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v11"  # v11: treat Nexus type="renewal" as a subscription charge (flow #1)
+ENGINE_VERSION = "wb-flow12-v12"  # v12: honor LLM-disambiguated preferred_charge_id on AMBIGUOUS residual
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -101,6 +101,7 @@ class RefundContext:
     nexus_available: bool = False
     nexus_data: Optional[dict] = None     # includes "charges", "subscription_id", "source"
     ticket_text: str = ""                 # subject + body — for informational amount logging
+    preferred_charge_id: Optional[str] = None  # LLM-disambiguated target charge (routes flow only)
 
 
 @dataclass
@@ -485,6 +486,18 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
             if typed is not None:
                 target_type = typed
                 trail.append("type_routed")
+
+        if target_type is None and ctx.preferred_charge_id:
+            # E0: an LLM disambiguator (main.py, on AMBIGUOUS only) picked the charge the
+            # customer is disputing. Use it to pick the FLOW (type) only — the window/type
+            # rules below still decide YES/NO, so this cannot manufacture a within-window
+            # false YES. Only honored for a refundable charge actually on the account.
+            pc = next((c for c in refundable
+                       if str(c.get("charge_id")) == str(ctx.preferred_charge_id)), None)
+            g = _type_group(pc) if pc is not None else None
+            if g:
+                target_type = g
+                trail.append("llm_disambiguated")
 
         if target_type is None and subs and _mentions_unauthorized_recurring(ctx.ticket_text):
             # E: unauthorized/surprise-recurring complaint + a subscription is present →

@@ -414,3 +414,38 @@ def test_renewal_plus_one_time_routes_to_renewal_by_amount():
     charges = [_renewal("ch_r", 5490, "2026-07-18"), _first(cid="ch_fee", amount=199, dt="2026-07-10")]
     d = decide(_ctx(nexus_data=_data(charges), ticket_text="refund my 5490円 charge"), CFG)
     assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
+
+
+# ── LLM disambiguation hint: preferred_charge_id (v12) ────────────────────── #
+
+def test_preferred_charge_routes_subscription_within_window():
+    charges = [_sub("ch_sub", 5490, "2026-07-18"), _report(cid="ch_rep", amount=1990),
+               _first(cid="ch_fee", amount=199)]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund",
+                    preferred_charge_id="ch_sub"), CFG)
+    assert d.would_be_refunded is True and d.refund_flow == "flow1_subscription"
+    assert "llm_disambiguated" in d.guard_trail
+
+
+def test_preferred_charge_report_declines_per_tos():
+    charges = [_sub("ch_sub", 5490, "2026-07-18"), _report(cid="ch_rep", amount=1990)]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="please refund",
+                    preferred_charge_id="ch_rep"), CFG)
+    assert d.reason_code == re_.RC_REPORT_NOT_REFUNDABLE and "llm_disambiguated" in d.guard_trail
+
+
+def test_preferred_charge_subscription_outside_window_still_no():
+    # Safety: LLM picks the sub, but it's old → window guard says NO (no false YES).
+    charges = [_sub("ch_old", 5490, "2026-06-20"), _report(cid="ch_rep", amount=1990),
+               _first(cid="ch_fee", amount=199)]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-25T00:00:00Z",
+                    ticket_text="refund", preferred_charge_id="ch_old"), CFG)
+    assert d.would_be_refunded is False and d.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW
+    assert "llm_disambiguated" in d.guard_trail
+
+
+def test_preferred_charge_unknown_id_ignored_stays_ambiguous():
+    charges = [_sub("ch_sub", 5490, "2026-07-18"), _report(cid="ch_rep", amount=1990)]
+    d = decide(_ctx(nexus_data=_data(charges), ticket_text="refund",
+                    preferred_charge_id="ch_does_not_exist"), CFG)
+    assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "llm_disambiguated" not in d.guard_trail
