@@ -31,16 +31,27 @@ def is_enabled() -> bool:
     return os.getenv("REFUND_DISAMBIG_ENABLED", "true").lower() == "true"
 
 
+_PROMPT_VERSION = "disambig-v2"  # v2: unauthorized/recurring dispute with no stated amount → subscription
+
 _SYSTEM = (
     "You route customer refund tickets. You are given the ticket text and the list "
     "of charges on the customer's account. Decide which SINGLE charge the customer "
-    "is asking to be refunded / disputing. Customers often list the charges they "
-    "ACCEPT (e.g. a small one-time test fee) and separately dispute the recurring "
-    "subscription - pick the DISPUTED one, not the accepted one. "
+    "is asking to be refunded / disputing, and reply with its id.\n"
+    "Rules:\n"
+    "1. Customers often list the charges they ACCEPT (e.g. a small one-time test or "
+    "report fee) and separately dispute the recurring subscription — pick the "
+    "DISPUTED one, not the accepted one.\n"
+    "2. If the customer complains about an UNAUTHORIZED / unrecognized / unexpected / "
+    "did-not-agree / didn't-sign-up charge, about repeated or recurring charges they "
+    "want stopped, or asks to cancel a subscription and be refunded, AND the account "
+    "has a subscription or renewal charge, then the disputed charge IS that "
+    "subscription — pick the MOST RECENT charge of type 'subscription' or 'renewal'. "
+    "Not stating an amount is NOT a reason to abstain.\n"
+    "3. Abstain only when the message is a pure question / asks only for an "
+    "explanation, contains no dispute or refund request at all, or the ticket text is "
+    "empty / just a placeholder with no real content.\n"
     'Reply ONLY with a compact JSON object: {"charge_id": "<id>"} using an id from '
-    'the list, or {"charge_id": null} if you cannot tell with confidence. Never '
-    "guess; abstain (null) when the ticket is a general question, asks only for an "
-    "explanation, or genuinely doesn't identify a charge."
+    'the list, or {"charge_id": null} to abstain.'
 )
 
 
