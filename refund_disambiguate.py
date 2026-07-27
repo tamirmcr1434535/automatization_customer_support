@@ -50,8 +50,9 @@ _SYSTEM = (
     "3. Abstain only when the message is a pure question / asks only for an "
     "explanation, contains no dispute or refund request at all, or the ticket text is "
     "empty / just a placeholder with no real content.\n"
-    'Reply ONLY with a compact JSON object: {"charge_id": "<id>"} using an id from '
-    'the list, or {"charge_id": null} to abstain.'
+    'Reply with the JSON object ONLY — no explanation, reasoning, or extra text: '
+    '{"charge_id": "<id>"} using an id from the list, or {"charge_id": null} to '
+    "abstain. The very first character of your reply must be '{'."
 )
 
 
@@ -105,7 +106,13 @@ def pick_target_charge_id(ticket_text: str, charges) -> str | None:
         user = f"Ticket:\n{ticket_text}\n\nCharges:\n{lines}"
         resp = _client.messages.create(
             model=_MODEL,
-            max_tokens=120,
+            # Headroom so a reply that reasons in prose before the JSON still
+            # reaches the closing brace. At 120 tokens the model occasionally
+            # narrated its reasoning and got truncated BEFORE emitting any JSON,
+            # so `_parse_charge_id` found no object and we abstained by mistake
+            # (seen on real messaging tickets, e.g. #167946 ~2-in-5 runs). The
+            # JSON itself is tiny; the extra budget only matters on the prose runs.
+            max_tokens=512,
             system=_SYSTEM,
             messages=[{"role": "user", "content": user}],
         )
