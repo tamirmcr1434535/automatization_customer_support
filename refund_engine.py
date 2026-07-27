@@ -452,14 +452,17 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         trail.append("found")
         if not charges:
             return _decision(False, RC_NOT_FOUND_IN_NEXUS,
-                             "No charges found in Nexus for this customer.", trail, **common)
+                             "No charge found in Nexus for this email — may be under another email, "
+                             "paid via PayPal, or not yet loaded. Human should look it up.",
+                             trail, **common)
 
         # 4. Refundable charges + route to the right flow (A: by stated amount → C: else human).
         trail.append("refundable")
         refundable = [c for c in charges if _is_refundable(c)]
         if not refundable:
             return _decision(False, RC_NOTHING_REFUNDABLE,
-                             "Charges exist but none are refundable (already refunded).",
+                             "Charges exist but none are refundable (already refunded or failed) "
+                             "— nothing left to refund.",
                              trail, candidate_charges=_charges_summary(charges), **common)
         subs    = [c for c in refundable if _is_subscription(c)]
         reports = [c for c in refundable if str(c.get("type", "")).lower() == "cross_sale"]
@@ -516,8 +519,8 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
 
         if target_type is None:                       # G: still ambiguous → human decides
             return _decision(False, RC_AMBIGUOUS_FLOW,
-                             "Multiple refundable charge types, no amount/date/type-word "
-                             "to disambiguate — human decides.",
+                             "Customer has more than one refundable charge type (Sale / Report / "
+                             "Subscription) and the message doesn't say which to refund — human decides.",
                              trail, candidate_charges=_charges_summary(refundable), **common)
         trail.append(f"route:{target_type}")
 
@@ -526,7 +529,8 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
             rep = max(reports, key=lambda c: (_charge_date(c) or date.min))
             note = " (also cancel active subscription)" if any(_is_subscription(c) for c in charges) else ""
             return _decision(False, RC_REPORT_NOT_REFUNDABLE,
-                             f"IQ Test Report fee is non-refundable per Terms of Use{note}.",
+                             f"Report charge (cross-sale = IQ Test Report) is non-refundable "
+                             f"per Terms of Use — always NO{note}.",
                              trail, refund_flow="flow2_report",
                              candidate_charge_id=rep.get("charge_id"), charge_type="cross_sale",
                              candidate_charges=_charges_summary(reports), **common)
@@ -534,7 +538,9 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         # ── Flow #3 — IQ Test fee (first_sale): not designed yet → human ──
         if target_type == "first_sale":
             return _decision(False, RC_ONE_TIME_OUT_OF_SCOPE,
-                             "IQ Test fee (first_sale) — refund flow not implemented yet; human handles.",
+                             "Sale charge (first-sale = IQ Test fee) — one-time purchase. The bot "
+                             "doesn't auto-refund one-time charges; a human decides (may still refund "
+                             "as goodwill). Not a hard policy NO like the Report.",
                              trail, refund_flow="flow3_pending",
                              candidate_charges=_charges_summary(firsts), **common)
 
@@ -544,7 +550,7 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         cdate, adate = _charge_date(target), _parse_iso_date(ctx.as_of_date)
         if cdate is None or adate is None:
             return _decision(False, RC_WINDOW_UNKNOWN,
-                             "Cannot determine charge/ticket date to check the refund window.",
+                             "Missing charge or ticket date — can't check the refund window; human decides.",
                              trail, refund_flow="flow1_subscription",
                              candidate_charge_id=target.get("charge_id"),
                              candidate_charges=_charges_summary(subs), **common)
@@ -561,16 +567,16 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         )
         if days > window:
             return _decision(False, RC_OUTSIDE_REFUND_WINDOW,
-                             f"Last subscription payment is {days}d old > {window}d window "
-                             f"({wsrc}) — previous months are non-refundable.",
+                             f"Subscription (renewal) is outside the refund window: this charge is "
+                             f"{days}d old > {window}d limit ({wsrc}) — only the latest renewal within "
+                             f"the window is refundable; earlier months never.",
                              trail, candidate_charges=_charges_summary(subs), **base, **common)
 
         trail.append("would_be")
         return _decision(
             True, RC_WOULD_BE_REFUNDED,
-            f"Would be refunded (Nexus-only, disputes NOT checked): latest subscription "
-            f"{amt}{(' ' + str(cur)) if cur else ''} charge {target.get('charge_id')} "
-            f"({days}d ago, within {window}d {wsrc} window).",
+            f"Latest subscription (renewal) {amt}{(' ' + str(cur)) if cur else ''} is within the "
+            f"{window}d {wsrc} refund window (charged {days}d ago) → would refund this charge.",
             trail, **base, **common,
         )
 
