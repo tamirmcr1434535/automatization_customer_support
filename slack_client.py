@@ -264,10 +264,18 @@ class SlackClient:
             amt = result.get("refund_amount")
             cur = result.get("refund_currency") or ""
             amt_s = f" ({amt} {cur})".rstrip() if amt else ""
-            detail_lines.append(
+            wb_line = (
                 f"*Would be refunded (Nexus-only, disputes NOT checked):* "
                 f"{rd} — `{rc}`{amt_s}"
             )
+            # Surface the engine's plain-language explanation of the reason code
+            # (already computed, e.g. "Last subscription payment is 54d old > 8d
+            # window — previous months are non-refundable") so a reviewer sees WHY
+            # without decoding the code or the guard trail.
+            hm = (result.get("refund_human_message") or "").strip()
+            if hm:
+                wb_line += f"\n> _{hm[:300]}_"
+            detail_lines.append(wb_line)
         if result.get("reason"):
             detail_lines.append(f"*Reason:* {str(result['reason'])[:400]}")
         if result.get("validation_fail_reason"):

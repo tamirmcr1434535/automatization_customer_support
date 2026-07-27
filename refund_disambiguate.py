@@ -70,6 +70,14 @@ def _charges_lines(charges) -> str:
     return "\n".join(out)
 
 
+def _is_refundable(charge) -> bool:
+    """Mirror of refund_engine._is_refundable (kept local so this module stays
+    dependency-free / fail-closed). `refundable` flag wins; else status success."""
+    if "refundable" in charge:
+        return charge.get("refundable") is True
+    return str(charge.get("status", "")).lower() == "success"
+
+
 def _parse_charge_id(text: str, valid_ids: set) -> str | None:
     if not text:
         return None
@@ -96,6 +104,16 @@ def pick_target_charge_id(ticket_text: str, charges) -> str | None:
     try:
         if not is_enabled() or not ticket_text or not charges:
             return None
+        # Only offer REFUNDABLE charges. The engine honors a picked charge only if
+        # it's refundable (routes flow by its type); a pick of a failed / already-
+        # refunded charge is silently dropped → the ticket falls back to
+        # AMBIGUOUS_FLOW even though a refundable charge existed. Worse, "pick the
+        # MOST RECENT renewal" (system rule 2) can land on a recent FAILED renewal
+        # that shadows an older in-window refundable one. Filtering here makes the
+        # pick actionable and deterministic. (Live #168524: LLM sometimes picked a
+        # failed 07-22 renewal → dropped → AMBIGUOUS; the real answer is the 06-03
+        # refundable renewal → OUTSIDE_WINDOW NO.)
+        charges = [c for c in charges if _is_refundable(c)]
         valid_ids = {str(c.get("charge_id") or c.get("id")) for c in charges
                      if (c.get("charge_id") or c.get("id"))}
         if len(valid_ids) < 2:
