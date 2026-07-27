@@ -63,3 +63,13 @@ def test_exception_fails_closed():
 def test_empty_inputs():
     assert dis.pick_target_charge_id("", CHARGES) is None
     assert dis.pick_target_charge_id("refund", []) is None
+
+
+def test_max_tokens_headroom():
+    # Regression: at max_tokens=120 a reply that reasoned in prose before the
+    # JSON got truncated pre-brace → spurious abstain (real ticket #167946).
+    # Guard the budget so the closing brace is always reachable.
+    with patch.object(dis._client.messages, "create",
+                      return_value=_resp('{"charge_id":"ch_sub"}')) as m:
+        dis.pick_target_charge_id("refund the recurring charge", CHARGES)
+        assert m.call_args.kwargs["max_tokens"] >= 400
