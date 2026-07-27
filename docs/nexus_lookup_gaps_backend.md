@@ -134,3 +134,54 @@ loader lag currently hides the very charge the customer is disputing.
 `search_subscription(email)` includes that renewal within minutes; re-running the
 refund audit, the `ONE_TIME`/`OUTSIDE_WINDOW`→`refund_approved` mismatches driven by
 missing recent renewals drop toward zero.
+
+## UPDATE 2026-07-27 — 3-day audit: 25 `NOT_FOUND_IN_NEXUS` where the human refunded
+
+Simulated the current prod engine (`wb-flow12-v12`, rev `00350-wtt`) on **all 496
+refund tickets** created in the last 3 days (Zendesk `refund_approved` ∪
+`refund_denied`). Of the 76 "bot NO → human approved" misses, **29 were
+`NOT_FOUND_IN_NEXUS`**. Re-probing Nexus live, **4 were transient (`search-subscription`
+30 s timeout during the run → treated as not-found)** and **25 genuinely return
+nothing for the requester email** even though the CS agent found a charge and
+refunded. The 25 split by cause (each verified: alt-emails in the ticket were
+re-probed against Nexus; payment-method inferred from the ticket text):
+
+| Cause | N | Owner | Example tickets (requester email → what they were charged) |
+|---|---:|---|---|
+| **Email mismatch — paying email is IN the ticket** | 7 | **Bot-side** | 167012 `yabiku370@gmail.com` → charge under `top-secret422@ymail.ne.jp`; 168063 → `kamunagara_road@yahoo.co.jp`; 167435 → `toranomekurayami@docomo.ne.jp` (states "別のメールアドレス"); 167024 → `chantal_ster@hotmail.nl`; 166866, 166607, 168365 |
+| **PayPal charge not indexed** | 4 | Backend | 167050 (DE, PayPal €29,99), 167156 (JP, PayPal ¥5490), 167378 (JP, "PayPalにも連絡します"), 166569 (JP ¥5490) |
+| **Apple Pay / Google Pay (IAP)** | 2 | Backend | 167434 (Apple Pay, IQ Booster), 168376 (NL, monthly €30 via Google) |
+| **Carrier email, paying email absent** | 2 | Backend | 168294 `…@docomo.ne.jp` (¥5490), 167511 `…@ezweb.ne.jp` (楽天カード ¥5490) |
+| **No charge resolvable by any email in the ticket / one-time-only** | 10 | Backend | 166997 (NL, €2,99 one-time — in the original evidence); 167309 (KR, states alt `swoo91@hanmail.net`, still not indexed, ₩39,900); 166766 (KR, KakaoPay); 167355 (MyPersonality brand); 167142, 167017, 168203, 168056, 166528, 167460 |
+
+### What this changes vs. the earlier evidence
+- The original doc's 4 examples (167012, 167050, 167156, 166997) **all reappear**
+  in this 3-day set → the gap is **recurring and stable**, not a one-off. This is
+  the "proven, repeating example" the acceptance section asked for.
+- **7 of the 25 are actually bot-side, not backend:** the paying email is present
+  in the ticket (in the "Request Description" custom field or a public comment),
+  but the would-be eval's alt-email retry only scans `subject + description`, so it
+  never sees it. **Bot fix:** broaden `_refund_would_be_eval`'s alt-email source to
+  include the Request Description field and public customer comments (the same text
+  the classifier already reads). Tracked separately from this backend ticket.
+- The remaining **18 are backend** and map onto the root causes already listed:
+  PayPal-by-contact-email indexing (4), IAP/Apple-Google charges absent (2, new
+  sub-category), carrier-email customers whose paying address never appears (2),
+  and customers with **no charge resolvable by any email they gave / one-time-only**
+  (10 — includes stated-but-unindexed alt emails like 167309 and Korean payment
+  methods).
+
+### Ask (backend), in priority order
+1. **PayPal charges** returned by `search-subscription` keyed to the account/contact
+   email (not only the PayPal payer email) — `provider="paypal"` already in the v2 spec.
+2. **Apple Pay / Google Pay (IAP) charges** included in `charges[]` (with provider),
+   so the engine can at least see and route them. NB: IAP refunds are usually issued
+   by Apple/Google, not the merchant — returning them lets the bot *explain* that
+   instead of a blind NOT_FOUND.
+3. **Account-level resolution:** resolve a customer by any linked / normalized email,
+   and **return one-time-only customers** (a `charges[]` with only
+   `first_sale`/`cross_sale`, no subscription) instead of an empty response.
+
+**Data for backend:** per-ticket detail (requester email, alt emails probed, cause,
+cited amount, text snippet) is in the audit scratchpad `notfound25.json`; can be
+exported to a sheet on request.
