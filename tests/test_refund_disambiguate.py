@@ -65,6 +65,36 @@ def test_empty_inputs():
     assert dis.pick_target_charge_id("refund", []) is None
 
 
+def test_non_refundable_charges_excluded_from_pick():
+    # Only refundable charges are offered: a most-recent FAILED renewal must not be
+    # pickable (it would be dropped by the engine → spurious AMBIGUOUS). (Live #168524.)
+    charges = [
+        {"charge_id": "ch_fail", "amount": 5490, "currency": "JPY", "type": "renewal",
+         "status": "failed", "date": "2026-07-22", "refundable": False},
+        {"charge_id": "ch_ok", "amount": 5490, "currency": "JPY", "type": "renewal",
+         "status": "success", "date": "2026-06-03", "refundable": True},
+        {"charge_id": "ch_fs", "amount": 199, "currency": "JPY", "type": "first_sale",
+         "status": "success", "date": "2026-04-29", "refundable": True},
+    ]
+    # Even if the model names the failed charge, it isn't a valid id → rejected.
+    with patch.object(dis._client.messages, "create", return_value=_resp('{"charge_id":"ch_fail"}')):
+        assert dis.pick_target_charge_id("unauthorized recurring charge, refund", charges) is None
+    # A refundable pick still works.
+    with patch.object(dis._client.messages, "create", return_value=_resp('{"charge_id":"ch_ok"}')):
+        assert dis.pick_target_charge_id("unauthorized recurring charge, refund", charges) == "ch_ok"
+
+
+def test_single_refundable_charge_no_llm_call():
+    # After filtering to refundable, only one remains → nothing to disambiguate.
+    charges = [
+        {"charge_id": "ch_fail", "type": "renewal", "status": "failed", "refundable": False},
+        {"charge_id": "ch_ok", "type": "renewal", "status": "success", "refundable": True},
+    ]
+    with patch.object(dis._client.messages, "create") as m:
+        assert dis.pick_target_charge_id("refund", charges) is None
+        m.assert_not_called()
+
+
 def test_max_tokens_headroom():
     # Regression: at max_tokens=120 a reply that reasoned in prose before the
     # JSON got truncated pre-brace → spurious abstain (real ticket #167946).
