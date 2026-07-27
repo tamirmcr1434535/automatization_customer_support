@@ -79,6 +79,9 @@ SCHEMA = [
     bigquery.SchemaField("refund_ocr_source",     "STRING"),   # provenance, e.g. "screenshot"
     bigquery.SchemaField("refund_lookup_email",   "STRING"),   # alt email that resolved the Nexus lookup (AN-192)
     bigquery.SchemaField("refund_disambig_charge","STRING"),   # LLM-picked disputed charge_id on AMBIGUOUS (AN-192)
+    bigquery.SchemaField("refund_draft_reply",    "STRING"),   # SHADOW: customer reply the bot WOULD send (not sent unless REFUNDS_ENABLED)
+    bigquery.SchemaField("refund_reply_template", "STRING"),   # which template produced the draft (reason code)
+    bigquery.SchemaField("refund_reply_sent",     "BOOLEAN"),  # TRUE only if actually posted to the customer
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -189,6 +192,9 @@ def log_result(result: dict):
             "refund_ocr_source":     result.get("refund_ocr_source") or "",
             "refund_lookup_email":   result.get("refund_lookup_email") or "",
             "refund_disambig_charge": result.get("refund_disambig_charge") or "",
+            "refund_draft_reply":    result.get("refund_draft_reply") or "",
+            "refund_reply_template": result.get("refund_reply_template") or "",
+            "refund_reply_sent":     bool(result.get("refund_reply_sent", False)),
 
             # Error
             "error":              result.get("error") or "",

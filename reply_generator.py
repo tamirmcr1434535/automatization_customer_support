@@ -275,3 +275,112 @@ def english_fallback_reply(intent: str, cancel_result: dict) -> str:
     return _master_sub_cancel()
 
 
+# ── AN-192 refund reply templates (would-be / shadow) ──────────────────── #
+# English master templates for the refund decisions we auto-answer, reconstructed
+# faithfully from real agent replies (audit 2026-07-27). Same translate-not-generate
+# pipeline as cancellations. These are DRAFTS pending Anna's canonical wording.
+#
+# SAFETY: generating a draft here NEVER sends anything. The caller (main.py) logs
+# the draft to BigQuery for shadow comparison and only posts to the customer when
+# REFUNDS_ENABLED=true (and, for an APPROVED refund, only when the money movement
+# actually executed — which is a no-op stub today).
+
+# Reason codes we produce a customer draft for. Everything else → human, no draft.
+REFUND_AUTOREPLY_CODES = {
+    "WOULD_BE_REFUNDED",
+    "REPORT_NOT_REFUNDABLE_PER_TOS",
+    "OUTSIDE_REFUND_WINDOW",
+}
+
+
+def _fmt_amount(amount, currency: str) -> str:
+    a = str(amount) if amount is not None else ""
+    c = (currency or "").strip()
+    return f"{a} {c}".strip() if a else (c or "the charge")
+
+
+def _master_refund_approved(d: dict) -> str:
+    amt = _fmt_amount(d.get("refund_amount"), d.get("currency"))
+    brand = d.get("brand", BRAND_NAME)
+    pdate = d.get("purchase_date")
+    order_line = f"Order date: {pdate}\n\n" if pdate else ""
+    return (
+        "Hello,\n\n"
+        "Thank you for reaching out, and we appreciate your patience while we "
+        "looked into this.\n\n"
+        f"{order_line}"
+        "Refund status:\n"
+        f"- Your {brand} subscription has been cancelled — no further charges will be made.\n"
+        f"- Your refund of {amt} has been approved and processed to your original payment "
+        "method. Depending on your bank or card provider, it may take up to 10 business "
+        "days to appear.\n\n"
+        "If you have any further questions, please don't hesitate to contact us."
+    )
+
+
+def _master_refund_report_not_refundable(d: dict) -> str:
+    brand = d.get("brand", BRAND_NAME)
+    price = d.get("report_price")  # display-ready (already carries its symbol)
+    price_ref = f"the {price} charge" if price else "this charge"
+    return (
+        "Hello,\n\n"
+        "Thank you for reaching out, and we're sorry for any confusion.\n\n"
+        f"Having re-checked your order, {price_ref} is for the IQ Test Report — an optional "
+        "one-time purchase shown on a separate screen after the test, and charged only when "
+        "it is manually confirmed. Our records show the purchase was confirmed and the report "
+        "was delivered immediately.\n\n"
+        "As this is digital content delivered instantly, it is not eligible for a refund under "
+        "our Terms of Use and Refund Policy.\n\n"
+        f"Your {brand} free-trial subscription has already been cancelled, so no further "
+        "charges will be made.\n\n"
+        "If you have any other questions, we're happy to help."
+    )
+
+
+def _master_refund_outside_window(d: dict) -> str:
+    brand = d.get("brand", BRAND_NAME)
+    window = d.get("window_days")
+    window_ref = f"the {window}-day refund window" if window else "our refund window"
+    renewal = d.get("renewal_price")  # display-ready (already carries its symbol)
+    renew_line = (
+        f"After the trial, the {brand} plan automatically renewed at {renewal}, as shown on "
+        "the checkout page.\n\n"
+        if renewal else ""
+    )
+    return (
+        "Hello,\n\n"
+        "Thank you for reaching out, and we understand there may have been some confusion.\n\n"
+        f"{renew_line}"
+        "Please note we do not charge any currency-exchange or transaction fees — any "
+        "difference on your statement would come from your bank or card provider.\n\n"
+        "Subscription & refund status:\n"
+        "- Your subscription has been cancelled — no further charges will be made.\n"
+        f"- Refund for past charges: the service was already provided and the charge is beyond "
+        f"{window_ref}, so it is not eligible for a refund.\n\n"
+        "If you have any questions, please don't hesitate to contact us."
+    )
+
+
+_REFUND_MASTERS = {
+    "WOULD_BE_REFUNDED": _master_refund_approved,
+    "REPORT_NOT_REFUNDABLE_PER_TOS": _master_refund_report_not_refundable,
+    "OUTSIDE_REFUND_WINDOW": _master_refund_outside_window,
+}
+
+
+def refund_master_reply(reason_code: str, data: dict) -> str | None:
+    """English master refund reply for `reason_code`, or None if we don't auto-answer it."""
+    builder = _REFUND_MASTERS.get(reason_code)
+    return builder(data or {}) if builder else None
+
+
+def generate_refund_reply(reason_code: str, language: str, data: dict) -> str | None:
+    """Localised refund draft for `reason_code`, or None if not an auto-reply code.
+    Pure text generation — sends nothing. FAIL-SOFT: on translation failure the
+    English master is returned (same policy as cancellations)."""
+    master = refund_master_reply(reason_code, data)
+    if master is None:
+        return None
+    return _translate(master, language)
+
+

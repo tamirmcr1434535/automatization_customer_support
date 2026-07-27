@@ -47,6 +47,7 @@ from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
 from slack_client import SlackClient
 import ticket_merger
+import reply_generator
 from reply_generator import (
     generate_reply,
     validate_reply,
@@ -151,6 +152,30 @@ REFUND_CONFIG = refund_engine.RefundConfig(
 )
 # Money-op boundary. STUB only — never moves money on this branch (see refund_client.py).
 refund_client = RefundClient(provider="nexus", enabled=REFUNDS_ENABLED)
+
+
+# ── AN-192 refund reply: prices per currency (from the Legal/Pricing sheet) ── #
+# Used only to fill draft placeholders (report/renewal/trial line). Approximate —
+# the exact charged amount comes from Nexus; this is the published list price.
+_REFUND_PRICES = {
+    "JPY": {"trial": "¥199",     "renewal": "¥5,490",     "report": "¥1,990"},
+    "EUR": {"trial": "€1.90",    "renewal": "€29.99",     "report": "€9.99"},
+    "USD": {"trial": "$4.99",    "renewal": "$29.99",     "report": "$9.99"},
+    "KRW": {"trial": "₩4,990",   "renewal": "₩39,990",    "report": "₩19,990"},
+    "TRY": {"trial": "₺49,00",   "renewal": "₺1.290,00",  "report": "₺399,00"},
+    "NOK": {"trial": "19,00 kr", "renewal": "299,00 kr",  "report": "99,00 kr"},
+    "SEK": {"trial": "15,00 kr", "renewal": "299,00 kr",  "report": "99,00 kr"},
+}
+
+
+def _parse_window_days(trail) -> "int | None":
+    """Pull the country window (days) out of a guard-trail marker like
+    'window[currency=8d,age=54d]'. Returns None if absent."""
+    for t in trail or []:
+        m = re.search(r"window\[[^=]*=(\d+)d", str(t))
+        if m:
+            return int(m.group(1))
+    return None
 
 
 def _refund_would_be_eval(ticket_id, email, intent, classification, result,
@@ -285,6 +310,46 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         f"[{ticket_id}] would_be_refunded={result['refund_decision']} "
         f"reason={decision.reason_code} charge={decision.candidate_charge_id}"
     )
+
+    # ── AN-192 refund reply: shadow draft + gated send ───────────────────── #
+    # For the reason codes we auto-answer, build the customer-facing draft and log
+    # it (BigQuery `refund_draft_reply`) so we can compare it against what a human
+    # actually sends. The draft is POSTED to the customer ONLY when REFUNDS_ENABLED
+    # is true — and for an APPROVED refund, only when the money movement actually
+    # executed (a no-op stub today, so approved never posts). While REFUNDS_ENABLED
+    # is false the customer receives NOTHING; everything still goes to a human.
+    try:
+        rc = decision.reason_code
+        if rc in reply_generator.REFUND_AUTOREPLY_CODES:
+            prices = _REFUND_PRICES.get((decision.currency or "").upper(), {})
+            draft = reply_generator.generate_refund_reply(
+                rc, classification.get("language", "EN"),
+                {
+                    "brand": reply_generator.BRAND_NAME,
+                    "refund_amount": decision.computed_amount,
+                    "currency": decision.currency,
+                    "window_days": _parse_window_days(decision.guard_trail),
+                    "report_price": prices.get("report"),
+                    "renewal_price": prices.get("renewal"),
+                    "trial_price": prices.get("trial"),
+                },
+            )
+            if draft:
+                result["refund_draft_reply"] = draft
+                result["refund_reply_template"] = rc
+                executed = bool(result.get("refund_executed"))
+                send_ok = REFUNDS_ENABLED and (rc != "WOULD_BE_REFUNDED" or executed)
+                if send_ok:
+                    zendesk.post_reply(ticket_id, draft)
+                    result["refund_reply_sent"] = True
+                    log.info(f"[{ticket_id}] refund reply POSTED to customer ({rc})")
+                else:
+                    log.info(
+                        f"[{ticket_id}] refund reply drafted + logged, NOT sent "
+                        f"(REFUNDS_ENABLED={REFUNDS_ENABLED}, {rc})"
+                    )
+    except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
+        log.warning(f"[{ticket_id}] refund reply draft failed (non-blocking): {e}")
 
     # REFUNDS_ENABLED is inert on this branch: there is NO live refund path.
     # Even if true, nothing here calls refund_client.create_refund to execute.
