@@ -1,6 +1,16 @@
 """Unit tests for the AN-192 refund reply templates (reply_generator).
 EN language → _translate is a no-op, so no Claude call is made."""
-import reply_generator as rg
+import os
+import importlib.util
+
+# test_main_flow installs a MagicMock for `reply_generator` in sys.modules; load the
+# REAL module from source under a unique name so this test is order-independent.
+_spec = importlib.util.spec_from_file_location(
+    "reply_generator_under_test",
+    os.path.join(os.path.dirname(__file__), "..", "reply_generator.py"),
+)
+rg = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rg)
 
 
 def test_report_template_mentions_non_refundable():
