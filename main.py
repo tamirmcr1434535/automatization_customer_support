@@ -145,6 +145,16 @@ TEST_TAG           = "automation_test"
 # It is inert today (no live path exists) and does NOT affect the would-be
 # computation, which always runs. Default false.
 REFUNDS_ENABLED       = os.getenv("REFUNDS_ENABLED", "false").lower() == "true"
+
+# SOFT START (canary) — per-brand allowlist on top of the master switch.
+# REFUNDS_ENABLED_BRANDS is a comma-separated list of brand keys (see _brand_key).
+#   - master REFUNDS_ENABLED=false → OFF for every brand (nothing sent), always.
+#   - master true + list EMPTY     → ON for all brands (back-compat single toggle).
+#   - master true + list SET       → ON only for the listed brands, OFF for the rest.
+# Lets us switch one small brand live first without touching the others.
+REFUNDS_ENABLED_BRANDS = {
+    b.strip().lower() for b in os.getenv("REFUNDS_ENABLED_BRANDS", "").split(",") if b.strip()
+}
 REFUND_MIN_CONFIDENCE = float(os.getenv("REFUND_MIN_CONFIDENCE", "0.90"))
 REFUND_CONFIG = refund_engine.RefundConfig(
     min_confidence=REFUND_MIN_CONFIDENCE,
@@ -152,6 +162,36 @@ REFUND_CONFIG = refund_engine.RefundConfig(
 )
 # Money-op boundary. STUB only — never moves money on this branch (see refund_client.py).
 refund_client = RefundClient(provider="nexus", enabled=REFUNDS_ENABLED)
+
+# Brand key ← unambiguous domain marker in the contact-form footer / body.
+# Order: most specific first. "unknown" → never in an allowlist → stays OFF (safe).
+_BRAND_MARKERS = (
+    ("16types",           ("16types.ai",)),
+    ("16personas",        ("16persons.com", "16personas.com")),
+    ("iqbooster",         ("iqbooster.org",)),
+    ("iqpro",             ("iqpro.ai",)),
+    ("wwpersonalitytest", ("wwpersonalitytest.com", "mypersonality.")),
+    ("wwiqtest",          ("wwiqtest.com",)),
+)
+
+
+def _brand_key(text: str) -> str:
+    """Resolve the brand from a ticket's text via its site domain. 'unknown' if none."""
+    t = (text or "").lower()
+    for key, markers in _BRAND_MARKERS:
+        if any(m in t for m in markers):
+            return key
+    return "unknown"
+
+
+def refunds_enabled_for(brand: str) -> bool:
+    """Whether refund replies may actually be SENT for `brand` (soft-start gate).
+    Master kill-switch wins; empty allowlist = all brands; else only listed brands."""
+    if not REFUNDS_ENABLED:
+        return False
+    if not REFUNDS_ENABLED_BRANDS:
+        return True
+    return (brand or "").lower() in REFUNDS_ENABLED_BRANDS
 
 
 # ── AN-192 refund reply: prices per currency (from the Legal/Pricing sheet) ── #
@@ -337,16 +377,20 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             if draft:
                 result["refund_draft_reply"] = draft
                 result["refund_reply_template"] = rc
+                brand = _brand_key(ticket_text)
+                result["refund_brand"] = brand
                 executed = bool(result.get("refund_executed"))
-                send_ok = REFUNDS_ENABLED and (rc != "WOULD_BE_REFUNDED" or executed)
+                # Soft-start gate: brand must be enabled; APPROVED also needs the
+                # money to have actually moved (no-op stub today → never).
+                send_ok = refunds_enabled_for(brand) and (rc != "WOULD_BE_REFUNDED" or executed)
                 if send_ok:
                     zendesk.post_reply(ticket_id, draft)
                     result["refund_reply_sent"] = True
-                    log.info(f"[{ticket_id}] refund reply POSTED to customer ({rc})")
+                    log.info(f"[{ticket_id}] refund reply POSTED to customer (brand={brand}, {rc})")
                 else:
                     log.info(
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
-                        f"(REFUNDS_ENABLED={REFUNDS_ENABLED}, {rc})"
+                        f"(brand={brand}, refunds_enabled_for={refunds_enabled_for(brand)}, {rc})"
                     )
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
         log.warning(f"[{ticket_id}] refund reply draft failed (non-blocking): {e}")

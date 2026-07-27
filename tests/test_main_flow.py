@@ -1598,6 +1598,66 @@ def test_refund_approved_reply_NOT_sent_without_execution():
     zd.post_reply.assert_not_called()                    # not executed → not sent
 
 
+# ── AN-192 soft-start per-brand gate ──────────────────────────────────────── #
+
+def test_brand_key_resolution():
+    assert main._brand_key("… contact form on WW IQ TEST (https://jap.wwiqtest.com)") == "wwiqtest"
+    assert main._brand_key("sent from 16types.ai") == "16types"
+    assert main._brand_key("info@iqbooster.org login") == "iqbooster"
+    assert main._brand_key("no domain here") == "unknown"
+
+
+def test_refunds_enabled_for_gate():
+    # master off → always off, even with an allowlist
+    with patch.object(main, "REFUNDS_ENABLED", False), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", {"16types"}):
+        assert main.refunds_enabled_for("16types") is False
+    # master on + empty allowlist → all brands on (back-compat)
+    with patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()):
+        assert main.refunds_enabled_for("wwiqtest") is True
+    # master on + allowlist → only listed brand on
+    with patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", {"16types"}):
+        assert main.refunds_enabled_for("16types") is True
+        assert main.refunds_enabled_for("wwiqtest") is False
+        assert main.refunds_enabled_for("unknown") is False
+
+
+def test_refund_reply_sent_only_for_enabled_brand():
+    # Canary: refunds enabled ONLY for the ticket's brand → posts; other brand → not.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    def run(brand_domain):
+        result = {}
+        with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+             patch.object(main, "nexus_client", nexus), \
+             patch.object(main, "REFUNDS_ENABLED", True), \
+             patch.object(main, "REFUNDS_ENABLED_BRANDS", {"wwiqtest"}), \
+             patch.object(main, "zendesk") as zd, \
+             patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+             patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+             patch.object(main.reply_generator, "BRAND_NAME", "IQ Booster"), \
+             patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+            zd.get_ticket_image_attachments.return_value = []
+            main._refund_would_be_eval(
+                "9300", "x@e.com", "REFUND_REQUEST", cls, result,
+                ticket_text=f"refund the report — sent from {brand_domain}",
+                as_of_date="2026-07-24T00:00:00Z")
+            return result, zd
+    # enabled brand → posted
+    res_on, zd_on = run("https://jap.wwiqtest.com")
+    assert res_on.get("refund_reply_sent") is True
+    assert res_on.get("refund_brand") == "wwiqtest"
+    zd_on.post_reply.assert_called_once()
+    # different brand (not in allowlist) → drafted + logged, NOT posted
+    res_off, zd_off = run("https://16types.ai")
+    assert "refund_reply_sent" not in res_off
+    assert res_off.get("refund_brand") == "16types"
+    assert res_off.get("refund_draft_reply") == "DRAFT"   # still logged for shadow
+    zd_off.post_reply.assert_not_called()
+
+
 # ── AN-192 LLM disambiguation on AMBIGUOUS residual ───────────────────────── #
 
 def _nexus_sub_plus_fee(sub_date="2026-07-22"):

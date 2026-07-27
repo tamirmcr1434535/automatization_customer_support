@@ -82,6 +82,7 @@ SCHEMA = [
     bigquery.SchemaField("refund_draft_reply",    "STRING"),   # SHADOW: customer reply the bot WOULD send (not sent unless REFUNDS_ENABLED)
     bigquery.SchemaField("refund_reply_template", "STRING"),   # which template produced the draft (reason code)
     bigquery.SchemaField("refund_reply_sent",     "BOOLEAN"),  # TRUE only if actually posted to the customer
+    bigquery.SchemaField("refund_brand",          "STRING"),   # resolved brand (soft-start per-brand gate)
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -195,6 +196,7 @@ def log_result(result: dict):
             "refund_draft_reply":    result.get("refund_draft_reply") or "",
             "refund_reply_template": result.get("refund_reply_template") or "",
             "refund_reply_sent":     bool(result.get("refund_reply_sent", False)),
+            "refund_brand":          result.get("refund_brand") or "",
 
             # Error
             "error":              result.get("error") or "",
