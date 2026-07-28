@@ -238,11 +238,21 @@ def _refund_xhost(brand: str) -> str:
 
 # ── Amount guard: standard renewal price per currency (from the Pricing sheet).
 # An auto-refund's charge must be a non-zero amount within ±20% of this — anything
-# else (0/null, or an anomalous amount) is escalated to a human. ── #
+# else (0/null, an unknown currency, or an anomalous amount) is escalated to a
+# human (fail-safe: an unlisted currency can NEVER auto-approve). New brand
+# currencies can be added without a code change via REFUND_RENEWAL_PRICE_MAP
+# (JSON, e.g. {"IDR": 149000, "VND": 199000}) — values merge over these defaults. ── #
 _RENEWAL_PRICE = {
     "JPY": 5490.0, "EUR": 29.99, "USD": 29.99, "KRW": 39990.0,
     "TRY": 1290.0, "NOK": 299.0, "SEK": 299.0,
 }
+try:
+    _RENEWAL_PRICE.update({
+        str(k).upper(): float(v)
+        for k, v in json.loads(os.getenv("REFUND_RENEWAL_PRICE_MAP", "") or "{}").items()
+    })
+except (ValueError, TypeError):
+    log.warning("REFUND_RENEWAL_PRICE_MAP is not valid JSON — using defaults")
 _REFUND_AMOUNT_BAND = float(os.getenv("REFUND_AMOUNT_BAND", "0.20"))
 
 
@@ -447,11 +457,19 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             if _det is not None:
                 result["refund_charge_disputed"] = bool(_det.get("disputed"))
                 result["refund_charge_refundable"] = _det.get("refundable")
+                result["refund_charge_refunded_at"] = _det.get("refunded_at")
                 _override = None
                 if _det.get("disputed"):
                     _override = ("REFUND_DISPUTE_OPEN",
                                  "Open dispute/chargeback on the charge — cannot refund; a human must handle.")
-                elif _det.get("refundable") is False:
+                elif _det.get("refundable") is False or _det.get("refunded_at"):
+                    # Double-refund guard: block if the charge is flagged non-refundable
+                    # OR already carries a refunded_at timestamp. We must NOT rely on the
+                    # `refundable` flag alone — if a prior refund (e.g. from a separate
+                    # ticket about the same charge) left `refundable` stale-true while
+                    # stamping refunded_at, checking only `refundable` would let a SECOND
+                    # refund through. refunded_at is the authoritative "already refunded"
+                    # signal, so one payment can never be refunded twice here.
                     _override = ("REFUND_NOT_REFUNDABLE",
                                  "The charge is not refundable (already refunded / blocked) — a human must handle.")
                 elif decision.reason_code == "WOULD_BE_REFUNDED":
@@ -465,6 +483,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                                         reason_code=_override[0], human_message=_override[1])
                     log.info(f"[{ticket_id}] refund guard: charge {_cand} → override → {decision.reason_code} "
                              f"(disputed={_det.get('disputed')} refundable={_det.get('refundable')} "
+                             f"refunded_at={_det.get('refunded_at')} "
                              f"amount={_det.get('amount')} {_det.get('currency')})")
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
         log.warning(f"[{ticket_id}] refund guard failed (non-blocking): {e}")
@@ -538,12 +557,23 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # is configured (REFUND_API_*). In prod both are off → nothing moves.
                 # On dev (REFUND_API_* set + REFUNDS_ENABLED=true) it really refunds.
                 if rc == "WOULD_BE_REFUNDED" and refunds_enabled_for(brand):
-                    _ref = refund_client.create_refund(
-                        charge_id=decision.candidate_charge_id, x_host=_refund_xhost(brand))
-                    result["refund_execution_status"] = _ref.get("status")
-                    result["refund_executed"] = bool(_ref.get("executed"))
-                    log.info(f"[{ticket_id}] refund execution: {_ref.get('status')} "
-                             f"(amount={_ref.get('refunded_amount')})")
+                    # x-host safety: PROD enforces x-host per brand. If we could not
+                    # resolve one (unknown / unmapped brand), we do NOT know which
+                    # brand scope the money move would hit — so refuse to auto-execute
+                    # and leave it to a human instead of refunding against a wrong /
+                    # default scope. (A resolved-but-wrong x-host is a backend config
+                    # question, not detectable here.)
+                    if not _refund_xhost(brand):
+                        result["refund_execution_status"] = "skipped_no_xhost"
+                        log.warning(f"[{ticket_id}] refund NOT executed — no x-host resolved "
+                                    f"for brand={brand!r}; leaving to a human")
+                    else:
+                        _ref = refund_client.create_refund(
+                            charge_id=decision.candidate_charge_id, x_host=_refund_xhost(brand))
+                        result["refund_execution_status"] = _ref.get("status")
+                        result["refund_executed"] = bool(_ref.get("executed"))
+                        log.info(f"[{ticket_id}] refund execution: {_ref.get('status')} "
+                                 f"(amount={_ref.get('refunded_amount')})")
                 executed = bool(result.get("refund_executed"))
                 # Soft-start gate: brand must be enabled; APPROVED also needs the
                 # money to have actually moved (no-op stub unless dev API configured).

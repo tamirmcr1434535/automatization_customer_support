@@ -133,8 +133,20 @@ class TestWooCommerceConnectivity:
             )
 
     def test_dry_run_cancel_does_not_call_api(self, woo_client):
-        """DRY_RUN cancel must return dry_run status without any PUT call."""
-        result = woo_client.cancel_subscription("dryrun@example.com")
+        """DRY_RUN cancel must return dry_run status without any write (PUT) call.
+
+        Hermetic: the WC reads are mocked so this verifies the DRY_RUN contract
+        deterministically without depending on a live server or a real
+        cancellable email. (Previously this hit the real WC with a fake email
+        and flaked to not_found/api_error whenever the integration module got
+        un-skipped by env priming leaking from the unit tests.)
+        """
+        from tests.test_woocommerce_client import wc_http
+        from tests.conftest import make_wc_customer, make_wc_subscription
+
+        active_sub = make_wc_subscription(days_since_start=3)
+        with wc_http({"customers": [make_wc_customer()], "subscriptions": [active_sub]}):
+            result = woo_client.cancel_subscription("dryrun@example.com")
         assert result["status"] == "dry_run"
         assert result["cancelled"] is True
         print(f"\n  ✅ DRY_RUN cancel returned: {result}")

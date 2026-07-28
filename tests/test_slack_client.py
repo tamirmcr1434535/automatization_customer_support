@@ -3,13 +3,17 @@ Unit tests for SlackClient
 ===========================
 All HTTP calls are mocked — no real Slack messages sent.
 
+SlackClient sends DMs via a Slack **bot token** (not a webhook):
+  users.lookupByEmail (GET) → conversations.open (POST) → chat.postMessage (POST).
+`notify_ticket_result` is the per-ticket report used by the bot.
+
 Scenarios:
   1. DRY_RUN — no HTTP call, returns True
-  2. Successful send — POST called once, returns True
-  3. Slack API error (non-200) — returns False, no exception raised
-  4. Network timeout — returns False, no exception raised
-  5. Message contains ticket URL with correct subdomain
-  6. Message contains email and intent
+  2. Successful send — chat.postMessage called, returns True
+  3. Slack API error (chat.postMessage ok:false) — returns False, no exception
+  4. Network exception during lookup — returns False, no exception
+  5. Message contains the ticket URL with the correct subdomain
+  6. Message contains the email and intent
 """
 
 import pytest
@@ -19,10 +23,57 @@ import requests
 from slack_client import SlackClient
 
 
+_RESULT = {
+    "status": "manual_review_required",
+    "intent": "TRIAL_CANCELLATION",
+    "email": "user@test.com",
+    "language": "EN",
+    "confidence": 0.92,
+}
+
+
 def make_client(dry_run=False):
     return SlackClient(
-        webhook_url="https://hooks.slack.com/services/TEST/TEST/TEST",
+        bot_token="xoxb-test-token",
+        target_email="ops@example.com",
         dry_run=dry_run,
+    )
+
+
+def slack_http(user_ok=True, open_ok=True, post_ok=True, get_exc=None, capture=None):
+    """Patch the three Slack HTTP seams onto URL-routed fakes.
+
+    users.lookupByEmail → GET; conversations.open + chat.postMessage → POST.
+    `capture`, if given, collects each chat.postMessage JSON payload.
+    `get_exc`, if given, is raised from the users.lookupByEmail GET.
+    """
+    def fake_get(url, **kwargs):
+        if get_exc is not None:
+            raise get_exc
+        r = MagicMock()
+        r.json.return_value = (
+            {"ok": True, "user": {"id": "U1"}} if user_ok
+            else {"ok": False, "error": "users_not_found"}
+        )
+        return r
+
+    def fake_post(url, **kwargs):
+        r = MagicMock()
+        if url.endswith("conversations.open"):
+            r.json.return_value = (
+                {"ok": True, "channel": {"id": "D1"}} if open_ok
+                else {"ok": False, "error": "cannot_dm_bot"}
+            )
+        else:  # chat.postMessage
+            if capture is not None:
+                capture.append(kwargs.get("json", {}))
+            r.json.return_value = {"ok": True} if post_ok else {"ok": False, "error": "channel_not_found"}
+        return r
+
+    return patch.multiple(
+        "slack_client.requests",
+        get=MagicMock(side_effect=fake_get),
+        post=MagicMock(side_effect=fake_post),
     )
 
 
@@ -30,75 +81,61 @@ def make_client(dry_run=False):
 
 def test_dry_run_returns_true_without_http_call():
     client = make_client(dry_run=True)
-    with patch("slack_client.requests.post") as mock_post:
-        result = client.notify_manual_review("1234", "user@test.com", "TRIAL_CANCELLATION", "wwiqtest")
+    with patch("slack_client.requests.get") as mock_get, \
+         patch("slack_client.requests.post") as mock_post:
+        result = client.notify_ticket_result("1234", _RESULT, "wwiqtest")
         assert result is True
+        mock_get.assert_not_called()
         mock_post.assert_not_called()
 
 
 # ── 2. Successful send ────────────────────────────────────────────────────── #
 
-@patch("slack_client.requests.post")
-def test_successful_send(mock_post):
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status.return_value = None
-    mock_post.return_value = mock_resp
-
+def test_successful_send():
+    cap: list = []
     client = make_client()
-    result = client.notify_manual_review("1234", "user@test.com", "TRIAL_CANCELLATION", "wwiqtest")
-
+    with slack_http(capture=cap):
+        result = client.notify_ticket_result("1234", _RESULT, "wwiqtest")
     assert result is True
-    mock_post.assert_called_once()
+    assert len(cap) == 1          # chat.postMessage fired exactly once
 
 
-# ── 3. Slack API error ────────────────────────────────────────────────────── #
+# ── 3. Slack API error (chat.postMessage ok:false) ───────────────────────── #
 
-@patch("slack_client.requests.post")
-def test_slack_api_error_returns_false(mock_post):
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status.side_effect = requests.exceptions.HTTPError("400 Bad Request")
-    mock_post.return_value = mock_resp
-
+def test_slack_api_error_returns_false():
     client = make_client()
-    result = client.notify_manual_review("1234", "user@test.com", "SUB_CANCELLATION", "wwiqtest")
-
+    with slack_http(post_ok=False):
+        result = client.notify_ticket_result("1234", _RESULT, "wwiqtest")
     assert result is False
 
 
-# ── 4. Network timeout ────────────────────────────────────────────────────── #
+# ── 4. Network exception during lookup → False (no raise) ─────────────────── #
 
-@patch("slack_client.requests.post", side_effect=requests.exceptions.Timeout)
-def test_network_timeout_returns_false(mock_post):
+def test_network_timeout_returns_false():
     client = make_client()
-    result = client.notify_manual_review("1234", "user@test.com", "SUB_CANCELLATION", "wwiqtest")
+    with slack_http(get_exc=requests.exceptions.Timeout("boom")):
+        result = client.notify_ticket_result("1234", _RESULT, "wwiqtest")
     assert result is False
 
 
-# ── 5. Message contains correct ticket URL ────────────────────────────────── #
+# ── 5. Message contains ticket URL with correct subdomain ─────────────────── #
 
-@patch("slack_client.requests.post")
-def test_message_contains_ticket_url(mock_post):
-    mock_post.return_value = MagicMock()
-    mock_post.return_value.raise_for_status.return_value = None
-
+def test_message_contains_ticket_url():
+    cap: list = []
     client = make_client()
-    client.notify_manual_review("9999", "x@x.com", "TRIAL_CANCELLATION", "wwiqtest")
-
-    payload = mock_post.call_args.kwargs.get("json") or mock_post.call_args[1].get("json")
-    payload_str = str(payload)
-    assert "9999" in payload_str
-    assert "wwiqtest.zendesk.com" in payload_str
+    with slack_http(capture=cap):
+        client.notify_ticket_result("1234", _RESULT, "mysub")
+    text = cap[0]["text"]
+    assert "https://mysub.zendesk.com/agent/tickets/1234" in text
 
 
-# ── 6. Message contains email and intent ─────────────────────────────────── #
+# ── 6. Message contains email and intent ──────────────────────────────────── #
 
-@patch("slack_client.requests.post")
-def test_message_contains_email_and_intent(mock_post):
-    mock_post.return_value = MagicMock()
-    mock_post.return_value.raise_for_status.return_value = None
-
+def test_message_contains_email_and_intent():
+    cap: list = []
     client = make_client()
-    client.notify_manual_review("1234", "customer@example.com", "SUB_CANCELLATION", "wwiqtest")
-
-    payload_str = str(mock_post.call_args)
-    assert "customer@example.com" in payload_str
+    with slack_http(capture=cap):
+        client.notify_ticket_result("1234", _RESULT, "wwiqtest")
+    text = cap[0]["text"]
+    assert "user@test.com" in text
+    assert "TRIAL_CANCELLATION" in text

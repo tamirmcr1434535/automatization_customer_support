@@ -12,20 +12,39 @@ def make_wc_subscription(
     sub_id: int = 101,
     status: str = "active",
     trial_days_from_now: int = 0,
+    days_since_start: int | None = None,
     plan_name: str = "IQ Test Monthly",
 ) -> dict:
-    """Build a fake WooCommerce subscription dict."""
+    """Build a fake WooCommerce subscription dict.
+
+    Args:
+        sub_id: WooCommerce subscription ID.
+        status: WooCommerce subscription status.
+        trial_days_from_now: If > 0, sets trial_end_date_gmt to N days in the future
+            (simulates an active trial via the fallback path when no start_date_gmt).
+        days_since_start: If provided, sets start_date_gmt to N days in the past.
+            This is the primary signal used by _get_sub_type:
+              - days_since_start ≤ 8  → trial  (with order_count ≤ 1)
+              - days_since_start > 8  → subscription
+        plan_name: Line item name.
+    """
     if trial_days_from_now > 0:
         trial_end = (datetime.now(timezone.utc) + timedelta(days=trial_days_from_now)).isoformat()
     else:
         trial_end = "0000-00-00 00:00:00"
 
-    return {
+    sub: dict = {
         "id": sub_id,
         "status": status,
         "trial_end_date_gmt": trial_end,
         "line_items": [{"name": plan_name}],
     }
+
+    if days_since_start is not None:
+        start_dt = datetime.now(timezone.utc) - timedelta(days=days_since_start)
+        sub["start_date_gmt"] = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+
+    return sub
 
 
 def make_wc_customer(customer_id: int = 42, email: str = "test@example.com") -> dict:

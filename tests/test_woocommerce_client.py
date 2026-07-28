@@ -47,63 +47,73 @@ def make_client(dry_run=False):
     )
 
 
-def mock_get(responses: dict):
+def wc_http(responses: dict, put_status: int = 200):
+    """Unified HTTP stand-in patched onto EVERY seam the WC client uses.
+
+    The client mixes seams: customer + subscription lookups and the cancel PUT
+    go through requests.request (via _request_with_retry); the health check,
+    orders and order-count use requests.get directly. Patching only requests.get
+    (as the old tests did) let the customer lookup leak to the real network. We
+    route requests.request / requests.get / requests.put through one URL-based
+    dispatcher so no step can ever hit the network.
+
+    `responses` maps a URL substring → JSON payload:
+      {"customers": [...], "subscriptions": [...], "orders": [...]}
+    A PUT (the cancel write) returns `put_status`.
     """
-    Build a requests.get mock that dispatches based on URL substring.
-    `responses` maps URL substring → return value (list or dict).
+    def _respond(method: str, url: str):
+        r = MagicMock()
+        r.ok = True
+        r.status_code = 200
+        r.reason = "OK"
+        r.text = "OK"
+        r.headers.get.return_value = None  # no X-WP-Total → len() fallback
 
-    Handles the /orders endpoint BEFORE /subscriptions to avoid the
-    substring collision (subscriptions/101/orders contains "subscriptions").
+        if method == "PUT":  # the cancel write
+            r.status_code = put_status
+            r.ok = put_status < 400
+            r.reason = "OK" if put_status < 400 else "Error"
+            r.text = "OK" if put_status < 400 else "Error"
+            r.json.return_value = {"id": 101, "status": "cancelled"}
+            return r
 
-    The "orders" key in responses controls what the orders endpoint returns;
-    defaults to [] (no orders → order_count = 0 via len fallback).
-
-    Sets headers.get("X-WP-Total") to return None so get_order_count()
-    falls back to len(data) rather than int(MagicMock).
-    """
-    def _get(url, **kwargs):
-        mock_resp = MagicMock()
-        mock_resp.ok = True
-        mock_resp.status_code = 200
-        # Explicitly no X-WP-Total header → get_order_count() uses len(data)
-        mock_resp.headers.get.return_value = None
-
-        # Orders endpoint must be checked BEFORE "subscriptions" (substring match)
+        # /orders must be matched BEFORE /subscriptions (substring collision:
+        # ".../subscriptions/101/orders" contains "subscriptions").
         if "/orders" in url:
-            data = responses.get("orders", [])
-            mock_resp.json.return_value = data
-            return mock_resp
+            r.json.return_value = responses.get("orders", [])
+        elif "customers" in url:
+            r.json.return_value = responses.get("customers", [])
+        elif "subscriptions" in url:
+            r.json.return_value = responses.get("subscriptions", [])
+        else:
+            r.json.return_value = []
+        return r
 
-        for key, value in responses.items():
-            if key in url:
-                mock_resp.json.return_value = value
-                return mock_resp
+    def fake_request(method, url, **kwargs):
+        return _respond(str(method).upper(), url)
 
-        mock_resp.json.return_value = []
-        return mock_resp
-    return _get
+    def fake_get(url, **kwargs):
+        return _respond("GET", url)
 
+    def fake_put(url, **kwargs):
+        return _respond("PUT", url)
 
-def mock_put(status_code=200):
-    mock_resp = MagicMock()
-    mock_resp.ok = status_code < 400
-    mock_resp.status_code = status_code
-    mock_resp.text = "Error" if status_code >= 400 else "OK"
-    return mock_resp
+    return patch.multiple(
+        "woocommerce_client.requests",
+        request=MagicMock(side_effect=fake_request),
+        get=MagicMock(side_effect=fake_get),
+        put=MagicMock(side_effect=fake_put),
+    )
 
 
 # ── 1. DRY_RUN mode ───────────────────────────────────────────────────────── #
 
-@patch("woocommerce_client.requests.get")
-def test_dry_run_returns_dry_run_status(mock_get_fn):
+def test_dry_run_returns_dry_run_status():
     """DRY_RUN still performs real reads; if sub found, returns dry_run."""
     active_sub = make_wc_subscription(days_since_start=3)
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [active_sub],
-    })
     client = make_client(dry_run=True)
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [active_sub]}):
+        result = client.cancel_subscription("test@example.com")
     assert result["status"] == "dry_run"
     assert result["cancelled"] is True
     assert result["source"] == "woocommerce"
@@ -111,48 +121,32 @@ def test_dry_run_returns_dry_run_status(mock_get_fn):
 
 # ── 2. Customer not found ─────────────────────────────────────────────────── #
 
-@patch("woocommerce_client.requests.get")
-def test_customer_not_found(mock_get_fn):
-    mock_resp = MagicMock()
-    mock_resp.ok = True
-    mock_resp.json.return_value = []       # empty list → no customer
-    mock_get_fn.return_value = mock_resp
-
+def test_customer_not_found():
     client = make_client()
-    result = client.cancel_subscription("nobody@example.com")
+    with wc_http({"customers": [], "subscriptions": []}):
+        result = client.cancel_subscription("nobody@example.com")
     assert result["status"] == "not_found"
     assert result["cancelled"] is False
 
 
 # ── 3. Customer found but no subscriptions ────────────────────────────────── #
 
-@patch("woocommerce_client.requests.get")
-def test_no_subscriptions(mock_get_fn):
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [],
-    })
+def test_no_subscriptions():
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": []}):
+        result = client.cancel_subscription("test@example.com")
     assert result["status"] == "no_active_sub"
     assert result["cancelled"] is False
 
 
 # ── 4. Active trial (days ≤ 8) → trial_cancelled ──────────────────────────── #
 
-@patch("woocommerce_client.requests.put")
-@patch("woocommerce_client.requests.get")
-def test_active_trial_cancelled(mock_get_fn, mock_put_fn):
+def test_active_trial_cancelled():
     # days_since_start=3 → primary signal: 3 ≤ 8 → trial
     trial_sub = make_wc_subscription(days_since_start=3)
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [trial_sub],
-    })
-    mock_put_fn.return_value = mock_put(200)
-
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [trial_sub]}):
+        result = client.cancel_subscription("test@example.com")
     assert result["status"] == "trial_cancelled"
     assert result["cancelled"] is True
     assert result["subscription_type"] == "trial"
@@ -161,19 +155,12 @@ def test_active_trial_cancelled(mock_get_fn, mock_put_fn):
 
 # ── 5. Paid subscription (days > 8) → subscription_cancelled ─────────────── #
 
-@patch("woocommerce_client.requests.put")
-@patch("woocommerce_client.requests.get")
-def test_paid_subscription_cancelled(mock_get_fn, mock_put_fn):
+def test_paid_subscription_cancelled():
     # days_since_start=40 → 40 > 8 → subscription
     paid_sub = make_wc_subscription(days_since_start=40)
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [paid_sub],
-    })
-    mock_put_fn.return_value = mock_put(200)
-
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [paid_sub]}):
+        result = client.cancel_subscription("test@example.com")
     assert result["status"] == "subscription_cancelled"
     assert result["cancelled"] is True
     assert result["subscription_type"] == "subscription"
@@ -181,74 +168,51 @@ def test_paid_subscription_cancelled(mock_get_fn, mock_put_fn):
 
 # ── 6. Expired trial (no start_date, past trial_end) → subscription ────────── #
 
-@patch("woocommerce_client.requests.put")
-@patch("woocommerce_client.requests.get")
-def test_expired_trial_treated_as_subscription(mock_get_fn, mock_put_fn):
+def test_expired_trial_treated_as_subscription():
     """trial_end in the past + no start_date → subscription (not a trial)."""
     past = (datetime.now(timezone.utc) - timedelta(days=3)).isoformat()
     sub = make_wc_subscription()   # no days_since_start → no start_date_gmt
     sub["trial_end_date_gmt"] = past
 
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [sub],
-    })
-    mock_put_fn.return_value = mock_put(200)
-
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [sub]}):
+        result = client.cancel_subscription("test@example.com")
     assert result["subscription_type"] == "subscription"
     assert result["status"] == "subscription_cancelled"
 
 
 # ── 7. pending-cancel subscription ───────────────────────────────────────── #
 
-@patch("woocommerce_client.requests.put")
-@patch("woocommerce_client.requests.get")
-def test_pending_cancel_subscription(mock_get_fn, mock_put_fn):
+def test_pending_cancel_subscription():
     sub = make_wc_subscription(status="pending-cancel", days_since_start=40)
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [sub],
-    })
-    mock_put_fn.return_value = mock_put(200)
-
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [sub]}):
+        result = client.cancel_subscription("test@example.com")
     assert result["cancelled"] is True
 
 
 # ── 8. Cancel API returns error ───────────────────────────────────────────── #
 
-@patch("woocommerce_client.requests.put")
-@patch("woocommerce_client.requests.get")
-def test_cancel_api_error_propagated(mock_get_fn, mock_put_fn):
+def test_cancel_api_error_propagated():
     paid_sub = make_wc_subscription(days_since_start=40)
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [paid_sub],
-    })
-    mock_put_fn.return_value = mock_put(500)
-
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [paid_sub]},
+                 put_status=500):
+        result = client.cancel_subscription("test@example.com")
     assert result["cancelled"] is False
-    assert result["status"] == "error"
+    # A failed cancel PUT propagates a typed error status (a 500 → "api_error";
+    # the older code collapsed all failures to a bare "error").
+    assert result["status"] in {"api_error", "error"}
 
 
 # ── 9. Already-cancelled subscription → already_cancelled ────────────────── #
 
-@patch("woocommerce_client.requests.get")
-def test_already_cancelled_subscription(mock_get_fn):
+def test_already_cancelled_subscription():
     """If WC returns a cancelled sub (no active), bot should confirm cancellation."""
     cancelled_sub = make_wc_subscription(status="cancelled", days_since_start=40)
-    mock_get_fn.side_effect = mock_get({
-        "customers": [make_wc_customer()],
-        "subscriptions": [cancelled_sub],
-    })
-
     client = make_client()
-    result = client.cancel_subscription("test@example.com")
+    with wc_http({"customers": [make_wc_customer()], "subscriptions": [cancelled_sub]}):
+        result = client.cancel_subscription("test@example.com")
     assert result["status"] == "already_cancelled"
     assert result["cancelled"] is True
     assert result["subscription_type"] == "subscription"
