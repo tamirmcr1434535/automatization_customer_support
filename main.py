@@ -346,6 +346,37 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
         log.warning(f"[{ticket_id}] refund disambiguation failed (non-blocking): {e}")
 
+    # ── Dispute guard (charge-detail) — applies to ALL refund cases ──────── #
+    # We must NEVER refund a charge with an open dispute/chargeback (nor one the
+    # provider marks non-refundable). Read-only lookup; if the candidate charge is
+    # disputed / not refundable, OVERRIDE the decision to NO → a human handles it.
+    # Only runs when the refund API is configured (REFUND_API_* env); otherwise
+    # skipped, so prod (unconfigured) behaves exactly as before.
+    try:
+        _cand = decision.candidate_charge_id
+        if _cand and refund_client.is_configured():
+            _det = refund_client.get_charge_detail(_cand)
+            if _det is not None:
+                result["refund_charge_disputed"] = bool(_det.get("disputed"))
+                result["refund_charge_refundable"] = _det.get("refundable")
+                if _det.get("disputed") or _det.get("refundable") is False:
+                    from dataclasses import replace as _replace
+                    _disp = bool(_det.get("disputed"))
+                    decision = _replace(
+                        decision,
+                        would_be_refunded=False,
+                        reason_code=("REFUND_DISPUTE_OPEN" if _disp else "REFUND_NOT_REFUNDABLE"),
+                        human_message=(
+                            "Open dispute/chargeback on the charge — cannot refund; a human must handle."
+                            if _disp else
+                            "The charge is not refundable (already refunded / blocked) — a human must handle."
+                        ),
+                    )
+                    log.info(f"[{ticket_id}] dispute guard: charge {_cand} disputed={_disp} "
+                             f"refundable={_det.get('refundable')} → override → {decision.reason_code}")
+    except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
+        log.warning(f"[{ticket_id}] dispute guard failed (non-blocking): {e}")
+
     # Map onto result (refund_* keys → bq_logger + slack). Additive only.
     result["refund_decision"]              = "YES" if decision.would_be_refunded else "NO"
     result["refund_reason_code"]           = decision.reason_code
@@ -410,9 +441,20 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             if draft:
                 result["refund_draft_reply"] = draft
                 result["refund_reply_template"] = rc
+                # ── Refund EXECUTION (test path) ────────────────────────────── #
+                # Only fires for an approved refund on a live brand. create_refund
+                # is a no-op unless REFUNDS_ENABLED (self.enabled) AND the refund API
+                # is configured (REFUND_API_*). In prod both are off → nothing moves.
+                # On dev (REFUND_API_* set + REFUNDS_ENABLED=true) it really refunds.
+                if rc == "WOULD_BE_REFUNDED" and refunds_enabled_for(brand):
+                    _ref = refund_client.create_refund(charge_id=decision.candidate_charge_id)
+                    result["refund_execution_status"] = _ref.get("status")
+                    result["refund_executed"] = bool(_ref.get("executed"))
+                    log.info(f"[{ticket_id}] refund execution: {_ref.get('status')} "
+                             f"(amount={_ref.get('refunded_amount')})")
                 executed = bool(result.get("refund_executed"))
                 # Soft-start gate: brand must be enabled; APPROVED also needs the
-                # money to have actually moved (no-op stub today → never).
+                # money to have actually moved (no-op stub unless dev API configured).
                 send_ok = refunds_enabled_for(brand) and (rc != "WOULD_BE_REFUNDED" or executed)
                 if send_ok:
                     zendesk.post_reply(ticket_id, draft)

@@ -1645,6 +1645,65 @@ def test_refund_approved_reply_NOT_sent_without_execution():
     zd.post_reply.assert_not_called()                    # not executed → not sent
 
 
+# ── AN-192 dispute guard + refund execution (test path) ───────────────────── #
+
+def test_dispute_guard_blocks_refund_and_escalates():
+    # A WOULD_BE charge whose charge-detail shows disputed=True → overridden to NO
+    # (REFUND_DISPUTE_OPEN), no customer reply, no execution.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_SUB_CHARGE)
+    rcm = MagicMock()
+    rcm.is_configured.return_value = True
+    rcm.get_charge_detail.return_value = {"disputed": True, "refundable": False}
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "refund_client", rcm), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9500", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund my subscription", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_decision"] == "NO"
+    assert result["refund_reason_code"] == "REFUND_DISPUTE_OPEN"
+    assert result.get("refund_charge_disputed") is True
+    rcm.create_refund.assert_not_called()      # never refund a disputed charge
+    zd.post_reply.assert_not_called()          # no customer refund reply
+
+
+def test_refund_executed_when_enabled_and_clean():
+    # Clean, refundable, not-disputed WOULD_BE on a live brand → refund executes,
+    # then the approved reply is sent.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_SUB_CHARGE)
+    rcm = MagicMock()
+    rcm.is_configured.return_value = True
+    rcm.get_charge_detail.return_value = {"disputed": False, "refundable": True}
+    rcm.create_refund.return_value = {"status": "refunded", "executed": True, "refunded_amount": 5490}
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "refund_client", rcm), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9501", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund my subscription", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_decision"] == "YES"
+    rcm.create_refund.assert_called_once()
+    assert result.get("refund_executed") is True
+    assert result.get("refund_execution_status") == "refunded"
+    zd.post_reply.assert_called_once()         # executed → approved reply sent
+
+
 # ── AN-192 soft-start per-brand gate ──────────────────────────────────────── #
 
 def test_brand_key_resolution():

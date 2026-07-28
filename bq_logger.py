@@ -85,6 +85,9 @@ SCHEMA = [
     bigquery.SchemaField("refund_brand",          "STRING"),   # resolved brand (soft-start per-brand gate)
     bigquery.SchemaField("refund_internal_note",  "STRING"),   # SHADOW: agent-facing note the bot WOULD add on escalated refunds
     bigquery.SchemaField("refund_note_added",     "BOOLEAN"),  # TRUE only if the internal note was actually posted
+    bigquery.SchemaField("refund_charge_disputed","BOOLEAN"),  # dispute guard: charge-detail `disputed`
+    bigquery.SchemaField("refund_charge_refundable","BOOLEAN"),# dispute guard: charge-detail `refundable`
+    bigquery.SchemaField("refund_execution_status","STRING"),  # refund API status (refunded / rejected / would_refund)
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -201,6 +204,9 @@ def log_result(result: dict):
             "refund_brand":          result.get("refund_brand") or "",
             "refund_internal_note":  result.get("refund_internal_note") or "",
             "refund_note_added":     bool(result.get("refund_note_added", False)),
+            "refund_charge_disputed":   result.get("refund_charge_disputed"),
+            "refund_charge_refundable": result.get("refund_charge_refundable"),
+            "refund_execution_status":  result.get("refund_execution_status") or "",
 
             # Error
             "error":              result.get("error") or "",

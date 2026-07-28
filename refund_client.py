@@ -1,70 +1,107 @@
 """
-Refund client — the money-operation boundary (STUB ONLY) (AN-192)
-==================================================================
-This module is the single, auditable place where a real refund would ever be
-executed. In THIS iteration it has **no live path at all**:
+Refund client — the money-operation boundary (AN-192)
+=====================================================
+The single, auditable place where a refund can ever be executed, plus the
+read-only charge-detail lookup used to guard it.
 
-  * There is NO call to `stripe.Refund.create`.
-  * There is NO POST to any Nexus refund endpoint.
-  * `create_refund(...)` always returns a `would_refund` result with
-    `executed=False` and never moves money.
+TWO calls to the Cellon Nexus refund API (base/x-host/token from env):
 
-"Can this move money?" must be answerable by reading this one small file.
-The answer, on this branch, is: no.
+  * get_charge_detail(charge_id)  — READ ONLY. Returns the charge's
+    {disputed, refundable, refunded_at, ...}. Always safe; used to block
+    refunds on disputed / non-refundable charges. Works whenever the API is
+    configured, regardless of `enabled`.
 
-Future execution (separate, gated iteration — see docs/nexus_refund_api_spec.md)
-will route through the Nexus refund endpoint and MUST additionally require the
-deferred safety checks (Stripe/PayPal dispute check, amount cap, two-source
-verify). The insertion point is marked below. It is intentionally left as a
-no-op so that even `REFUNDS_ENABLED=true` cannot move money today.
+  * create_refund(charge_id)      — the money move. Executes ONLY when BOTH
+    `enabled` (mirrors REFUNDS_ENABLED) is true AND the API is configured.
+    Otherwise it is a NO-OP that returns executed=False and moves nothing.
+
+SAFETY: with REFUNDS_ENABLED=false (prod default) `enabled` is false, so
+create_refund never posts to the refund endpoint. The refund API itself also
+rejects disputed charges (`dispute_open`) and double refunds (`already_refunded`)
+— a second, server-side guard. "Can this move money?" is answerable here: only
+when enabled AND configured AND the charge passes both guards.
 """
 
+import os
 import logging
+
+import requests
 
 log = logging.getLogger("refund_client")
 
 
 class RefundClient:
-    """Provider-agnostic refund boundary. Execution target (future) = Nexus."""
+    """Charge-detail (read) + refund (gated) against the Nexus refund API."""
 
     def __init__(self, provider: str = "nexus", enabled: bool = False):
-        # `enabled` mirrors REFUNDS_ENABLED but is inert here — there is no live
-        # branch to enable. Kept so the future wiring reads naturally.
         self.provider = provider
-        self.enabled = enabled
+        self.enabled = enabled  # mirrors REFUNDS_ENABLED — gates create_refund only
+        self.base = os.getenv("REFUND_API_BASE_URL", "").rstrip("/")
+        self.token = os.getenv("REFUND_API_TOKEN", "").strip()
+        self.x_host = os.getenv("REFUND_API_X_HOST", "").strip()
+        self.timeout = int(os.getenv("REFUND_API_TIMEOUT", "30"))
 
-    def create_refund(
-        self,
-        *,
-        idempotency_key: str,
-        order_id: str | int | None,
-        amount,
-        currency: str,
-        reason: str = "",
-    ) -> dict:
-        """Would-be refund. NEVER executes — always returns `would_refund`.
+    def is_configured(self) -> bool:
+        """True when the charge-detail / refund API is wired (base + token)."""
+        return bool(self.base and self.token)
 
-        This deliberately has no live branch. Do not add one here without the
-        deferred safety prerequisites (dispute/PayPal/amount-cap) and an explicit
-        product decision.
-        """
-        log.info(
-            "[would_refund] provider=%s order=%s amount=%s %s (idem=%s) — NOT executed",
-            self.provider, order_id, amount, currency, idempotency_key,
-        )
+    def _headers(self, x_host: str | None) -> dict:
+        h = {"Authorization": f"Bearer {self.token}", "Content-Type": "application/json"}
+        host = (x_host or self.x_host).strip()
+        if host:
+            h["x-host"] = host
+        return h
 
-        # ── FUTURE live path goes here, gated behind REFUNDS_ENABLED *and* the
-        # deferred safety checks. Intentionally absent on this branch. ──
-        # if self.enabled and _all_deferred_safety_checks_pass(...):
-        #     return _execute_via_nexus_refund_endpoint(...)
+    def get_charge_detail(self, charge_id: str, *, x_host: str | None = None) -> dict | None:
+        """Read-only charge lookup for the dispute guard. Returns the chargeData
+        dict ({disputed, refundable, refunded_at, amount, ...}) or None on any
+        failure / not-configured. NEVER moves money; safe to call always."""
+        if not charge_id or not self.is_configured():
+            return None
+        try:
+            r = requests.post(
+                f"{self.base}/api/v1/customer/charge-detail",
+                headers=self._headers(x_host),
+                json={"charge_id": charge_id},
+                timeout=self.timeout,
+            )
+        except requests.exceptions.RequestException as e:
+            log.warning("charge-detail network error for %s: %s", charge_id, e)
+            return None
+        if r.status_code == 404:
+            return None
+        if not r.ok:
+            log.warning("charge-detail %s → HTTP %s: %s", charge_id, r.status_code, r.text[:200])
+            return None
+        try:
+            data = (r.json().get("data") or {}).get("chargeData")
+        except ValueError:
+            return None
+        return data if isinstance(data, dict) else None
 
-        return {
-            "status": "would_refund",
-            "executed": False,
-            "provider": self.provider,
-            "order_id": order_id,
-            "amount": str(amount) if amount is not None else None,
-            "currency": currency,
-            "idempotency_key": idempotency_key,
-            "reason": reason,
-        }
+    def create_refund(self, *, charge_id: str, x_host: str | None = None,
+                      idempotency_key: str = "", reason: str = "") -> dict:
+        """Execute a refund for `charge_id` — ONLY when enabled AND configured.
+        Otherwise a no-op ({executed:False}). Returns the API's data dict
+        ({status, refunded_amount, ...}) on execution."""
+        if not (self.enabled and self.is_configured()):
+            log.info("[would_refund] charge=%s — NOT executed (enabled=%s configured=%s)",
+                     charge_id, self.enabled, self.is_configured())
+            return {"status": "would_refund", "executed": False,
+                    "provider": self.provider, "charge_id": charge_id, "reason": reason}
+        try:
+            r = requests.post(
+                f"{self.base}/api/v1/customer/refund",
+                headers=self._headers(x_host),
+                json={"charge_id": charge_id},
+                timeout=self.timeout,
+            )
+            body = r.json()
+        except (requests.exceptions.RequestException, ValueError) as e:
+            log.warning("refund error for %s: %s", charge_id, e)
+            return {"status": "error", "executed": False, "charge_id": charge_id, "message": str(e)}
+        data = body.get("data") or {}
+        data["executed"] = (data.get("status") == "refunded")
+        log.info("[refund] charge=%s → status=%s refunded_amount=%s",
+                 charge_id, data.get("status"), data.get("refunded_amount"))
+        return data
