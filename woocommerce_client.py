@@ -38,6 +38,8 @@ import time
 import requests
 from datetime import datetime, timezone
 
+from nexus_client import NexusLookupError
+
 log = logging.getLogger("woocommerce")
 
 
@@ -1334,7 +1336,26 @@ class WooCommerceClient:
             base_result["country"] = country
 
         # ── Step 2: Nexus search-subscription (replaces slow WC) ──────── #
-        nexus_data = nexus_client.search_subscription(email)
+        # A transient/ambiguous Nexus failure (5xx, Cloudflare 52x,
+        # timeout, network) raises NexusLookupError — the bot did NOT get
+        # a definitive answer, so it must NOT conclude "no subscription".
+        # Return a dedicated status so main._cancel_by_email escalates
+        # like a lookup error (no customer reply) instead of telling a
+        # paying customer they have no sub.
+        try:
+            nexus_data = nexus_client.search_subscription(email)
+        except NexusLookupError as e:
+            log.error(
+                f"WC[nexus] STEP2: Nexus lookup error for {email}: {e} — "
+                "cannot determine subscription state, escalating"
+            )
+            return {
+                **base_result,
+                "status": "nexus_lookup_error",
+                "error_kind": "nexus_lookup_error",
+                "error_detail": str(e),
+                "error_step": "nexus_search_subscription",
+            }
         if nexus_data is None:
             # Nexus returned 404 / network error / 5xx. Two cases:
             # - if WC also has no customer → genuinely not found
