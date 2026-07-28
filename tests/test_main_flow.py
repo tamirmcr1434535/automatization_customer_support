@@ -307,6 +307,56 @@ class TestProcess:
         assert result["status"] == "skipped_refund_request"
         mock_zd.post_reply.assert_not_called()
 
+    # D5c. Unauthorized-signup, STOP-FUTURE-ONLY → auto-cancel (carve-out #169289).
+    # "without my knowledge" / "did not sign up" are refund keywords, so the
+    # deterministic guard would normally force REFUND_REQUEST → human. But the
+    # ONLY ask is to stop future charges, with no money-back demand, no fraud, and
+    # no completed past charge ("an attempt was made to charge"), so the bot
+    # auto-cancels. Real ticket #169289 (July 2026) — Anna: it's a cancellation.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your subscription has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_unauthorized_stop_only_auto_cancels(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="subscription cancellation",
+            body=(
+                "Hello, I discovered today that a subscription to your application "
+                "was set up in my name without my knowledge; however, I did not "
+                "initiate such a subscription. Furthermore, an attempt was made to "
+                "charge 1,290 TL to my card. I am not satisfied with this situation "
+                "and request that you do not charge me again."
+            ),
+        ))
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("169289")
+        assert result["status"] == "success"
+        assert result.get("stop_only_cancel_carveout") is True
+
+    # D5d. Same unauthorized-signup + stop wording BUT with an explicit money-back
+    # demand ("refund my money") → carve-out MUST NOT apply; stays a refund for a
+    # human. Guards the #149230 spirit: any money-back ask ⇒ refund, not cancel.
+    @patch.object(main, "log_result")
+    @patch.object(main, "classify_ticket", return_value=_classification())
+    @patch.object(main, "zendesk")
+    def test_unauthorized_with_money_back_still_refund(self, mock_zd, mock_cls, mock_log):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="subscription cancellation",
+            body=(
+                "A subscription was set up in my name without my knowledge. I did "
+                "not sign up for this. Please cancel it and refund my money — do "
+                "not charge me again."
+            ),
+        ))
+        result = main._process("169290")
+        assert result["status"] == "skipped_refund_request"
+        assert not result.get("stop_only_cancel_carveout")
+        mock_zd.post_reply.assert_not_called()
+
     # D5b. CHARGEBACK_THREAT fired on a legal threat, but the customer's real ask
     # is to cancel and there is NO refund request → treat as a normal cancellation
     # (Anna, ticket 165635). Must NOT skip as a payment dispute.
