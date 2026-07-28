@@ -42,6 +42,7 @@ import refund_engine
 import refund_ocr
 import refund_disambiguate
 from refund_client import RefundClient
+from nexus_client import NexusLookupError
 from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
 from stripe_client import StripeClient
@@ -317,6 +318,12 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     `as_of_date` = ISO date the refund window is measured from (ticket created)."""
     nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
     nexus_data = None
+    # Set when the PRIMARY lookup raised a transient error (5xx / Cloudflare
+    # 52x / timeout / network). The engine then emits UNABLE_TO_EVAL instead
+    # of NOT_FOUND_IN_NEXUS, so an outage isn't reported as "no charge". Alt-
+    # email lookups are best-effort widening and do NOT flip this flag — a
+    # clean primary answer stands even if a speculative alt lookup errors.
+    nexus_lookup_failed = False
 
     def _has_charges(d):
         return bool(d and isinstance(d.get("charges"), list) and d.get("charges"))
@@ -324,6 +331,10 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     if nexus_available:
         try:
             nexus_data = nexus_client.search_subscription(email)  # read-only
+        except NexusLookupError as e:
+            log.warning(f"[{ticket_id}] refund eval: Nexus lookup FAILED (transient): {e}")
+            nexus_data = None
+            nexus_lookup_failed = True
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund eval: Nexus lookup error: {e}")
             nexus_data = None
@@ -395,6 +406,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         as_of_date=as_of_date,
         nexus_available=nexus_available,
         nexus_data=nexus_data,
+        nexus_lookup_failed=nexus_lookup_failed,
         ticket_text=eff_text,
     )
     decision = refund_engine.decide(ctx, REFUND_CONFIG)

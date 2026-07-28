@@ -57,6 +57,25 @@ def test_not_found_no_charges():
     assert d.reason_code == re_.RC_NOT_FOUND_IN_NEXUS
 
 
+def test_transient_lookup_failure_is_unable_to_eval_not_not_found():
+    """A transient Nexus lookup failure (5xx / Cloudflare 52x / timeout /
+    network) must NOT be reported as "no charge found". With no charges AND
+    nexus_lookup_failed=True the engine returns UNABLE_TO_EVAL, not
+    NOT_FOUND_IN_NEXUS. Symmetric to the cancel-path nexus_lookup_error fix."""
+    d = decide(_ctx(nexus_data=None, nexus_lookup_failed=True), CFG)
+    assert d.would_be_refunded is False
+    assert d.reason_code == re_.RC_UNABLE_TO_EVAL
+    assert "unreachable" in d.human_message.lower()
+
+
+def test_lookup_failed_flag_ignored_when_charges_present():
+    """If charges were recovered anyway (e.g. via an alt email), the transient
+    flag from the primary lookup is irrelevant — evaluation proceeds normally."""
+    d = decide(_ctx(nexus_lookup_failed=True), CFG)  # default ctx has a refundable charge
+    assert d.reason_code != re_.RC_UNABLE_TO_EVAL
+    assert d.reason_code != re_.RC_NOT_FOUND_IN_NEXUS
+
+
 def test_nothing_refundable():
     d = decide(_ctx(nexus_data=_data([_sub("ch1", 5490, "2026-07-18", refundable=False, status="refunded")])), CFG)
     assert d.reason_code == re_.RC_NOTHING_REFUNDABLE
