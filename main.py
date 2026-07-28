@@ -48,6 +48,7 @@ from stripe_client import StripeClient
 from slack_client import SlackClient
 import ticket_merger
 import reply_generator
+import refund_reply_links
 from reply_generator import (
     generate_reply,
     validate_reply,
@@ -182,6 +183,14 @@ def _brand_key(text: str) -> str:
         if any(m in t for m in markers):
             return key
     return "unknown"
+
+
+# Product/subscription name shown in the refund reply ({{brand}} in Anna's templates).
+# None → the template's own default ("IQ Booster subscription"). 16types confirmed by
+# Anna; personality-brand sub names still to confirm, so left at default for now.
+_BRAND_PHRASE = {
+    "16types": "16 Types Growth Plan",
+}
 
 
 def refunds_enabled_for(brand: str) -> bool:
@@ -368,12 +377,15 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     try:
         rc = decision.reason_code
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
+            brand = _brand_key(ticket_text)
+            _lang = classification.get("language", "EN")
             _win = _parse_window_days(decision.guard_trail)
             _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
             _amt = (f"{decision.computed_amount} {decision.currency}".strip()
                     if decision.computed_amount else "")
+            _terms, _sub = refund_reply_links.links_for(brand, _lang)  # per-site+language
             draft = reply_generator.generate_refund_reply(
-                rc, classification.get("language", "EN"),
+                rc, _lang,
                 {
                     # canonical-template placeholders (Anna's Generic templates)
                     "charge_amount": _amt,
@@ -381,14 +393,14 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     "refund_window_days": _win,
                     "charges_list": (f"- {_amt} (charged {_cdate})".rstrip() if _amt else ""),
                     "it_falls": "it falls",
-                    # brand_phrase / terms_url / subscription_url default to WWIQTEST;
-                    # per site+language resolution is a follow-up (data in the xlsx).
+                    "brand_phrase": _BRAND_PHRASE.get(brand),   # None → template default
+                    "terms_url": _terms,
+                    "subscription_url": _sub,
                 },
             )
             if draft:
                 result["refund_draft_reply"] = draft
                 result["refund_reply_template"] = rc
-                brand = _brand_key(ticket_text)
                 result["refund_brand"] = brand
                 executed = bool(result.get("refund_executed"))
                 # Soft-start gate: brand must be enabled; APPROVED also needs the
