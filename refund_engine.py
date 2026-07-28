@@ -100,6 +100,11 @@ class RefundContext:
     as_of_date: Optional[str] = None     # ISO date to measure the window from (ticket created)
     nexus_available: bool = False
     nexus_data: Optional[dict] = None     # includes "charges", "subscription_id", "source"
+    nexus_lookup_failed: bool = False     # the (primary) Nexus lookup raised a
+                                          # transient error (5xx / 52x / timeout /
+                                          # network) — we did NOT get a definitive
+                                          # answer, so an empty charges[] must NOT
+                                          # be read as "no charge" (see main.py)
     ticket_text: str = ""                 # subject + body — for informational amount logging
     preferred_charge_id: Optional[str] = None  # LLM-disambiguated target charge (routes flow only)
 
@@ -451,6 +456,21 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         # 3. Found in Nexus (charges present)?
         trail.append("found")
         if not charges:
+            # Distinguish a transient lookup failure from a genuine "no charge".
+            # When the Nexus lookup raised (5xx / Cloudflare 52x / timeout /
+            # network) we have NO answer — an empty charges[] here is an
+            # artefact of the outage, not evidence the customer paid nothing.
+            # Emit UNABLE_TO_EVAL so the agent retries instead of being told
+            # "no charge found". (Symmetric to the cancel-path nexus_lookup_error
+            # fix; refunds always go to a human regardless, so this only
+            # corrects the human-facing wording — no auto-action changes.)
+            if ctx.nexus_lookup_failed:
+                return _decision(False, RC_UNABLE_TO_EVAL,
+                                 "Nexus was temporarily unreachable (lookup error) — could NOT "
+                                 "verify whether this customer has refundable charges. This is NOT "
+                                 "a confirmation that they have none. Please retry in a few minutes "
+                                 "or look it up manually.",
+                                 trail, **common)
             return _decision(False, RC_NOT_FOUND_IN_NEXUS,
                              "No charge found in Nexus for this email — may be under another email, "
                              "paid via PayPal, or not yet loaded. Human should look it up.",
