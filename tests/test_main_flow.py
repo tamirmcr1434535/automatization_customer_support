@@ -1797,6 +1797,8 @@ def test_abuse_guard_blocks_execution():
     assert str(result.get("refund_execution_status")).startswith("skipped_abuse_guard")
     rcm.create_refund.assert_not_called()                           # money move blocked by velocity guard
     zd.post_reply.assert_not_called()                               # no auto reply
+    assert "PAUSED" in (result.get("refund_internal_note") or "")   # agent told why (spike)
+    zd.add_internal_note.assert_called_once()                       # note posted to the agent
 
 
 def test_refund_not_executed_when_xhost_unresolved():

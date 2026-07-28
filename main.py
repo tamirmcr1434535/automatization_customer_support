@@ -608,6 +608,31 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
                         f"(brand={brand}, refunds_enabled_for={refunds_enabled_for(brand)}, {rc})"
                     )
+                # If an APPROVE was blocked at execution by a safety guard, tell the
+                # agent WHY (they must handle it manually). For an abnormal-volume
+                # spike the note flags that auto-refunds are PAUSED pending review —
+                # they stay routed to a human until refunds are manually re-enabled.
+                _exec = str(result.get("refund_execution_status") or "")
+                if rc == "WOULD_BE_REFUNDED" and not executed and _exec.startswith("skipped_"):
+                    if _exec.startswith("skipped_abuse_guard"):
+                        _guard_note = (
+                            "🤖⚠️ Auto-refund PAUSED — refund volume/velocity above normal "
+                            f"({_exec.split(':', 1)[-1]}). This refund was NOT processed automatically; "
+                            "auto-refunds stay routed to a human until they are manually re-enabled. "
+                            "Please review the spike and handle this refund manually."
+                        )
+                    elif _exec == "skipped_no_xhost":
+                        _guard_note = ("🤖 Auto-refund not processed — brand/x-host could not be "
+                                       "resolved for the refund API. Please handle manually.")
+                    elif _exec == "skipped_llm_disambiguated":
+                        _guard_note = ("🤖 Auto-refund not processed — refund target was low-confidence "
+                                       "(LLM-resolved). Please review and handle manually.")
+                    else:
+                        _guard_note = f"🤖 Auto-refund not processed ({_exec}). Please handle manually."
+                    result["refund_internal_note"] = _guard_note
+                    if refunds_enabled_for(brand):
+                        zendesk.add_internal_note(ticket_id, _guard_note)
+                        result["refund_note_added"] = True
         else:
             # Not a simple window case → LEAVE TO A HUMAN. No customer reply; instead
             # add an internal note (agents only) explaining why the bot didn't handle

@@ -29,9 +29,17 @@ import logging
 log = logging.getLogger("refund_abuse")
 
 # ── Tunables (conservative canary defaults) ─────────────────────────────── #
-MAX_PER_DAY_PER_BRAND = int(os.getenv("REFUND_MAX_PER_DAY_PER_BRAND", "30"))
-MAX_PER_EMAIL         = int(os.getenv("REFUND_MAX_PER_EMAIL", "1"))
-EMAIL_WINDOW_DAYS     = int(os.getenv("REFUND_EMAIL_WINDOW_DAYS", "30"))
+# Per-brand protection is two-tier: a rolling-hour RATE limit (catches a sudden
+# burst — attack or runaway bug — within the hour, regardless of brand size) plus
+# a per-day COUNT backstop (hard ceiling). The rate limit is the "flexible but
+# reliable" control: it lets steady legitimate volume through but slams the brakes
+# on a spike. A per-currency daily SUM cap is the recommended next upgrade
+# (see docs/refund_abuse_guards.md).
+MAX_PER_HOUR_PER_BRAND = int(os.getenv("REFUND_MAX_PER_HOUR_PER_BRAND", "5"))
+MAX_PER_DAY_PER_BRAND  = int(os.getenv("REFUND_MAX_PER_DAY_PER_BRAND", "30"))
+# Per-customer: at most N refunds per rolling window (default 2 per 24h).
+MAX_PER_EMAIL          = int(os.getenv("REFUND_MAX_PER_EMAIL", "2"))
+EMAIL_WINDOW_HOURS     = int(os.getenv("REFUND_EMAIL_WINDOW_HOURS", "24"))
 _TABLE = os.getenv("REFUND_ABUSE_TABLE",
                    f'{os.getenv("GCP_PROJECT", "powerful-vine-426615-r2")}.zendesk_bot.cancellation_logs')
 
@@ -53,8 +61,9 @@ def _bq():
 
 def check(brand: str, email: str, client=None) -> "tuple[bool, str]":
     """(ok, reason). Count executed auto-refunds (refund_execution_status='refunded')
-    and block if this refund would exceed the per-brand daily cap or the per-email
-    velocity limit. FAIL-CLOSED: any error → (False, reason)."""
+    and block if this refund would exceed: the per-brand rolling-hour RATE, the
+    per-brand daily COUNT backstop, or the per-email velocity. FAIL-CLOSED: any
+    error → (False, reason)."""
     if not is_enabled():
         return True, ""
     try:
@@ -62,26 +71,30 @@ def check(brand: str, email: str, client=None) -> "tuple[bool, str]":
         cli = client or _bq()
         q = f"""
         SELECT
-          COUNTIF(refund_execution_status = 'refunded'
-                  AND refund_brand = @brand
+          COUNTIF(refund_execution_status = 'refunded' AND refund_brand = @brand
+                  AND logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 1 HOUR)) AS brand_hour,
+          COUNTIF(refund_execution_status = 'refunded' AND refund_brand = @brand
                   AND DATE(logged_at) = CURRENT_DATE()) AS brand_today,
-          COUNTIF(refund_execution_status = 'refunded'
-                  AND email = @email) AS email_recent
+          COUNTIF(refund_execution_status = 'refunded' AND email = @email
+                  AND logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @ewin HOUR)) AS email_recent
         FROM `{_TABLE}`
-        WHERE logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL @win DAY)
+        WHERE logged_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 48 HOUR)
         """
         cfg = bigquery.QueryJobConfig(query_parameters=[
             bigquery.ScalarQueryParameter("brand", "STRING", brand or ""),
             bigquery.ScalarQueryParameter("email", "STRING", email or ""),
-            bigquery.ScalarQueryParameter("win", "INT64", EMAIL_WINDOW_DAYS),
+            bigquery.ScalarQueryParameter("ewin", "INT64", EMAIL_WINDOW_HOURS),
         ])
         row = list(cli.query(q, job_config=cfg).result())[0]
-        brand_today = int(row["brand_today"] or 0)
+        brand_hour   = int(row["brand_hour"] or 0)
+        brand_today  = int(row["brand_today"] or 0)
         email_recent = int(row["email_recent"] or 0)
+        if brand_hour >= MAX_PER_HOUR_PER_BRAND:
+            return False, f"brand_rate:{brand_hour}>={MAX_PER_HOUR_PER_BRAND}/h"
         if brand_today >= MAX_PER_DAY_PER_BRAND:
             return False, f"brand_daily_cap:{brand_today}>={MAX_PER_DAY_PER_BRAND}"
         if email_recent >= MAX_PER_EMAIL:
-            return False, f"email_velocity:{email_recent}>={MAX_PER_EMAIL}/{EMAIL_WINDOW_DAYS}d"
+            return False, f"email_velocity:{email_recent}>={MAX_PER_EMAIL}/{EMAIL_WINDOW_HOURS}h"
         return True, ""
     except Exception as e:  # noqa: BLE001 — money guard must fail closed
         log.warning("refund abuse check failed (fail-closed → escalate): %s", e)

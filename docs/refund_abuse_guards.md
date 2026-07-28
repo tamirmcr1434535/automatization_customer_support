@@ -29,15 +29,35 @@ Evaluated against the BigQuery refund log immediately before execution.
 
 | Guard | Env | Default | Blocks |
 |---|---|---|---|
-| Per-brand **daily circuit breaker** | `REFUND_MAX_PER_DAY_PER_BRAND` | 30 | mass abuse / runaway bug draining a brand in one day |
-| Per-customer **velocity** | `REFUND_MAX_PER_EMAIL` / `REFUND_EMAIL_WINDOW_DAYS` | 1 / 30d | same customer farming refunds across renewals |
+| Per-brand **hourly rate** (burst breaker) | `REFUND_MAX_PER_HOUR_PER_BRAND` | 5 | a sudden spike (attack / runaway bug) within the hour — flexible: lets steady legit volume through, slams the brakes on a burst |
+| Per-brand **daily count** backstop | `REFUND_MAX_PER_DAY_PER_BRAND` | 30 | hard daily ceiling |
+| Per-customer **velocity** | `REFUND_MAX_PER_EMAIL` / `REFUND_EMAIL_WINDOW_HOURS` | 2 / 24h | same customer farming refunds |
 
 Counts `refund_execution_status='refunded'` rows. On trip → `refund_execution_status =
-skipped_abuse_guard:<reason>`, refund NOT executed, ticket → human.
+skipped_abuse_guard:<reason>`, refund NOT executed, ticket → human, **and an internal
+note is posted to the agent** explaining the spike: *"Auto-refund PAUSED — refund
+volume/velocity above normal … auto-refunds stay routed to a human until manually
+re-enabled. Please review the spike and handle this refund manually."*
 
-**Recommended canary thresholds:** keep defaults (brand ≤ 30/day, 1 refund per
-email per 30 days). Tighten `REFUND_MAX_PER_DAY_PER_BRAND` to ~10 for the very
-first day if desired.
+**Pause-until-toggle:** while the burst is active the rate guard keeps every refund
+escalating to a human on its own. To hold the pause deliberately after a spike, the
+operator flips the manual kill-switch — `REFUNDS_ENABLED=false` (or drop the brand
+from `REFUNDS_ENABLED_BRANDS`) — and flips it back after reviewing. (Pairs with the
+recommended Slack spike alert so the operator is notified to toggle.)
+
+The per-brand control is **two-tier on purpose**: a fixed daily count alone is too
+crude (a small brand needs a small cap, a big one a large one, and it reacts a full
+day late). The **rolling-hour rate** adapts to that — it doesn't care about brand
+size, it only trips on an abnormal *burst*, which is exactly what an attack or a
+runaway bug looks like — while the daily count stays as a hard backstop.
+
+**Recommended canary thresholds:** brand ≤ 5/hour + ≤ 30/day; email ≤ 2 / 24h.
+Tighten the hourly rate to ~3 for the very first day if desired.
+
+**Next upgrade (recommended):** a per-brand+currency **daily SUM cap** (money, not
+count) — 10 large refunds are worse than 30 small ones; and an **adaptive baseline**
+(trip when today's bot-refund rate exceeds the brand's trailing-7-day mean + k·σ)
+for a fully self-tuning breaker.
 
 ## Proposed — not yet implemented (prioritised)
 
