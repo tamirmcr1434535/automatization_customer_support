@@ -1951,6 +1951,41 @@ def test_llm_disambiguation_resolves_ambiguous_to_yes():
     assert result["refund_flow"] == "flow1_subscription"
 
 
+def test_llm_disambiguated_refund_not_auto_executed():
+    # A WOULD_BE that was ONLY resolvable via the LLM disambiguator (lowest-confidence
+    # routing) must NOT auto-move money even on a live, x-host-resolvable brand — it is
+    # drafted and left to a human. (2026-07-28 backtest: llm-disambiguated approves were
+    # 0/2 vs human, i.e. all false positives.)
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = MagicMock(); nexus.search_subscription.return_value = _nexus_sub_plus_fee()
+    rcm = MagicMock()
+    rcm.is_configured.return_value = True
+    rcm.get_charge_detail.return_value = {"disputed": False, "refundable": True,
+                                          "amount": 5490, "currency": "JPY", "refunded_at": ""}
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "refund_client", rcm), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.refund_disambiguate, "is_enabled", return_value=True), \
+         patch.object(main.refund_disambiguate, "pick_target_charge_id", return_value="ch_sub"), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9203", "u@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund everything except the first payment",
+            as_of_date="2026-07-25T00:00:00Z", brand="16types")
+    assert result["refund_decision"] == "YES"                      # engine still says would-refund
+    assert result["refund_disambig_charge"] == "ch_sub"
+    assert result.get("refund_execution_status") == "skipped_llm_disambiguated"
+    rcm.create_refund.assert_not_called()                          # no auto money move
+    zd.post_reply.assert_not_called()                              # no auto approve reply
+
+
 def test_llm_abstain_leaves_ambiguous():
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}

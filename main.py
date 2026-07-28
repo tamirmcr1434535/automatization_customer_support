@@ -557,6 +557,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # is configured (REFUND_API_*). In prod both are off → nothing moves.
                 # On dev (REFUND_API_* set + REFUNDS_ENABLED=true) it really refunds.
                 if rc == "WOULD_BE_REFUNDED" and refunds_enabled_for(brand):
+                    _routed_by_llm = "llm_disambiguated" in (decision.guard_trail or [])
                     # x-host safety: PROD enforces x-host per brand. If we could not
                     # resolve one (unknown / unmapped brand), we do NOT know which
                     # brand scope the money move would hit — so refuse to auto-execute
@@ -567,6 +568,15 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         result["refund_execution_status"] = "skipped_no_xhost"
                         log.warning(f"[{ticket_id}] refund NOT executed — no x-host resolved "
                                     f"for brand={brand!r}; leaving to a human")
+                    elif _routed_by_llm:
+                        # The flow was only resolvable by the LLM disambiguator on an
+                        # AMBIGUOUS residual (no clear amount/date/type signal). This is
+                        # the lowest-confidence routing path and must NOT auto-move money:
+                        # in the 2026-07-28 backtest every llm-disambiguated approve was a
+                        # false positive (human did not refund). Draft + leave to a human.
+                        result["refund_execution_status"] = "skipped_llm_disambiguated"
+                        log.warning(f"[{ticket_id}] refund NOT executed — flow resolved via "
+                                    f"LLM disambiguation (low confidence); leaving to a human")
                     else:
                         _ref = refund_client.create_refund(
                             charge_id=decision.candidate_charge_id, x_host=_refund_xhost(brand))
