@@ -1527,7 +1527,53 @@ _OUTSIDE_CHARGE = [{"charge_id": "o1", "type": "renewal", "amount": 5490,
                     "currency": "JPY", "status": "success", "refundable": True,
                     "date": "2026-06-01"}]
 
-_AUTO_CODES = {"WOULD_BE_REFUNDED", "REPORT_NOT_REFUNDABLE_PER_TOS", "OUTSIDE_REFUND_WINDOW"}
+_AUTO_CODES = {"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"}
+# A refundable cross_sale → REPORT_NOT_REFUNDABLE → escalated (internal note, no reply).
+_REPORT_CHARGE = [{"charge_id": "c1", "type": "cross_sale", "amount": 1990,
+                   "currency": "JPY", "status": "success", "refundable": True,
+                   "date": "2026-07-20"}]
+
+
+def test_escalated_refund_note_shadow_when_disabled():
+    # Non-simple case (REPORT) → NO customer reply; internal note logged but NOT
+    # written while the brand is off (shadow).
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", False), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9400", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund the report", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "REPORT_NOT_REFUNDABLE_PER_TOS"
+    assert result.get("refund_internal_note")        # note text drafted + logged
+    assert "refund_note_added" not in result
+    zd.add_internal_note.assert_not_called()          # SAFETY: nothing written to the ticket
+    zd.post_reply.assert_not_called()                 # no customer reply either
+
+
+def test_escalated_refund_note_added_when_enabled():
+    # Brand live → the internal note IS written; still no customer reply.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9401", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund the report", as_of_date="2026-07-24T00:00:00Z")
+    assert result.get("refund_note_added") is True
+    zd.add_internal_note.assert_called_once()
+    zd.post_reply.assert_not_called()                 # never a customer reply for escalated cases
 
 
 def test_refund_reply_drafted_but_NOT_sent_when_disabled():

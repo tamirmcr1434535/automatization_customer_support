@@ -376,8 +376,17 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     # is false the customer receives NOTHING; everything still goes to a human.
     try:
         rc = decision.reason_code
+        brand = _brand_key(ticket_text)
+        result["refund_brand"] = brand
+        # ── SCOPE (2026-07-27): SIMPLE window-based cases ONLY ───────────────── #
+        # The bot AUTO-ANSWERS exactly two clean decisions (data-backed ~100% human
+        # agreement): WITHIN window → approve (WOULD_BE_REFUNDED); OUTSIDE window →
+        # deny (OUTSIDE_REFUND_WINDOW). EVERY OTHER reason (REPORT/add-on, AMBIGUOUS,
+        # NOT_FOUND, ONE_TIME, LOW_CONFIDENCE) is LEFT TO A HUMAN: the customer gets
+        # NOTHING; instead the bot leaves an INTERNAL NOTE explaining why. Both the
+        # customer reply and the internal note are gated by refunds_enabled_for(brand)
+        # — shadow (logged only) until a brand goes live.
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
-            brand = _brand_key(ticket_text)
             _lang = classification.get("language", "EN")
             _win = _parse_window_days(decision.guard_trail)
             _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
@@ -401,7 +410,6 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             if draft:
                 result["refund_draft_reply"] = draft
                 result["refund_reply_template"] = rc
-                result["refund_brand"] = brand
                 executed = bool(result.get("refund_executed"))
                 # Soft-start gate: brand must be enabled; APPROVED also needs the
                 # money to have actually moved (no-op stub today → never).
@@ -415,6 +423,26 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
                         f"(brand={brand}, refunds_enabled_for={refunds_enabled_for(brand)}, {rc})"
                     )
+        else:
+            # Not a simple window case → LEAVE TO A HUMAN. No customer reply; instead
+            # add an internal note (agents only) explaining why the bot didn't handle
+            # it. Gated by the same soft-start switch → shadow-logged until go-live.
+            note = (
+                "🤖 Refund left to a human — the bot only auto-handles simple "
+                "in-window / out-of-window refunds.\n"
+                f"Would-be decision: NO — {rc}.\n"
+                f"{decision.human_message}"
+            )
+            result["refund_internal_note"] = note
+            if refunds_enabled_for(brand):
+                zendesk.add_internal_note(ticket_id, note)
+                result["refund_note_added"] = True
+                log.info(f"[{ticket_id}] refund {rc} — internal note added (brand={brand})")
+            else:
+                log.info(
+                    f"[{ticket_id}] refund {rc} — internal note drafted + logged, NOT added "
+                    f"(brand={brand}, refunds_enabled_for={refunds_enabled_for(brand)})"
+                )
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
         log.warning(f"[{ticket_id}] refund reply draft failed (non-blocking): {e}")
 
