@@ -29,9 +29,9 @@ Evaluated against the BigQuery refund log immediately before execution.
 
 | Guard | Env | Default | Blocks |
 |---|---|---|---|
-| Per-brand **hourly rate** (burst breaker) | `REFUND_MAX_PER_HOUR_PER_BRAND` | 5 | a sudden spike (attack / runaway bug) within the hour — fixed, size-independent |
-| Per-brand **adaptive daily cap** (learned) | `REFUND_DAILY_FACTOR` / `REFUND_DAILY_FLOOR` / `REFUND_BASELINE_DAYS` / `REFUND_DAILY_HARD_MAX` | ×3 / floor 5 / 14d / 100 | more than N× the brand's *own normal* daily volume |
-| Per-customer **velocity** | `REFUND_MAX_PER_EMAIL` / `REFUND_EMAIL_WINDOW_HOURS` | 2 / 24h | same customer farming refunds |
+| Per-brand **hourly rate** (burst breaker) | `REFUND_MAX_PER_HOUR_PER_BRAND` | 20 | a sudden spike (attack / runaway bug) within the hour — fixed, size-independent |
+| Per-brand **adaptive daily cap** (learned) | `REFUND_DAILY_FACTOR` / `REFUND_DAILY_FLOOR` / `REFUND_BASELINE_DAYS` / `REFUND_DAILY_HARD_MAX` | ×3 / floor 40 / 14d / 150 | more than N× the brand's *own normal* daily volume |
+| Per-customer **velocity** | `REFUND_MAX_PER_EMAIL` / `REFUND_EMAIL_WINDOW_HOURS` | 3 / 24h | same customer farming refunds |
 
 On trip → `refund_execution_status = skipped_abuse_guard:<reason>`, refund NOT executed,
 ticket → human, **and an internal note is posted to the agent** explaining the spike:

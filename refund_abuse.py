@@ -37,13 +37,13 @@ log = logging.getLogger("refund_abuse")
 #      with a floor so tiny/new brands still allow a handful and an absolute hard
 #      ceiling as the ultimate backstop. This auto-tunes per brand: a brand that
 #      normally does 1 refund/day trips at ~a handful, a busy brand scales up.
-MAX_PER_HOUR_PER_BRAND = int(os.getenv("REFUND_MAX_PER_HOUR_PER_BRAND", "5"))
+MAX_PER_HOUR_PER_BRAND = int(os.getenv("REFUND_MAX_PER_HOUR_PER_BRAND", "20"))
 BASELINE_DAYS   = int(os.getenv("REFUND_BASELINE_DAYS", "14"))   # trailing window to learn "normal"
 DAILY_FACTOR    = float(os.getenv("REFUND_DAILY_FACTOR", "3"))   # allow up to N× the brand's normal
-DAILY_FLOOR     = int(os.getenv("REFUND_DAILY_FLOOR", "5"))      # min daily allowance (tiny/new brands)
-DAILY_HARD_MAX  = int(os.getenv("REFUND_DAILY_HARD_MAX", "100")) # absolute ceiling regardless of baseline
-# Per-customer: at most N refunds per rolling window (default 2 per 24h).
-MAX_PER_EMAIL          = int(os.getenv("REFUND_MAX_PER_EMAIL", "2"))
+DAILY_FLOOR     = int(os.getenv("REFUND_DAILY_FLOOR", "40"))     # min daily allowance (tiny/new brands)
+DAILY_HARD_MAX  = int(os.getenv("REFUND_DAILY_HARD_MAX", "150")) # absolute ceiling regardless of baseline
+# Per-customer: at most N refunds per rolling window (default 3 per 24h).
+MAX_PER_EMAIL          = int(os.getenv("REFUND_MAX_PER_EMAIL", "3"))
 EMAIL_WINDOW_HOURS     = int(os.getenv("REFUND_EMAIL_WINDOW_HOURS", "24"))
 _TABLE = os.getenv("REFUND_ABUSE_TABLE",
                    f'{os.getenv("GCP_PROJECT", "powerful-vine-426615-r2")}.zendesk_bot.cancellation_logs')
