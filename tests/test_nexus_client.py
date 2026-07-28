@@ -28,7 +28,7 @@ os.environ.setdefault("ANTHROPIC_API_KEY", "sk-ant-test")
 os.environ.setdefault("SLACK_WEBHOOK_URL", "https://hooks.slack.com/test")
 os.environ.setdefault("SKIP_WC_HEALTHCHECK", "true")
 
-from nexus_client import NexusClient  # noqa: E402
+from nexus_client import NexusClient, NexusLookupError  # noqa: E402
 from woocommerce_client import WooCommerceClient  # noqa: E402
 
 
@@ -36,11 +36,15 @@ from woocommerce_client import WooCommerceClient  # noqa: E402
 #  A. NexusClient.search_subscription
 # ────────────────────────────────────────────────────────────────────────
 
-def _nexus(x_host: str = ""):
+def _nexus(x_host: str = "", *, max_retries: int = 2, retry_backoff: float = 0.0):
+    # retry_backoff defaults to 0.0 in tests so transient-retry paths run
+    # without real sleeps.
     return NexusClient(
         "https://apinexus.cellon.ai",
         "test_token",
         x_host=x_host,
+        max_retries=max_retries,
+        retry_backoff=retry_backoff,
     )
 
 
@@ -85,23 +89,67 @@ def test_search_404_returns_none(mock_post):
 
 
 @patch("nexus_client.requests.post")
-def test_search_5xx_returns_none(mock_post):
+def test_search_5xx_raises_after_retries(mock_post):
+    """A persistent 5xx (incl. Cloudflare 52x) is transient/ambiguous — it
+    must NOT be silently reported as "no subscription". After exhausting
+    retries it raises NexusLookupError."""
     mock_post.return_value = _resp(503, {})
-    assert _nexus().search_subscription("foo@example.com") is None
+    with pytest.raises(NexusLookupError):
+        _nexus(max_retries=2).search_subscription("foo@example.com")
+    # initial attempt + 2 retries = 3 calls
+    assert mock_post.call_count == 3
 
 
 @patch("nexus_client.requests.post")
-def test_search_network_error_returns_none(mock_post):
+def test_search_cloudflare_520_raises_after_retries(mock_post):
+    """The exact production failure mode: Cloudflare 520 with an HTML body."""
+    r = _resp(520, {})
+    r.text = "<!DOCTYPE html>..."
+    mock_post.return_value = r
+    with pytest.raises(NexusLookupError):
+        _nexus(max_retries=1).search_subscription("foo@example.com")
+    assert mock_post.call_count == 2
+
+
+@patch("nexus_client.requests.post")
+def test_search_5xx_then_200_recovers(mock_post):
+    """Transient 5xx followed by a good response → retry succeeds, no raise.
+    This is why the retry exists: Cloudflare 520s usually pass on retry."""
+    good = _resp(200, {
+        "meta": {"success": True}, "data": {"subscription_id": "42"},
+    })
+    mock_post.side_effect = [_resp(520, {}), good]
+    out = _nexus(max_retries=2).search_subscription("foo@example.com")
+    assert out is not None and out["subscription_id"] == "42"
+    assert mock_post.call_count == 2
+
+
+@patch("nexus_client.requests.post")
+def test_search_non_404_4xx_raises(mock_post):
+    """401/403/422 etc. are not a "no sub" answer and retry won't help —
+    raise immediately (no retry) so the caller escalates."""
+    mock_post.return_value = _resp(403, {})
+    with pytest.raises(NexusLookupError):
+        _nexus(max_retries=2).search_subscription("foo@example.com")
+    assert mock_post.call_count == 1  # not retried
+
+
+@patch("nexus_client.requests.post")
+def test_search_network_error_raises_after_retries(mock_post):
     import requests as _r
     mock_post.side_effect = _r.exceptions.ConnectionError("dns failed")
-    assert _nexus().search_subscription("foo@example.com") is None
+    with pytest.raises(NexusLookupError):
+        _nexus(max_retries=2).search_subscription("foo@example.com")
+    assert mock_post.call_count == 3
 
 
 @patch("nexus_client.requests.post")
-def test_search_timeout_returns_none(mock_post):
+def test_search_timeout_raises_after_retries(mock_post):
     import requests as _r
     mock_post.side_effect = _r.exceptions.Timeout("timed out")
-    assert _nexus().search_subscription("foo@example.com") is None
+    with pytest.raises(NexusLookupError):
+        _nexus(max_retries=2).search_subscription("foo@example.com")
+    assert mock_post.call_count == 3
 
 
 @patch("nexus_client.requests.post")
@@ -189,13 +237,17 @@ def _wc():
 
 
 class FakeNexus:
-    """Hand-rolled Nexus stand-in. Returns canned data."""
-    def __init__(self, data):
+    """Hand-rolled Nexus stand-in. Returns canned data, or raises `raises`
+    (e.g. NexusLookupError) to simulate a transient lookup failure."""
+    def __init__(self, data, raises: Exception | None = None):
         self.data = data
+        self.raises = raises
         self.calls: list[str] = []
 
     def search_subscription(self, email):
         self.calls.append(email)
+        if self.raises is not None:
+            raise self.raises
         return self.data
 
 
@@ -461,6 +513,31 @@ def test_via_nexus_customer_found_but_nexus_404_returns_no_active_sub(mock_get, 
     out = _wc().cancel_subscription_via_nexus("x@y.com", FakeNexus(None))
     assert out["status"] == "no_active_sub", out
     assert out["country"] == "DE"
+
+
+@patch("woocommerce_client.requests.put")
+@patch("woocommerce_client.requests.request")
+@patch("woocommerce_client.requests.get")
+def test_via_nexus_transient_error_returns_nexus_lookup_error(mock_get, mock_request, mock_put):
+    """A transient Nexus failure (NexusLookupError) must NOT be treated as
+    "no subscription". The cancel path returns status=nexus_lookup_error so
+    main escalates as a lookup error (no customer reply), never telling a
+    paying customer they have no sub. Regression guard for the 2026-07-27
+    Cloudflare-520 incident (tickets #168709/#168717/#168718/…)."""
+    dispatch = _wc_dispatch({
+        "/customers": [{"id": 1, "email": "x@y.com", "billing": {}, "meta_data": []}],
+    })
+    mock_get.side_effect = dispatch
+    mock_request.side_effect = dispatch
+
+    nexus = FakeNexus(None, raises=NexusLookupError("x@y.com → HTTP 520 after 3 attempt(s)"))
+    out = _wc().cancel_subscription_via_nexus("x@y.com", nexus)
+    assert out["status"] == "nexus_lookup_error", out
+    assert out["cancelled"] is False
+    assert out["error_kind"] == "nexus_lookup_error"
+    assert out["error_step"] == "nexus_search_subscription"
+    # Must NOT have attempted a cancel — we don't know the sub state.
+    mock_put.assert_not_called()
 
 
 @patch("woocommerce_client.requests.put")
