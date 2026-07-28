@@ -286,85 +286,79 @@ def english_fallback_reply(intent: str, cancel_result: dict) -> str:
 # actually executed — which is a no-op stub today).
 
 # Reason codes we produce a customer draft for. Everything else → human, no draft.
+# NB: REPORT_NOT_REFUNDABLE_PER_TOS is intentionally NOT here — Anna's canonical
+# templates deny ONLY on the refund window; there is no "report non-refundable per
+# ToS" template, and that logic is contested (the 1990 is an IQ Test add-on,
+# refundable if the test wasn't taken). So the bot no longer auto-answers it → human.
 REFUND_AUTOREPLY_CODES = {
     "WOULD_BE_REFUNDED",
-    "REPORT_NOT_REFUNDABLE_PER_TOS",
     "OUTSIDE_REFUND_WINDOW",
 }
 
 
-def _fmt_amount(amount, currency: str) -> str:
-    a = str(amount) if amount is not None else ""
-    c = (currency or "").strip()
-    return f"{a} {c}".strip() if a else (c or "the charge")
+# Anna's canonical "Generic" (offer-agnostic) templates — reproduced VERBATIM from
+# the "Macros for AI Bot" Google Doc (WWIQTEST — Generic Refund Decision Templates).
+# Only the marked {{variables}} are substituted; wording is unchanged. Terms /
+# Subscription links default to WWIQTEST and can be overridden per site+language.
+_TERMS_URL_DEFAULT = ("https://wwiqtest.com/wp-content/uploads/2026/01/"
+                      "terms-conditions-2026-01-06.pdf?v=1767706526")
+_SUB_URL_DEFAULT = ("https://wwiqtest.com/wp-content/uploads/2025/11/"
+                    "subscription-policy-2025-11-11.pdf?v=1779111749")
 
 
-def _master_refund_approved(d: dict) -> str:
-    amt = _fmt_amount(d.get("refund_amount"), d.get("currency"))
-    brand = d.get("brand", BRAND_NAME)
-    pdate = d.get("purchase_date")
-    order_line = f"Order date: {pdate}\n\n" if pdate else ""
+def _brand_phrase(d: dict) -> str:
+    # Anna: brand-variable, e.g. "16 Types Growth Plan" on 16types. Default WWIQTEST.
+    return d.get("brand_phrase") or "IQ Booster subscription"
+
+
+def _links(d: dict) -> tuple[str, str]:
+    return d.get("terms_url") or _TERMS_URL_DEFAULT, d.get("subscription_url") or _SUB_URL_DEFAULT
+
+
+def _master_generic_approved(d: dict) -> str:
+    terms, sub = _links(d)
     return (
         "Hello,\n\n"
-        "Thank you for reaching out, and we appreciate your patience while we "
-        "looked into this.\n\n"
-        f"{order_line}"
-        "Refund status:\n"
-        f"- Your {brand} subscription has been cancelled — no further charges will be made.\n"
-        f"- Your refund of {amt} has been approved and processed to your original payment "
-        "method. Depending on your bank or card provider, it may take up to 10 business "
-        "days to appear.\n\n"
-        "If you have any further questions, please don't hesitate to contact us."
+        "Thank you for reaching out, and we appreciate your patience while we looked into this.\n\n"
+        "Status of your request:\n\n"
+        f"We've reviewed your refund request for your {_brand_phrase(d)} charge of "
+        f"{d.get('charge_amount','')} (charge dated {d.get('charge_date','')}). This charge falls "
+        f"within our applicable refund window ({d.get('refund_window_days','')} days from the "
+        "payment date), so your refund has been approved and processed to your original payment "
+        "method.\n\n"
+        "Please allow up to 10 business days for the amount to appear, depending on your bank or "
+        "card issuer.\n\n"
+        f"You can read more about our refund policy in our [Terms and Conditions]({terms}), and "
+        f"review our [Subscription Policies]({sub}) for details on billing terms.\n\n"
+        "Your subscription has also been canceled, so no further charges will be made.\n\n"
+        "If you have any questions about the product itself, please don't hesitate to reach out "
+        "to us directly."
     )
 
 
-def _master_refund_report_not_refundable(d: dict) -> str:
-    brand = d.get("brand", BRAND_NAME)
-    price = d.get("report_price")  # display-ready (already carries its symbol)
-    price_ref = f"the {price} charge" if price else "this charge"
+def _master_generic_denied(d: dict) -> str:
+    terms, sub = _links(d)
+    it_falls = d.get("it_falls") or "it falls"
     return (
         "Hello,\n\n"
-        "Thank you for reaching out, and we're sorry for any confusion.\n\n"
-        f"Having re-checked your order, {price_ref} is for the IQ Test Report — an optional "
-        "one-time purchase shown on a separate screen after the test, and charged only when "
-        "it is manually confirmed. Our records show the purchase was confirmed and the report "
-        "was delivered immediately.\n\n"
-        "As this is digital content delivered instantly, it is not eligible for a refund under "
-        "our Terms of Use and Refund Policy.\n\n"
-        f"Your {brand} free-trial subscription has already been cancelled, so no further "
-        "charges will be made.\n\n"
-        "If you have any other questions, we're happy to help."
-    )
-
-
-def _master_refund_outside_window(d: dict) -> str:
-    brand = d.get("brand", BRAND_NAME)
-    window = d.get("window_days")
-    window_ref = f"the {window}-day refund window" if window else "our refund window"
-    renewal = d.get("renewal_price")  # display-ready (already carries its symbol)
-    renew_line = (
-        f"After the trial, the {brand} plan automatically renewed at {renewal}, as shown on "
-        "the checkout page.\n\n"
-        if renewal else ""
-    )
-    return (
-        "Hello,\n\n"
-        "Thank you for reaching out, and we understand there may have been some confusion.\n\n"
-        f"{renew_line}"
-        "Please note we do not charge any currency-exchange or transaction fees — any "
-        "difference on your statement would come from your bank or card provider.\n\n"
-        "Subscription & refund status:\n"
-        "- Your subscription has been cancelled — no further charges will be made.\n"
-        f"- Refund for past charges: the service was already provided and the charge is beyond "
-        f"{window_ref}, so it is not eligible for a refund.\n\n"
-        "If you have any questions, please don't hesitate to contact us."
+        "Thank you for reaching out, and we appreciate your patience while we looked into this.\n\n"
+        "Status of your request:\n\n"
+        f"We've reviewed your refund request for your {_brand_phrase(d)}. The following charge(s) "
+        f"do not qualify for a refund under our policy, as {it_falls} outside the applicable "
+        f"refund window ({d.get('refund_window_days','')} days from the payment date):\n\n"
+        f"{d.get('charges_list','')}\n\n"
+        "We understand this may be disappointing and apologize for any inconvenience.\n\n"
+        f"You can read more about our refund policy on our [Terms and Conditions]({terms}) page, "
+        f"and review our [Subscription Policies]({sub}) for details on billing terms.\n\n"
+        "Your subscription has also been canceled, so no further charges will be made.\n\n"
+        "If you have any questions about the product itself, please don't hesitate to reach out "
+        "to us directly."
     )
 
 
 _REFUND_MASTERS = {
-    "WOULD_BE_REFUNDED": _master_refund_approved,
-    "REPORT_NOT_REFUNDABLE_PER_TOS": _master_refund_report_not_refundable,
-    "OUTSIDE_REFUND_WINDOW": _master_refund_outside_window,
+    "WOULD_BE_REFUNDED": _master_generic_approved,
+    "OUTSIDE_REFUND_WINDOW": _master_generic_denied,
 }
 
 

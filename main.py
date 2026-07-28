@@ -194,20 +194,6 @@ def refunds_enabled_for(brand: str) -> bool:
     return (brand or "").lower() in REFUNDS_ENABLED_BRANDS
 
 
-# ── AN-192 refund reply: prices per currency (from the Legal/Pricing sheet) ── #
-# Used only to fill draft placeholders (report/renewal/trial line). Approximate —
-# the exact charged amount comes from Nexus; this is the published list price.
-_REFUND_PRICES = {
-    "JPY": {"trial": "¥199",     "renewal": "¥5,490",     "report": "¥1,990"},
-    "EUR": {"trial": "€1.90",    "renewal": "€29.99",     "report": "€9.99"},
-    "USD": {"trial": "$4.99",    "renewal": "$29.99",     "report": "$9.99"},
-    "KRW": {"trial": "₩4,990",   "renewal": "₩39,990",    "report": "₩19,990"},
-    "TRY": {"trial": "₺49,00",   "renewal": "₺1.290,00",  "report": "₺399,00"},
-    "NOK": {"trial": "19,00 kr", "renewal": "299,00 kr",  "report": "99,00 kr"},
-    "SEK": {"trial": "15,00 kr", "renewal": "299,00 kr",  "report": "99,00 kr"},
-}
-
-
 def _parse_window_days(trail) -> "int | None":
     """Pull the country window (days) out of a guard-trail marker like
     'window[currency=8d,age=54d]'. Returns None if absent."""
@@ -216,6 +202,27 @@ def _parse_window_days(trail) -> "int | None":
         if m:
             return int(m.group(1))
     return None
+
+
+def _parse_window_age(trail) -> "int | None":
+    """Pull the charge age (days) from a 'window[...,age=54d]' guard-trail marker."""
+    for t in trail or []:
+        m = re.search(r"age=(\d+)d", str(t))
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def _charge_date_from(as_of_iso, age_days) -> str:
+    """Best-effort charge date = ticket date − age. '' if either is missing."""
+    if not as_of_iso or age_days is None:
+        return ""
+    try:
+        from datetime import datetime, timedelta
+        d = datetime.fromisoformat(str(as_of_iso).replace("Z", "+00:00"))
+        return (d - timedelta(days=int(age_days))).date().isoformat()
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _refund_would_be_eval(ticket_id, email, intent, classification, result,
@@ -361,17 +368,21 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     try:
         rc = decision.reason_code
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
-            prices = _REFUND_PRICES.get((decision.currency or "").upper(), {})
+            _win = _parse_window_days(decision.guard_trail)
+            _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
+            _amt = (f"{decision.computed_amount} {decision.currency}".strip()
+                    if decision.computed_amount else "")
             draft = reply_generator.generate_refund_reply(
                 rc, classification.get("language", "EN"),
                 {
-                    "brand": reply_generator.BRAND_NAME,
-                    "refund_amount": decision.computed_amount,
-                    "currency": decision.currency,
-                    "window_days": _parse_window_days(decision.guard_trail),
-                    "report_price": prices.get("report"),
-                    "renewal_price": prices.get("renewal"),
-                    "trial_price": prices.get("trial"),
+                    # canonical-template placeholders (Anna's Generic templates)
+                    "charge_amount": _amt,
+                    "charge_date": _cdate,
+                    "refund_window_days": _win,
+                    "charges_list": (f"- {_amt} (charged {_cdate})".rstrip() if _amt else ""),
+                    "it_falls": "it falls",
+                    # brand_phrase / terms_url / subscription_url default to WWIQTEST;
+                    # per site+language resolution is a follow-up (data in the xlsx).
                 },
             )
             if draft:

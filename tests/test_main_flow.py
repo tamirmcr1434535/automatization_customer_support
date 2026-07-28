@@ -1519,12 +1519,13 @@ def _refund_reply_ctx(nexus_charges):
     return nexus
 
 
-_REPORT_CHARGE = [{"charge_id": "c1", "type": "cross_sale", "amount": 1990,
-                   "currency": "JPY", "status": "success", "refundable": True,
-                   "date": "2026-07-20"}]
 _SUB_CHARGE = [{"charge_id": "s1", "type": "renewal", "amount": 5490,
                 "currency": "JPY", "status": "success", "refundable": True,
                 "date": "2026-07-22"}]
+# A single refundable renewal dated well before the ticket → OUTSIDE_REFUND_WINDOW.
+_OUTSIDE_CHARGE = [{"charge_id": "o1", "type": "renewal", "amount": 5490,
+                    "currency": "JPY", "status": "success", "refundable": True,
+                    "date": "2026-06-01"}]
 
 _AUTO_CODES = {"WOULD_BE_REFUNDED", "REPORT_NOT_REFUNDABLE_PER_TOS", "OUTSIDE_REFUND_WINDOW"}
 
@@ -1534,7 +1535,7 @@ def test_refund_reply_drafted_but_NOT_sent_when_disabled():
     # posts NOTHING to the customer.
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}
-    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    nexus = _refund_reply_ctx(_OUTSIDE_CHARGE)
     with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
          patch.object(main, "nexus_client", nexus), \
          patch.object(main, "REFUNDS_ENABLED", False), \
@@ -1546,8 +1547,8 @@ def test_refund_reply_drafted_but_NOT_sent_when_disabled():
         zd.get_ticket_image_attachments.return_value = []
         main._refund_would_be_eval(
             "9200", "x@e.com", "REFUND_REQUEST", cls, result,
-            ticket_text="please refund the report", as_of_date="2026-07-24T00:00:00Z")
-    assert result["refund_reason_code"] == "REPORT_NOT_REFUNDABLE_PER_TOS"
+            ticket_text="please refund my subscription", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"
     assert result.get("refund_draft_reply") == "DRAFT"   # drafted + logged
     assert "refund_reply_sent" not in result             # never marked sent
     zd.post_reply.assert_not_called()                    # SAFETY: nothing posted
@@ -1557,7 +1558,7 @@ def test_refund_reply_sent_when_enabled_for_deny():
     # With REFUNDS_ENABLED=true a deterministic DENY (no money movement) posts.
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}
-    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    nexus = _refund_reply_ctx(_OUTSIDE_CHARGE)
     with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
          patch.object(main, "nexus_client", nexus), \
          patch.object(main, "REFUNDS_ENABLED", True), \
@@ -1569,8 +1570,8 @@ def test_refund_reply_sent_when_enabled_for_deny():
         zd.get_ticket_image_attachments.return_value = []
         main._refund_would_be_eval(
             "9201", "x@e.com", "REFUND_REQUEST", cls, result,
-            ticket_text="please refund the report", as_of_date="2026-07-24T00:00:00Z")
-    assert result["refund_reason_code"] == "REPORT_NOT_REFUNDABLE_PER_TOS"
+            ticket_text="please refund my subscription", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"
     assert result.get("refund_reply_sent") is True
     zd.post_reply.assert_called_once_with("9201", "DRAFT")
 
@@ -1627,7 +1628,7 @@ def test_refunds_enabled_for_gate():
 def test_refund_reply_sent_only_for_enabled_brand():
     # Canary: refunds enabled ONLY for the ticket's brand → posts; other brand → not.
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
-    nexus = _refund_reply_ctx(_REPORT_CHARGE)
+    nexus = _refund_reply_ctx(_OUTSIDE_CHARGE)
     def run(brand_domain):
         result = {}
         with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
