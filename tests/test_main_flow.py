@@ -1645,6 +1645,56 @@ def test_refund_approved_reply_NOT_sent_without_execution():
     zd.post_reply.assert_not_called()                    # not executed → not sent
 
 
+# ── AN-192 brand resolution / x-host / amount guard helpers ────────────────── #
+
+def test_zendesk_brand_key():
+    assert main._zendesk_brand_key({"brand_id": 16656108529948}) == "wwiqtest"
+    assert main._zendesk_brand_key({"brand_id": 23720105185436}) == "iqpro"
+    assert main._zendesk_brand_key({"brand_id": None}) == ""
+    assert main._zendesk_brand_key({}) == ""
+
+
+def test_refund_xhost_map():
+    assert main._refund_xhost("16personas") == "16_persons"
+    assert main._refund_xhost("wwiqtest") == "ww_iqtest"
+    assert main._refund_xhost("unknown") == ""
+
+
+def test_amount_guard():
+    assert main._amount_guard(5490, "JPY")[0] is True        # exact
+    assert main._amount_guard(5900, "JPY")[0] is True        # within +20%
+    assert main._amount_guard(9000, "JPY")[0] is False       # >20% high
+    assert main._amount_guard(0, "JPY")[0] is False          # zero
+    assert main._amount_guard(None, "JPY")[0] is False       # null
+    assert main._amount_guard(5490, "XYZ")[0] is False       # unknown currency
+
+
+def test_amount_anomaly_blocks_refund():
+    # WOULD_BE but the charge amount is wildly off the standard renewal → override
+    # to REFUND_AMOUNT_ANOMALY (human), no execution, no reply.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_SUB_CHARGE)
+    rcm = MagicMock()
+    rcm.is_configured.return_value = True
+    rcm.get_charge_detail.return_value = {"disputed": False, "refundable": True,
+                                          "amount": 99999, "currency": "JPY"}  # anomalous
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "refund_client", rcm), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9502", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund my subscription", as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "REFUND_AMOUNT_ANOMALY"
+    rcm.create_refund.assert_not_called()
+    zd.post_reply.assert_not_called()
+
+
 # ── AN-192 dispute guard + refund execution (test path) ───────────────────── #
 
 def test_dispute_guard_blocks_refund_and_escalates():
@@ -1682,7 +1732,8 @@ def test_refund_executed_when_enabled_and_clean():
     nexus = _refund_reply_ctx(_SUB_CHARGE)
     rcm = MagicMock()
     rcm.is_configured.return_value = True
-    rcm.get_charge_detail.return_value = {"disputed": False, "refundable": True}
+    rcm.get_charge_detail.return_value = {"disputed": False, "refundable": True,
+                                          "amount": 5490, "currency": "JPY"}  # within ±20% of 5490
     rcm.create_refund.return_value = {"status": "refunded", "executed": True, "refunded_amount": 5490}
     with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
          patch.object(main, "nexus_client", nexus), \
