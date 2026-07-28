@@ -1752,6 +1752,7 @@ def test_refund_executed_when_enabled_and_clean():
          patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
          patch.object(main, "zendesk") as zd, \
          patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.refund_abuse, "check", return_value=(True, "")), \
          patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
          patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
         zd.get_ticket_image_attachments.return_value = []
@@ -1764,6 +1765,40 @@ def test_refund_executed_when_enabled_and_clean():
     assert result.get("refund_executed") is True
     assert result.get("refund_execution_status") == "refunded"
     zd.post_reply.assert_called_once()         # executed → approved reply sent
+
+
+def test_abuse_guard_blocks_execution():
+    # Clean WOULD_BE on a live, resolvable brand, but the abuse/velocity guard
+    # trips (e.g. per-brand daily cap or per-email velocity) → do NOT execute the
+    # money move; escalate to a human. No refund, no reply.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_SUB_CHARGE)
+    rcm = MagicMock()
+    rcm.is_configured.return_value = True
+    rcm.get_charge_detail.return_value = {"disputed": False, "refundable": True,
+                                          "amount": 5490, "currency": "JPY"}
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "refund_client", rcm), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "REFUNDS_ENABLED_BRANDS", set()), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.refund_abuse, "check", return_value=(False, "email_velocity:1>=1/30d")), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9506", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="refund my subscription", as_of_date="2026-07-24T00:00:00Z",
+            brand="16types")
+    assert result["refund_decision"] == "YES"                       # engine still says would-refund
+    assert str(result.get("refund_execution_status")).startswith("skipped_abuse_guard")
+    rcm.create_refund.assert_not_called()                           # money move blocked by velocity guard
+    zd.post_reply.assert_not_called()                               # no auto reply
+    assert "PAUSED" in (result.get("refund_internal_note") or "")   # agent told why (spike)
+    zd.add_internal_note.assert_called_once()                       # note posted to the agent
 
 
 def test_refund_not_executed_when_xhost_unresolved():
