@@ -36,7 +36,11 @@ class RefundClient:
     def __init__(self, provider: str = "nexus", enabled: bool = False):
         self.provider = provider
         self.enabled = enabled  # mirrors REFUNDS_ENABLED — gates create_refund only
-        self.base = os.getenv("REFUND_API_BASE_URL", "").rstrip("/")
+        # PROD refund/charge-detail API (same host as Nexus search-subscription).
+        # base defaults to prod; the TOKEN is intentionally NOT defaulted — until it
+        # is set the client is "not configured", so the guard is skipped and nothing
+        # is called. Execution additionally needs `enabled` (REFUNDS_ENABLED).
+        self.base = os.getenv("REFUND_API_BASE_URL", "https://apinexus.cellon.ai").rstrip("/")
         self.token = os.getenv("REFUND_API_TOKEN", "").strip()
         self.x_host = os.getenv("REFUND_API_X_HOST", "").strip()
         self.timeout = int(os.getenv("REFUND_API_TIMEOUT", "30"))

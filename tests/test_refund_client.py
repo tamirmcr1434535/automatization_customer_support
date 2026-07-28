@@ -20,6 +20,21 @@ def _resp(status, body):
     return r
 
 
+def test_default_base_prod_and_inert_without_token(monkeypatch):
+    # Base defaults to PROD, but with no token the client is "not configured" →
+    # guard skipped, refund a no-op, NOTHING is called. This is the safety property
+    # that keeps everything would-be until the token is set.
+    monkeypatch.delenv("REFUND_API_TOKEN", raising=False)
+    monkeypatch.delenv("REFUND_API_BASE_URL", raising=False)
+    c = rc_mod.RefundClient(enabled=True)          # even "enabled"
+    assert c.base == "https://apinexus.cellon.ai"
+    assert c.is_configured() is False              # no token
+    with patch.object(rc_mod.requests, "post") as p:
+        assert c.get_charge_detail("ch") is None
+        assert c.create_refund(charge_id="ch")["executed"] is False
+        p.assert_not_called()                      # SAFETY: no network at all
+
+
 def test_charge_detail_returns_chargedata():
     c = _client()
     body = {"data": {"chargeData": {"charge_id": "ch", "disputed": True, "refundable": False}}}
