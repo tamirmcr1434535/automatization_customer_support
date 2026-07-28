@@ -1,4 +1,6 @@
-"""Unit tests for refund_abuse — per-brand hourly rate + daily cap + per-email velocity, fail-closed."""
+"""Unit tests for refund_abuse — hourly burst rate + ADAPTIVE daily cap (learned from
+history) + per-email velocity, fail-closed."""
+import contextlib
 from unittest.mock import patch
 import refund_abuse
 
@@ -8,9 +10,13 @@ class _Job:
     def result(self): return self._rows
 
 class _Client:
-    """Fake BQ client. Returns one row of counts, or raises if boom=True."""
-    def __init__(self, brand_hour=0, brand_today=0, email_recent=0, boom=False):
-        self._row = [{"brand_hour": brand_hour, "brand_today": brand_today, "email_recent": email_recent}]
+    """Fake BQ client returning one counts row, or raising if boom=True."""
+    def __init__(self, brand_hour=0, brand_today=0, email_recent=0,
+                 wb_baseline_total=0, wb_baseline_days=0, boom=False):
+        self._row = [{"brand_hour": brand_hour, "brand_today": brand_today,
+                      "email_recent": email_recent,
+                      "wb_baseline_total": wb_baseline_total,
+                      "wb_baseline_days": wb_baseline_days}]
         self._boom = boom
     def query(self, q, job_config=None):
         if self._boom:
@@ -18,45 +24,66 @@ class _Client:
         return _Job(self._row)
 
 
-def _cfg(**kw):
-    base = {"MAX_PER_HOUR_PER_BRAND": 5, "MAX_PER_DAY_PER_BRAND": 30, "MAX_PER_EMAIL": 2}
-    base.update(kw)
-    return [patch.object(refund_abuse, "is_enabled", return_value=True)] + \
-           [patch.object(refund_abuse, k, v) for k, v in base.items()]
-
-
 def _run(client, **thresholds):
-    import contextlib
+    base = {"MAX_PER_HOUR_PER_BRAND": 5, "MAX_PER_EMAIL": 2,
+            "DAILY_FACTOR": 3.0, "DAILY_FLOOR": 5, "DAILY_HARD_MAX": 100}
+    base.update(thresholds)
     with contextlib.ExitStack() as es:
-        for p in _cfg(**thresholds):
-            es.enter_context(p)
+        es.enter_context(patch.object(refund_abuse, "is_enabled", return_value=True))
+        for k, v in base.items():
+            es.enter_context(patch.object(refund_abuse, k, v))
         return refund_abuse.check("iqpro", "a@e.com", client=client)
 
 
+# ── adaptive_daily_cap unit ─────────────────────────────────────────────── #
+
+def test_adaptive_cap_math():
+    with patch.object(refund_abuse, "DAILY_FACTOR", 3.0), \
+         patch.object(refund_abuse, "DAILY_FLOOR", 5), \
+         patch.object(refund_abuse, "DAILY_HARD_MAX", 100):
+        assert refund_abuse.adaptive_daily_cap(0, 0) == 5        # new brand → floor
+        assert refund_abuse.adaptive_daily_cap(28, 14) == 6      # 2/day × 3 = 6
+        assert refund_abuse.adaptive_daily_cap(1000, 10) == 100  # clamped to hard max
+
+
+# ── check() ─────────────────────────────────────────────────────────────── #
+
 def test_ok_when_under_all_limits():
-    ok, why = _run(_Client(brand_hour=2, brand_today=5, email_recent=1))
+    # baseline 2/day → cap 6; today=3 is under
+    ok, why = _run(_Client(brand_hour=2, brand_today=3, email_recent=1,
+                           wb_baseline_total=28, wb_baseline_days=14))
     assert ok is True and why == ""
 
 
 def test_blocks_on_brand_hourly_rate():
-    ok, why = _run(_Client(brand_hour=5, brand_today=5, email_recent=0))
+    ok, why = _run(_Client(brand_hour=5, brand_today=1, email_recent=0,
+                           wb_baseline_total=28, wb_baseline_days=14))
     assert ok is False and why.startswith("brand_rate")
 
 
-def test_blocks_on_brand_daily_cap():
-    ok, why = _run(_Client(brand_hour=1, brand_today=30, email_recent=0))
-    assert ok is False and why.startswith("brand_daily_cap")
+def test_adaptive_daily_cap_blocks_small_brand():
+    # new/tiny brand (no baseline) → cap = floor 5; today already 5 → blocked
+    ok, why = _run(_Client(brand_hour=1, brand_today=5, email_recent=0,
+                           wb_baseline_total=0, wb_baseline_days=0))
+    assert ok is False and why.startswith("brand_daily_adaptive")
+
+
+def test_adaptive_daily_cap_scales_with_history():
+    # busy brand: baseline 10/day → cap 30; today=20 still allowed
+    ok, why = _run(_Client(brand_hour=1, brand_today=20, email_recent=0,
+                           wb_baseline_total=140, wb_baseline_days=14))
+    assert ok is True and why == ""
 
 
 def test_blocks_on_email_velocity_2_per_day():
-    # 2 already refunded in the window → 3rd blocked (cap = 2)
-    ok, why = _run(_Client(brand_hour=1, brand_today=3, email_recent=2))
+    ok, why = _run(_Client(brand_hour=1, brand_today=1, email_recent=2,
+                           wb_baseline_total=140, wb_baseline_days=14))
     assert ok is False and why.startswith("email_velocity")
 
 
 def test_email_second_refund_allowed():
-    # 1 prior refund → a 2nd is still allowed (cap = 2)
-    ok, why = _run(_Client(brand_hour=1, brand_today=3, email_recent=1))
+    ok, why = _run(_Client(brand_hour=1, brand_today=1, email_recent=1,
+                           wb_baseline_total=140, wb_baseline_days=14))
     assert ok is True and why == ""
 
 
