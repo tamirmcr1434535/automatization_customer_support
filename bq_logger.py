@@ -83,6 +83,8 @@ SCHEMA = [
     bigquery.SchemaField("refund_reply_template", "STRING"),   # which template produced the draft (reason code)
     bigquery.SchemaField("refund_reply_sent",     "BOOLEAN"),  # TRUE only if actually posted to the customer
     bigquery.SchemaField("refund_brand",          "STRING"),   # resolved brand (soft-start per-brand gate)
+    bigquery.SchemaField("refund_internal_note",  "STRING"),   # SHADOW: agent-facing note the bot WOULD add on escalated refunds
+    bigquery.SchemaField("refund_note_added",     "BOOLEAN"),  # TRUE only if the internal note was actually posted
 
     # Error info
     bigquery.SchemaField("error",            "STRING"),
@@ -197,6 +199,8 @@ def log_result(result: dict):
             "refund_reply_template": result.get("refund_reply_template") or "",
             "refund_reply_sent":     bool(result.get("refund_reply_sent", False)),
             "refund_brand":          result.get("refund_brand") or "",
+            "refund_internal_note":  result.get("refund_internal_note") or "",
+            "refund_note_added":     bool(result.get("refund_note_added", False)),
 
             # Error
             "error":              result.get("error") or "",
