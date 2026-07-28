@@ -192,6 +192,78 @@ _BRAND_PHRASE = {
     "16types": "16 Types Growth Plan",
 }
 
+# ── Authoritative brand from the Zendesk native brand_id (reliable — beats parsing
+# domains out of ticket text). Maps to our brand_key. (GET /api/v2/brands.json) ── #
+_ZENDESK_BRAND_TO_KEY = {
+    21262012006172: "16personas",
+    27151310564636: "16types",
+    18445895176860: "iqbooster",
+    23720105185436: "iqpro",
+    18446370704284: "quickiqtest",
+    16656108529948: "wwiqtest",
+    18445181123996: "wwpersonalitytest",
+}
+
+
+def _zendesk_brand_key(ticket: dict) -> str:
+    """Brand_key from the Zendesk ticket's brand_id, or '' if absent/unmapped."""
+    try:
+        return _ZENDESK_BRAND_TO_KEY.get(int(ticket.get("brand_id")), "")
+    except (TypeError, ValueError):
+        return ""
+
+
+# ── Per-brand x-host for the refund API. The DEV API ignores x-host, but PROD
+# enforces it per brand, so we send the right one. Values are best-guess defaults
+# (confirm with backend) and can be overridden by REFUND_API_XHOST_MAP (JSON). ── #
+_REFUND_XHOST = {
+    "16personas": "16_persons",   # confirmed on dev
+    "16types": "16_types",
+    "iqbooster": "iq_booster",
+    "iqpro": "iq_pro",
+    "wwiqtest": "ww_iqtest",
+    "wwpersonalitytest": "ww_personality",
+    "quickiqtest": "quick_iqtest",
+}
+try:
+    _REFUND_XHOST.update(json.loads(os.getenv("REFUND_API_XHOST_MAP", "") or "{}"))
+except (ValueError, TypeError):
+    log.warning("REFUND_API_XHOST_MAP is not valid JSON — using defaults")
+
+
+def _refund_xhost(brand: str) -> str:
+    return _REFUND_XHOST.get(brand, "")
+
+
+# ── Amount guard: standard renewal price per currency (from the Pricing sheet).
+# An auto-refund's charge must be a non-zero amount within ±20% of this — anything
+# else (0/null, or an anomalous amount) is escalated to a human. ── #
+_RENEWAL_PRICE = {
+    "JPY": 5490.0, "EUR": 29.99, "USD": 29.99, "KRW": 39990.0,
+    "TRY": 1290.0, "NOK": 299.0, "SEK": 299.0,
+}
+_REFUND_AMOUNT_BAND = float(os.getenv("REFUND_AMOUNT_BAND", "0.20"))
+
+
+def _amount_guard(amount, currency) -> "tuple[bool, str]":
+    """(ok, reason). Reject zero/null, unknown currency, or >band deviation from
+    the standard renewal price."""
+    if amount is None:
+        return False, "amount missing"
+    try:
+        a = float(amount)
+    except (TypeError, ValueError):
+        return False, f"amount not numeric ({amount!r})"
+    if a <= 0:
+        return False, "zero/negative amount"
+    ref = _RENEWAL_PRICE.get((currency or "").upper())
+    if ref is None:
+        return False, f"no reference renewal price for currency {currency!r}"
+    if abs(a - ref) / ref > _REFUND_AMOUNT_BAND:
+        return False, (f"amount {a} {currency} deviates >"
+                       f"{int(_REFUND_AMOUNT_BAND*100)}% from standard {ref}")
+    return True, ""
+
 
 def refunds_enabled_for(brand: str) -> bool:
     """Whether refund replies may actually be SENT for `brand` (soft-start gate).
@@ -235,7 +307,7 @@ def _charge_date_from(as_of_iso, age_days) -> str:
 
 
 def _refund_would_be_eval(ticket_id, email, intent, classification, result,
-                          ticket_text="", country="", as_of_date=None):
+                          ticket_text="", country="", as_of_date=None, brand=""):
     """Compute the would-be refund decision (flow #1, Nexus-only) and record it on
     `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
     Never moves money. Caller wraps this in try/except (strictly additive).
@@ -346,36 +418,44 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
         log.warning(f"[{ticket_id}] refund disambiguation failed (non-blocking): {e}")
 
-    # ── Dispute guard (charge-detail) — applies to ALL refund cases ──────── #
-    # We must NEVER refund a charge with an open dispute/chargeback (nor one the
-    # provider marks non-refundable). Read-only lookup; if the candidate charge is
-    # disputed / not refundable, OVERRIDE the decision to NO → a human handles it.
+    # Authoritative brand: Zendesk brand_id (passed in) → else domain-from-text.
+    _brand = brand or _brand_key(ticket_text)
+    result["refund_brand"] = _brand
+
+    # ── Dispute + amount guard (charge-detail) — applies to ALL refund cases ── #
+    # We must NEVER refund a charge that is (a) disputed / not refundable, or (b)
+    # (for an approved refund) zero/null or off the standard renewal price by >band.
+    # Read-only lookup; on any guard failure OVERRIDE the decision to NO → human.
     # Only runs when the refund API is configured (REFUND_API_* env); otherwise
     # skipped, so prod (unconfigured) behaves exactly as before.
     try:
         _cand = decision.candidate_charge_id
         if _cand and refund_client.is_configured():
-            _det = refund_client.get_charge_detail(_cand)
+            _det = refund_client.get_charge_detail(_cand, x_host=_refund_xhost(_brand))
             if _det is not None:
                 result["refund_charge_disputed"] = bool(_det.get("disputed"))
                 result["refund_charge_refundable"] = _det.get("refundable")
-                if _det.get("disputed") or _det.get("refundable") is False:
+                _override = None
+                if _det.get("disputed"):
+                    _override = ("REFUND_DISPUTE_OPEN",
+                                 "Open dispute/chargeback on the charge — cannot refund; a human must handle.")
+                elif _det.get("refundable") is False:
+                    _override = ("REFUND_NOT_REFUNDABLE",
+                                 "The charge is not refundable (already refunded / blocked) — a human must handle.")
+                elif decision.reason_code == "WOULD_BE_REFUNDED":
+                    _ok, _why = _amount_guard(_det.get("amount"), _det.get("currency"))
+                    if not _ok:
+                        _override = ("REFUND_AMOUNT_ANOMALY",
+                                     f"Refund amount guard: {_why} — a human must handle.")
+                if _override:
                     from dataclasses import replace as _replace
-                    _disp = bool(_det.get("disputed"))
-                    decision = _replace(
-                        decision,
-                        would_be_refunded=False,
-                        reason_code=("REFUND_DISPUTE_OPEN" if _disp else "REFUND_NOT_REFUNDABLE"),
-                        human_message=(
-                            "Open dispute/chargeback on the charge — cannot refund; a human must handle."
-                            if _disp else
-                            "The charge is not refundable (already refunded / blocked) — a human must handle."
-                        ),
-                    )
-                    log.info(f"[{ticket_id}] dispute guard: charge {_cand} disputed={_disp} "
-                             f"refundable={_det.get('refundable')} → override → {decision.reason_code}")
+                    decision = _replace(decision, would_be_refunded=False,
+                                        reason_code=_override[0], human_message=_override[1])
+                    log.info(f"[{ticket_id}] refund guard: charge {_cand} → override → {decision.reason_code} "
+                             f"(disputed={_det.get('disputed')} refundable={_det.get('refundable')} "
+                             f"amount={_det.get('amount')} {_det.get('currency')})")
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
-        log.warning(f"[{ticket_id}] dispute guard failed (non-blocking): {e}")
+        log.warning(f"[{ticket_id}] refund guard failed (non-blocking): {e}")
 
     # Map onto result (refund_* keys → bq_logger + slack). Additive only.
     result["refund_decision"]              = "YES" if decision.would_be_refunded else "NO"
@@ -407,8 +487,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     # is false the customer receives NOTHING; everything still goes to a human.
     try:
         rc = decision.reason_code
-        brand = _brand_key(ticket_text)
-        result["refund_brand"] = brand
+        brand = _brand  # authoritative brand resolved above (Zendesk brand_id)
         # ── SCOPE (2026-07-27): SIMPLE window-based cases ONLY ───────────────── #
         # The bot AUTO-ANSWERS exactly two clean decisions (data-backed ~100% human
         # agreement): WITHIN window → approve (WOULD_BE_REFUNDED); OUTSIDE window →
@@ -447,7 +526,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # is configured (REFUND_API_*). In prod both are off → nothing moves.
                 # On dev (REFUND_API_* set + REFUNDS_ENABLED=true) it really refunds.
                 if rc == "WOULD_BE_REFUNDED" and refunds_enabled_for(brand):
-                    _ref = refund_client.create_refund(charge_id=decision.candidate_charge_id)
+                    _ref = refund_client.create_refund(
+                        charge_id=decision.candidate_charge_id, x_host=_refund_xhost(brand))
                     result["refund_execution_status"] = _ref.get("status")
                     result["refund_executed"] = bool(_ref.get("executed"))
                     log.info(f"[{ticket_id}] refund execution: {_ref.get('status')} "
@@ -1733,6 +1813,7 @@ def _process(ticket_id: str) -> dict:
                 {"confidence": 0.95, "language": "EN"}, result,
                 ticket_text=f"{subject}\n{body}",  # body holds the amount (subject rarely does)
                 as_of_date=ticket.get("created_at"),
+                brand=_zendesk_brand_key(ticket),
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -2102,6 +2183,7 @@ def _process(ticket_id: str) -> dict:
                 {"confidence": 0.95, "language": language}, result,
                 ticket_text=f"{subject}\n{body}",
                 as_of_date=ticket.get("created_at"),
+                brand=_zendesk_brand_key(ticket),
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -2234,6 +2316,7 @@ def _process(ticket_id: str) -> dict:
                 ticket_id, email, intent, classification, result,
                 ticket_text=f"{subject}\n{body}",
                 as_of_date=ticket.get("created_at"),
+                brand=_zendesk_brand_key(ticket),
             )
         except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -2656,6 +2739,14 @@ def _process(ticket_id: str) -> dict:
             human_summary = (
                 "🤖 WooCommerce returned an error during lookup — the bot "
                 "cannot tell whether this customer has a subscription. Please "
+                f"check manually.{sub_info_human}"
+            )
+        elif error_kind == "nexus_lookup_error":
+            human_summary = (
+                "🤖 The subscription service (Nexus) was temporarily "
+                "unreachable — the bot could NOT determine whether this "
+                "customer has a subscription (this is NOT a confirmation "
+                "that they have none). Please retry in a few minutes or "
                 f"check manually.{sub_info_human}"
             )
         else:
@@ -3362,6 +3453,31 @@ def _cancel_by_email(email: str, ticket_id: str) -> dict:
     else:
         woo_result = woo.cancel_subscription(email)
     woo_status = woo_result.get("status", "")
+
+    # Nexus lookup failed transiently (5xx / Cloudflare 52x / timeout /
+    # network) — the bot did NOT get a definitive answer. Route through
+    # the same "cannot determine → escalate, no customer reply" path used
+    # for WC lookup errors so we NEVER tell a paying customer they have no
+    # subscription just because Nexus hiccupped. error_kind is preserved
+    # so the human-facing note and tag reflect the real cause.
+    if woo_status == "nexus_lookup_error":
+        log.error(
+            f"[{ticket_id}] Nexus lookup error — cannot determine "
+            "subscription state, escalating (no customer reply)"
+        )
+        return {
+            "status": "wc_lookup_error",
+            "email": email,
+            "cancelled": False,
+            "source": "nexus",
+            "error_kind": "nexus_lookup_error",
+            "error_detail": woo_result.get("error_detail", ""),
+            "error_step": woo_result.get("error_step", "nexus_search_subscription"),
+            "subscription_type": None,
+            "subscription_id": None,
+            "order_count": None,
+            "plan": woo_result.get("plan"),
+        }
 
     # Successful WC outcome — return immediately
     _TERMINAL_MISS = {
