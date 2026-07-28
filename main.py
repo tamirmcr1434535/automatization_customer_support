@@ -41,6 +41,7 @@ from classifier import classify_ticket
 import refund_engine
 import refund_ocr
 import refund_disambiguate
+import refund_abuse
 from refund_client import RefundClient
 from nexus_client import NexusLookupError
 from zendesk_client import ZendeskClient, TicketNotWritableError
@@ -578,12 +579,22 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         log.warning(f"[{ticket_id}] refund NOT executed — flow resolved via "
                                     f"LLM disambiguation (low confidence); leaving to a human")
                     else:
-                        _ref = refund_client.create_refund(
-                            charge_id=decision.candidate_charge_id, x_host=_refund_xhost(brand))
-                        result["refund_execution_status"] = _ref.get("status")
-                        result["refund_executed"] = bool(_ref.get("executed"))
-                        log.info(f"[{ticket_id}] refund execution: {_ref.get('status')} "
-                                 f"(amount={_ref.get('refunded_amount')})")
+                        # Abuse / velocity guard — protects against VOLUME (mass in-window
+                        # refund farming, repeat-customer abuse, runaway execution). Checks
+                        # the BQ refund log for the per-brand daily cap and per-email
+                        # velocity. FAIL-CLOSED: any error → escalate, do not execute.
+                        _ok_abuse, _why_abuse = refund_abuse.check(brand, email)
+                        if not _ok_abuse:
+                            result["refund_execution_status"] = f"skipped_abuse_guard:{_why_abuse}"
+                            log.warning(f"[{ticket_id}] refund NOT executed — abuse/velocity guard "
+                                        f"({_why_abuse}); leaving to a human")
+                        else:
+                            _ref = refund_client.create_refund(
+                                charge_id=decision.candidate_charge_id, x_host=_refund_xhost(brand))
+                            result["refund_execution_status"] = _ref.get("status")
+                            result["refund_executed"] = bool(_ref.get("executed"))
+                            log.info(f"[{ticket_id}] refund execution: {_ref.get('status')} "
+                                     f"(amount={_ref.get('refunded_amount')})")
                 executed = bool(result.get("refund_executed"))
                 # Soft-start gate: brand must be enabled; APPROVED also needs the
                 # money to have actually moved (no-op stub unless dev API configured).
