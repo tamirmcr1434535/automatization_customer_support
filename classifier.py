@@ -111,7 +111,37 @@ A) REFUND signals (返金, 払い戻し, refund, money back, geld terug, Rücker
    → If customer mentions RENEWAL charges specifically (自動更新, auto-renewal,
      2回目の請求, second charge, renewal charge) + refund → SUB_RENEWAL_REFUND.
 
-   CRITICAL: unauthorized/unknown charge complaints are REFUND_REQUEST by default.
+   A2-STOP-ONLY CARVE-OUT — unauthorized signup, but the ONLY ask is to STOP
+     FUTURE charges, with NO money-back demand:
+   → If the customer says the subscription was set up without their knowledge /
+     they did not initiate it, AND the charge is described as an ATTEMPT or an
+     UPCOMING / first recurring charge (NOT a completed past charge they want
+     reversed), AND their only request is forward-looking ("do not charge me
+     again", "don't bill me", "cancel it so I'm not charged", "please stop the
+     subscription") with NO refund / money-back / "give it back" / "return my
+     money" wording AND NO past multi-month / amount-rose complaint
+     → TRIAL_CANCELLATION, NOT REFUND_REQUEST.
+     Rationale: there is nothing to refund yet — the customer wants the recurring
+     charge stopped going forward, which is a cancellation. The bot can safely
+     auto-cancel + reply instead of escalating to a human.
+   → HARD CONTRAST with #149230 (see above): PAST completed charges over several
+     months + amount ROSE + "stop / reverse the payments" = the customer wants
+     money BACK → keep as REFUND_REQUEST / SUB_RENEWAL_REFUND. The discriminator
+     is PAST completed charge + money-back intent (→ REFUND) vs. FUTURE / attempted
+     charge + stop-only intent (→ TRIAL_CANCELLATION). If EITHER a completed past
+     charge OR any money-back word is present, this carve-out does NOT apply.
+
+     Real-world reference (ticket #169289, July 2026):
+       "a subscription was set up in my name without my knowledge; I did not
+        initiate such a subscription. An attempt was made to charge 1,290 TL to
+        my card ... request that you do not charge me again."
+     → TRIAL_CANCELLATION (stop future charges, no money-back demand). Previously
+       misclassified as REFUND_REQUEST (91%) and escalated to a human instead of
+       being auto-cancelled.
+
+   CRITICAL: unauthorized/unknown charge complaints are REFUND_REQUEST by default,
+   UNLESS the A2-STOP-ONLY carve-out applies (unauthorized signup + stop-future-
+   charges ONLY + no completed past charge + no money-back word → TRIAL_CANCELLATION).
    Only use CHARGEBACK_THREAT if customer uses explicit threat words (see Step 3).
 
 B) CANCEL signals (解約, キャンセル, 退会, cancel, 취소, kündigen, opzeggen,

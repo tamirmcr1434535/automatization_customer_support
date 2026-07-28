@@ -2237,6 +2237,29 @@ def _process(ticket_id: str) -> dict:
         except Exception:
             log.warning(f"[{ticket_id}] Failed to fetch comments for refund check")
     _has_refund_kw = intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund)
+
+    # ── Carve-out (#169289): unauthorized-signup, STOP-FUTURE-ONLY cancellation ──
+    # The refund keyword list (_REFUND_KEYWORDS) flags "without my knowledge" /
+    # "did not sign up" as a refund signal, because such complaints usually mean
+    # the customer wants their money back. But some tickets are pure forward-
+    # looking cancellations: the sub was set up without the customer's knowledge,
+    # a charge was ATTEMPTED / is upcoming, and the ONLY ask is "do not charge me
+    # again" — no money-back demand, no fraud accusation, no completed past
+    # charge. There is nothing to refund yet, so the bot may safely auto-cancel.
+    # Kept strictly narrow (see _is_unauthorized_stop_only_cancel) so genuine
+    # disputes — #149230: past multi-month charges + amount rose + money-back —
+    # still trip the refund override below. This guard only runs for
+    # HANDLED_INTENTS, so the classifier must ALSO have picked a cancellation
+    # intent: both the LLM and this deterministic check must agree before we act.
+    if _has_refund_kw and _is_unauthorized_stop_only_cancel(_customer_text_only):
+        log.info(
+            f"[{ticket_id}] {intent}: unauthorized-signup + stop-future-charges "
+            f"only (no money-back / fraud / past charge) → treating as "
+            f"cancellation, NOT refund (carve-out #169289)"
+        )
+        result["stop_only_cancel_carveout"] = True
+        _has_refund_kw = False
+
     # IMPORTANT: check cancel signals in BODY + COMMENTS only (not subject).
     # Subjects like "Re: Your Subscription Cancellation Code" are system-generated
     # and contain "cancel" even when the customer's actual request is a pure refund.
@@ -4278,6 +4301,130 @@ def _contains_strong_refund_signal(text: str) -> bool:
         return True
 
     return False
+
+
+# ── Unauthorized-signup "stop-only" cancellation carve-out (#169289) ────── #
+# Both _REFUND_KEYWORDS and _STRONG_REFUND_SIGNALS treat unauthorized-signup
+# wording ("without my knowledge", "did not sign up") as a refund signal —
+# because such complaints usually mean the customer wants money back and a human
+# must decide. But a ticket can be a pure forward-looking cancellation: the sub
+# was created without the customer's knowledge, a charge was ATTEMPTED / is
+# upcoming, and the ONLY ask is "do not charge me again", with NO money-back
+# demand and NO completed past charge. There is nothing to refund yet, so the
+# bot may auto-cancel. The lists below are the discriminators.
+
+# Explicit "give me my money back" wording ONLY. Deliberately EXCLUDES
+# unauthorized-signup / "without my consent" phrases (those live in the broader
+# _REFUND_KEYWORDS). Presence of any of these keeps the ticket a refund.
+_MONEY_BACK_WORDS = [
+    # English
+    "refund", "money back", "get my money", "pay me back", "return my money",
+    "give me my money", "want my money", "reimburse", "reimbursement",
+    "chargeback", "charge back",
+    # Japanese
+    "返金", "払い戻し", "返済", "返還", "お金を返して", "お金返して",
+    "料金を返して", "代金を返して", "お金を戻して", "クーリングオフ",
+    "クーリング・オフ",
+    # Korean
+    "환불",
+    # German
+    "rückerstattung", "rückzahlung", "erstattet", "geld zurück",
+    "widerruf", "widerrufen",
+    # French
+    "remboursement", "rembourser", "remboursez",
+    # Spanish / Portuguese
+    "reembolso", "devolución", "devolucion", "devuelvan", "devuélvanme",
+    # Italian
+    "rimborso",
+    # Russian
+    "возврат",
+    # Dutch
+    "terugbetaling", "terugbetalen", "geld terug",
+    # Vietnamese
+    "hoàn tiền", "hoàn lại tiền", "trả lại tiền",
+    # Nordic
+    "penger tilbake", "tilbakebetaling", "återbetalning", "tilbagebetaling",
+]
+
+# Fraud / scam accusations — always a dispute, never a plain cancellation.
+_FRAUD_WORDS = [
+    "fraud", "fraudulent", "scam", "詐欺", "不正請求", "不正利用",
+    "사기", "betrug", "betrügerisch", "fraude", "estafa", "lừa đảo",
+]
+
+# Indicators a charge already COMPLETED (money left the account) — the customer
+# would want it back, so this is not a stop-only cancellation. Note "attempt to
+# charge" / "was made to charge" (an upcoming/failed charge) is intentionally
+# NOT here — that is the #169289 pattern the carve-out is meant to catch.
+_PAST_CHARGE_TAKEN_SIGNALS = [
+    "was charged", "i was charged", "you charged me", "they charged me",
+    "have been charged", "has been charged", "already charged",
+    "charged twice", "charged again", "double charged", "double-charged",
+    "charged multiple", "money was taken", "money taken", "was debited",
+    "was deducted", "has been deducted", "have been deducted",
+]
+
+# Unauthorized-signup wording: the customer says the sub was created without
+# their knowledge / they did not sign up. At least one must be present.
+_UNAUTH_SIGNUP_SIGNALS = [
+    "without my knowledge", "without my consent", "without my permission",
+    "without my authorization", "without my authorisation",
+    "did not sign up", "didn't sign up", "never signed up",
+    "i never signed up", "did not initiate", "didn't initiate",
+    "did not authorize", "didn't authorize", "did not authorise",
+    "didn't authorise", "set up in my name", "in my name without",
+    "did not agree", "didn't agree", "never agreed",
+]
+
+# Forward-looking "stop future charges / cancel" request. At least one must be
+# present so we know the customer actually wants it stopped going forward.
+_STOP_FUTURE_ONLY_SIGNALS = [
+    "do not charge me again", "don't charge me again", "not charge me again",
+    "do not charge me", "don't charge me", "stop charging", "stop the charges",
+    "no longer be charged", "not be charged again", "won't be charged",
+    "don't bill me", "do not bill me", "stop billing",
+    "cancel the subscription", "cancel my subscription",
+    "cancel this subscription", "stop the subscription",
+    "please cancel", "cancel it",
+    "do not want to be charged", "don't want to be charged",
+]
+
+
+def _is_unauthorized_stop_only_cancel(text: str) -> bool:
+    """
+    Carve-out for ticket #169289: an unauthorized-signup complaint whose ONLY
+    ask is to STOP FUTURE charges, with no money-back demand, no fraud
+    accusation, and no completed past charge. Such a ticket is a plain
+    cancellation the bot may auto-handle, not a refund for a human.
+
+    Returns True ONLY when ALL of the following hold:
+      1. an unauthorized-signup signal is present, AND
+      2. a forward-looking stop/cancel request is present, AND
+      3. NO explicit money-back word is present, AND
+      4. NO fraud/scam accusation is present, AND
+      5. NO completed-past-charge indicator is present, AND
+      6. the amount-rose / stop-past-payments pattern is absent
+         (_contains_billing_amount_complaint is False — protects #149230).
+
+    Deliberately conservative: any money-back / fraud / past-charge / amount-
+    complaint signal keeps the ticket a REFUND_REQUEST for a human.
+    """
+    if not text:
+        return False
+    t = text.lower()
+    if not any(kw in t for kw in _UNAUTH_SIGNUP_SIGNALS):
+        return False
+    if not any(kw in t for kw in _STOP_FUTURE_ONLY_SIGNALS):
+        return False
+    if any(kw in t for kw in _MONEY_BACK_WORDS):
+        return False
+    if any(kw in t for kw in _FRAUD_WORDS):
+        return False
+    if any(kw in t for kw in _PAST_CHARGE_TAKEN_SIGNALS):
+        return False
+    if _contains_billing_amount_complaint(text):
+        return False
+    return True
 
 
 # ── Explanation question detection ─────────────────────────────────────── #
