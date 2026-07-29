@@ -47,3 +47,45 @@ def test_unhandled_reason_returns_none():
 
 def test_autoreply_codes_set():
     assert rg.REFUND_AUTOREPLY_CODES == {"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"}
+
+
+# ── "Explained" variant (ticket #169403, Anna 2026-07-29) ────────────────── #
+
+def test_explained_variant_only_when_explain_charge_set():
+    # Without explain_charge → short template (no explanation section).
+    plain = rg.generate_refund_reply(
+        "OUTSIDE_REFUND_WINDOW", "EN",
+        {"refund_window_days": 14, "charges_list": "- 29.99 EUR (charged 2026-06-03)"})
+    assert "Explanation of the charge:" not in plain
+    # With explain_charge → explained template with the dedicated section.
+    explained = rg.generate_refund_reply(
+        "OUTSIDE_REFUND_WINDOW", "EN",
+        {"refund_window_days": 14, "charges_list": "- 29.99 EUR (charged 2026-06-03)",
+         "explain_charge": True, "brand": "iqpro"})
+    assert "Explanation of the charge:" in explained
+    assert "Outcome of your request:" in explained
+    assert "automatically converted to a paid subscription" in explained
+
+
+def test_explained_plan_name_varies_by_brand():
+    data = {"charge_amount": "29.99 EUR", "charge_date": "2026-07-25",
+            "refund_window_days": 14, "explain_charge": True}
+    iqpro = rg.generate_refund_reply("WOULD_BE_REFUNDED", "EN", {**data, "brand": "iqpro"})
+    types16 = rg.generate_refund_reply("WOULD_BE_REFUNDED", "EN", {**data, "brand": "16types"})
+    assert "IQ Booster brain training plan" in iqpro
+    assert "16 Types Growth Plan" not in iqpro
+    assert "16 Types Growth Plan" in types16
+    assert "IQ Booster brain training plan" not in types16
+
+
+def test_explained_has_no_markdown_brackets():
+    # Links must render as "Terms and Conditions: URL" (plain text), no [ ]( ).
+    for code in ("WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"):
+        out = rg.generate_refund_reply(
+            code, "EN",
+            {"charge_amount": "29.99 EUR", "charge_date": "2026-07-25",
+             "refund_window_days": 14, "charges_list": "- 29.99 EUR (charged 2026-06-03)",
+             "explain_charge": True, "brand": "iqpro",
+             "terms_url": "https://x/terms.pdf", "subscription_url": "https://x/sub.pdf"})
+        assert "](" not in out and "[" not in out and "]" not in out
+        assert "Terms and Conditions: https://x/terms.pdf" in out

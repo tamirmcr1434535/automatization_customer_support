@@ -356,16 +356,113 @@ def _master_generic_denied(d: dict) -> str:
     )
 
 
+# ── "Explained" refund templates (ticket #169403, Anna 2026-07-29) ───────── #
+# Used ONLY when the customer asks WHY the charge happened ("why was I charged?"
+# / "what is this charge?") — main.py sets data["explain_charge"]=True on the
+# refund path. These reproduce Anna's canonical "with explanation" macros: a
+# dedicated "Explanation of the charge:" first section (trial → auto-conversion →
+# renewal, with the terms/consent framing) followed by the refund outcome. When
+# the customer does NOT ask why, the shorter _master_generic_* templates above
+# are used unchanged.
+#
+# Plan name is a variable: 16types customers are on the "16 Types Growth Plan";
+# every other brand cross-sells the "IQ Booster brain training plan" (Anna).
+def _plan_name(d: dict) -> str:
+    return ("16 Types Growth Plan"
+            if (d.get("brand") or "").lower() == "16types"
+            else "IQ Booster brain training plan")
+
+
+def _charge_explanation_block(d: dict, *, plural: bool) -> str:
+    plan = _plan_name(d)
+    tail = (
+        "The charge(s) referenced in your request correspond to these "
+        "subscription renewal payments."
+        if plural else
+        "The charge referenced in your request corresponds to one of these "
+        "subscription renewal payments."
+    )
+    return (
+        "Explanation of the charge:\n"
+        f"When you purchased your test results on our website, this purchase "
+        f"included a trial of our {plan}. At the time of this initial purchase, "
+        "you agreed to the terms of the plan on the checkout page, including the "
+        "terms governing the trial. The trial period commenced immediately upon "
+        "purchase.\n\n"
+        "In accordance with these terms, you were provided 7 days from the start "
+        "of the trial to cancel if you did not wish to continue. As the trial was "
+        "not cancelled within this 7-day period, it automatically converted to a "
+        "paid subscription, consistent with the terms agreed to at checkout. "
+        "Following this conversion, the subscription renews automatically at the "
+        f"end of each billing period unless cancelled. {tail}"
+    )
+
+
+def _master_generic_approved_explained(d: dict) -> str:
+    terms, sub = _links(d)
+    return (
+        "Hello,\n\n"
+        "Thank you for contacting us. We appreciate your patience while we review your request.\n\n"
+        f"{_charge_explanation_block(d, plural=False)}\n\n"
+        "Outcome of your request:\n"
+        f"We have reviewed your refund request regarding the {_brand_phrase(d)} charge of "
+        f"{d.get('charge_amount','')}, dated {d.get('charge_date','')}. This charge falls within "
+        f"our applicable refund window ({d.get('refund_window_days','')} days from the payment "
+        "date). Accordingly, your refund has been approved and processed to your original payment "
+        "method.\n\n"
+        "Please allow up to 10 business days for the refunded amount to appear, depending on your "
+        "bank or card issuer.\n\n"
+        f"For further information, please refer to our Terms and Conditions: {terms} and our "
+        f"Subscription Policies: {sub}.\n\n"
+        "Your subscription has been cancelled, and no further charges will be applied.\n\n"
+        "Should you have any questions regarding the product itself, please do not hesitate to "
+        "contact us."
+    )
+
+
+def _master_generic_denied_explained(d: dict) -> str:
+    terms, sub = _links(d)
+    it_falls = d.get("it_falls") or "it falls"
+    return (
+        "Hello,\n\n"
+        "Thank you for contacting us. We appreciate your patience while we review your request.\n\n"
+        f"{_charge_explanation_block(d, plural=True)}\n\n"
+        "Outcome of your request:\n"
+        f"We have reviewed your refund request regarding your {_brand_phrase(d)} charge(s). The "
+        f"following charge(s) do not qualify for a refund under our policy, as {it_falls} outside "
+        f"the applicable refund window ({d.get('refund_window_days','')} days from the payment "
+        "date):\n\n"
+        f"{d.get('charges_list','')}\n\n"
+        "We regret any inconvenience this may cause.\n\n"
+        f"For further information, please refer to our Terms and Conditions: {terms} and our "
+        f"Subscription Policies: {sub}.\n\n"
+        "Your subscription has been cancelled, and no further charges will be applied.\n\n"
+        "Should you have any questions regarding the product itself, please do not hesitate to "
+        "contact us."
+    )
+
+
 _REFUND_MASTERS = {
     "WOULD_BE_REFUNDED": _master_generic_approved,
     "OUTSIDE_REFUND_WINDOW": _master_generic_denied,
 }
 
+_REFUND_MASTERS_EXPLAINED = {
+    "WOULD_BE_REFUNDED": _master_generic_approved_explained,
+    "OUTSIDE_REFUND_WINDOW": _master_generic_denied_explained,
+}
+
 
 def refund_master_reply(reason_code: str, data: dict) -> str | None:
-    """English master refund reply for `reason_code`, or None if we don't auto-answer it."""
-    builder = _REFUND_MASTERS.get(reason_code)
-    return builder(data or {}) if builder else None
+    """English master refund reply for `reason_code`, or None if we don't auto-answer it.
+
+    When `data["explain_charge"]` is set (customer asked WHY the charge happened),
+    the "explained" variant with the "Explanation of the charge:" section is used.
+    """
+    data = data or {}
+    table = _REFUND_MASTERS_EXPLAINED if data.get("explain_charge") else _REFUND_MASTERS
+    builder = table.get(reason_code)
+    return builder(data) if builder else None
 
 
 def generate_refund_reply(reason_code: str, language: str, data: dict) -> str | None:

@@ -2076,12 +2076,12 @@ def test_llm_disambiguated_refund_not_auto_executed():
     zd.post_reply.assert_not_called()                              # no auto approve reply
 
 
-def test_refund_explanation_question_suppressed_even_when_enabled():
-    # Guard 2a (2026-07-29, Anna): if the customer asks WHY the charge happened
-    # ("why was I charged?" / "what is this charge?"), the bot must NOT auto-answer
-    # a refund approve/deny — a human must explain the charge. This holds even on a
-    # live brand and even for a clean OUTSIDE_REFUND_WINDOW deny that would
-    # otherwise post. The refund intent still goes to a human as usual.
+def test_refund_explanation_question_uses_explained_template():
+    # why-branch (2026-07-29, Anna): if the customer asks WHY the charge happened
+    # ("why was I charged?" / "what is this charge?"), the bot answers with the
+    # "explained" template variant (data["explain_charge"]=True) instead of the
+    # bare approve/deny — it does NOT suppress. (Cross-sale ambiguity still
+    # suppresses; see test_llm_disambiguated_refund_not_auto_executed.)
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}
     nexus = _refund_reply_ctx(_OUTSIDE_CHARGE)  # clean single renewal → OUTSIDE_REFUND_WINDOW
@@ -2091,17 +2091,20 @@ def test_refund_explanation_question_suppressed_even_when_enabled():
          patch.object(main, "zendesk") as zd, \
          patch.object(main.refund_ocr, "is_enabled", return_value=False), \
          patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
-         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT") as gen:
         zd.get_ticket_image_attachments.return_value = []
         main._refund_would_be_eval(
             "9210", "x@e.com", "REFUND_REQUEST", cls, result,
             ticket_text="Why was I charged? What is this charge for?",
             as_of_date="2026-07-24T00:00:00Z")
     assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"  # engine unchanged
-    assert result.get("refund_reply_suppressed") == "explanation_question"
-    assert "refund_draft_reply" not in result                       # no draft generated
-    assert "refund_reply_sent" not in result
-    zd.post_reply.assert_not_called()                               # SAFETY: nothing posted
+    assert "refund_reply_suppressed" not in result                  # NOT suppressed — explained instead
+    assert result.get("refund_draft_reply") == "DRAFT"              # explained draft generated
+    # the explained variant was requested (explain_charge flag passed through)
+    _rc, _lang, _data = gen.call_args.args
+    assert _data.get("explain_charge") is True
+    assert result.get("refund_reply_sent") is True                  # deny sent (with explanation)
+    zd.post_reply.assert_called_once_with("9210", "DRAFT")
 
 
 def test_refund_clean_subscription_still_auto_answers_when_asked_no_why():
