@@ -528,7 +528,66 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         # NOTHING; instead the bot leaves an INTERNAL NOTE explaining why. Both the
         # customer reply and the internal note are gated by refunds_enabled_for(brand)
         # — shadow (logged only) until a brand goes live.
+        #
+        # ── Refund-launch safety guards (2026-07-29, Anna) ───────────────────── #
+        # Before auto-answering a clean subscription window decision, bail out to a
+        # human in two cases:
+        #  2a) the customer is asking for an EXPLANATION ("why was I charged?" /
+        #      "what is this charge?") — a refund approve/deny does not answer that;
+        #      a human must explain the charge (covers cross-sale / add-on "why?"
+        #      questions Anna flagged).
+        #  2b) the account ALSO carries a cross_sale (IQ Test Report) or first_sale
+        #      (IQ Test fee) charge AND the flow was routed to the subscription only
+        #      via a SOFT signal (unauthorized-recurring heuristic or LLM
+        #      disambiguation) — i.e. the customer never named an amount or charge
+        #      type, so they may actually be disputing the cross-sale. Auto-answering
+        #      about the subscription would silently ignore that. Explicit routes
+        #      (stated amount / "report" keyword / date) are unaffected.
+        _refund_suppress = None
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
+            if _contains_explanation_question(eff_text or ""):
+                _refund_suppress = "explanation_question"
+            else:
+                _has_cross_or_first = any(
+                    str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
+                    for c in ((nexus_data or {}).get("charges") or [])
+                )
+                _soft_routed = any(
+                    m in (decision.guard_trail or [])
+                    for m in ("dispute_target_subscription", "llm_disambiguated")
+                )
+                if _has_cross_or_first and _soft_routed:
+                    _refund_suppress = "cross_sale_ambiguous_route"
+        if _refund_suppress:
+            result["refund_reply_suppressed"] = _refund_suppress
+            log.info(
+                f"[{ticket_id}] refund auto-reply SUPPRESSED ({_refund_suppress}) "
+                f"— leaving to a human"
+            )
+            # Only touch the ticket when refunds are LIVE for this brand. In shadow
+            # mode we record the suppression (BQ/Slack) but never mutate the ticket,
+            # so Anna's shadow eval stays non-invasive.
+            if refunds_enabled_for(brand):
+                _note = (
+                    "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
+                    + (
+                        "The customer is asking for an explanation of a charge "
+                        "(\"why was I charged?\" / \"what is this?\"). A refund "
+                        "approve/deny does not answer that — please identify the "
+                        "charge(s) and explain."
+                        if _refund_suppress == "explanation_question" else
+                        "The account also has a one-time / cross-sale charge (IQ Test "
+                        "Report or Test fee) and the customer did not name a specific "
+                        "amount or charge type, so the refund flow was resolved to the "
+                        "subscription only by a heuristic. The customer may be asking "
+                        "about the cross-sale charge — please review."
+                    )
+                )
+                try:
+                    zendesk.add_internal_note(ticket_id, _note)
+                except Exception as e:  # noqa: BLE001 — note is best-effort
+                    log.warning(f"[{ticket_id}] refund suppress note failed: {e}")
+        if rc in reply_generator.REFUND_AUTOREPLY_CODES and not _refund_suppress:
             _lang = classification.get("language", "EN")
             _win = _parse_window_days(decision.guard_trail)
             _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
