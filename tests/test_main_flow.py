@@ -2037,10 +2037,14 @@ def test_llm_disambiguation_resolves_ambiguous_to_yes():
 
 
 def test_llm_disambiguated_refund_not_auto_executed():
-    # A WOULD_BE that was ONLY resolvable via the LLM disambiguator (lowest-confidence
-    # routing) must NOT auto-move money even on a live, x-host-resolvable brand — it is
-    # drafted and left to a human. (2026-07-28 backtest: llm-disambiguated approves were
-    # 0/2 vs human, i.e. all false positives.)
+    # A WOULD_BE resolvable ONLY via the LLM disambiguator implies a MIXED-type
+    # account (subscription + a one-time fee / cross-sale) where the customer never
+    # named an amount or charge type — otherwise the pure engine would have routed
+    # it. Per the refund-launch Guard 2b (2026-07-29, Anna), such a ticket is
+    # SUPPRESSED and left to a human: the customer may actually be disputing the
+    # cross-sale/fee, so auto-answering about the subscription is unsafe. This is
+    # stronger than the older execution guard (which drafted but didn't move money):
+    # now there is no draft, no reply, and no money move.
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}
     nexus = MagicMock(); nexus.search_subscription.return_value = _nexus_sub_plus_fee()
@@ -2066,9 +2070,61 @@ def test_llm_disambiguated_refund_not_auto_executed():
             as_of_date="2026-07-25T00:00:00Z", brand="16types")
     assert result["refund_decision"] == "YES"                      # engine still says would-refund
     assert result["refund_disambig_charge"] == "ch_sub"
-    assert result.get("refund_execution_status") == "skipped_llm_disambiguated"
+    assert result.get("refund_reply_suppressed") == "cross_sale_ambiguous_route"
+    assert "refund_draft_reply" not in result                      # suppressed → no draft
     rcm.create_refund.assert_not_called()                          # no auto money move
     zd.post_reply.assert_not_called()                              # no auto approve reply
+
+
+def test_refund_explanation_question_suppressed_even_when_enabled():
+    # Guard 2a (2026-07-29, Anna): if the customer asks WHY the charge happened
+    # ("why was I charged?" / "what is this charge?"), the bot must NOT auto-answer
+    # a refund approve/deny — a human must explain the charge. This holds even on a
+    # live brand and even for a clean OUTSIDE_REFUND_WINDOW deny that would
+    # otherwise post. The refund intent still goes to a human as usual.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_OUTSIDE_CHARGE)  # clean single renewal → OUTSIDE_REFUND_WINDOW
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9210", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="Why was I charged? What is this charge for?",
+            as_of_date="2026-07-24T00:00:00Z")
+    assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"  # engine unchanged
+    assert result.get("refund_reply_suppressed") == "explanation_question"
+    assert "refund_draft_reply" not in result                       # no draft generated
+    assert "refund_reply_sent" not in result
+    zd.post_reply.assert_not_called()                               # SAFETY: nothing posted
+
+
+def test_refund_clean_subscription_still_auto_answers_when_asked_no_why():
+    # Guard sanity: a clean single-subscription deny with NO explanation question
+    # and NO cross/first-sale charge is unaffected by the new guards — it still
+    # drafts (and, when enabled, sends) exactly as before.
+    cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
+    result = {}
+    nexus = _refund_reply_ctx(_OUTSIDE_CHARGE)
+    with patch.object(main, "USE_NEXUS_FOR_LOOKUP", True), \
+         patch.object(main, "nexus_client", nexus), \
+         patch.object(main, "REFUNDS_ENABLED", True), \
+         patch.object(main, "zendesk") as zd, \
+         patch.object(main.refund_ocr, "is_enabled", return_value=False), \
+         patch.object(main.reply_generator, "REFUND_AUTOREPLY_CODES", _AUTO_CODES), \
+         patch.object(main.reply_generator, "generate_refund_reply", return_value="DRAFT"):
+        zd.get_ticket_image_attachments.return_value = []
+        main._refund_would_be_eval(
+            "9211", "x@e.com", "REFUND_REQUEST", cls, result,
+            ticket_text="please refund my subscription",
+            as_of_date="2026-07-24T00:00:00Z")
+    assert "refund_reply_suppressed" not in result
+    assert result.get("refund_draft_reply") == "DRAFT"              # still drafted
 
 
 def test_llm_abstain_leaves_ambiguous():
