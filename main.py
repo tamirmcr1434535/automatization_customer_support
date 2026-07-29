@@ -530,34 +530,34 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         # — shadow (logged only) until a brand goes live.
         #
         # ── Refund-launch safety guards (2026-07-29, Anna) ───────────────────── #
-        # Before auto-answering a clean subscription window decision, bail out to a
-        # human in two cases:
-        #  2a) the customer is asking for an EXPLANATION ("why was I charged?" /
-        #      "what is this charge?") — a refund approve/deny does not answer that;
-        #      a human must explain the charge (covers cross-sale / add-on "why?"
-        #      questions Anna flagged).
-        #  2b) the account ALSO carries a cross_sale (IQ Test Report) or first_sale
-        #      (IQ Test fee) charge AND the flow was routed to the subscription only
-        #      via a SOFT signal (unauthorized-recurring heuristic or LLM
-        #      disambiguation) — i.e. the customer never named an amount or charge
-        #      type, so they may actually be disputing the cross-sale. Auto-answering
-        #      about the subscription would silently ignore that. Explicit routes
-        #      (stated amount / "report" keyword / date) are unaffected.
+        # Before auto-answering a clean subscription window decision:
+        #  • EXPLANATION ("why was I charged?" / "what is this charge?"): we do NOT
+        #    just approve/deny — we send the "explained" template variant, which
+        #    prepends an "Explanation of the charge:" section (trial → auto-renewal
+        #    framing). Gated below via data["explain_charge"]; wording lives in
+        #    reply_generator._master_generic_*_explained.
+        #  • Guard 2b: if the account ALSO carries a cross_sale (IQ Test Report) or
+        #    first_sale (IQ Test fee) charge AND the flow was routed to the
+        #    subscription only via a SOFT signal (unauthorized-recurring heuristic
+        #    or LLM disambiguation) — the customer never named an amount or charge
+        #    type, so they may actually be disputing the cross-sale. Suppress the
+        #    auto-reply and leave it to a human (a cross-sale "why?" is exactly the
+        #    case Anna wants handled manually). Explicit routes (stated amount /
+        #    "report" keyword / date) are unaffected.
         _refund_suppress = None
+        _explain_charge = False
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
-            if _contains_explanation_question(eff_text or ""):
-                _refund_suppress = "explanation_question"
-            else:
-                _has_cross_or_first = any(
-                    str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
-                    for c in ((nexus_data or {}).get("charges") or [])
-                )
-                _soft_routed = any(
-                    m in (decision.guard_trail or [])
-                    for m in ("dispute_target_subscription", "llm_disambiguated")
-                )
-                if _has_cross_or_first and _soft_routed:
-                    _refund_suppress = "cross_sale_ambiguous_route"
+            _explain_charge = _contains_explanation_question(eff_text or "")
+            _has_cross_or_first = any(
+                str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
+                for c in ((nexus_data or {}).get("charges") or [])
+            )
+            _soft_routed = any(
+                m in (decision.guard_trail or [])
+                for m in ("dispute_target_subscription", "llm_disambiguated")
+            )
+            if _has_cross_or_first and _soft_routed:
+                _refund_suppress = "cross_sale_ambiguous_route"
         if _refund_suppress:
             result["refund_reply_suppressed"] = _refund_suppress
             log.info(
@@ -570,18 +570,11 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             if refunds_enabled_for(brand):
                 _note = (
                     "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
-                    + (
-                        "The customer is asking for an explanation of a charge "
-                        "(\"why was I charged?\" / \"what is this?\"). A refund "
-                        "approve/deny does not answer that — please identify the "
-                        "charge(s) and explain."
-                        if _refund_suppress == "explanation_question" else
-                        "The account also has a one-time / cross-sale charge (IQ Test "
-                        "Report or Test fee) and the customer did not name a specific "
-                        "amount or charge type, so the refund flow was resolved to the "
-                        "subscription only by a heuristic. The customer may be asking "
-                        "about the cross-sale charge — please review."
-                    )
+                    "The account also has a one-time / cross-sale charge (IQ Test "
+                    "Report or Test fee) and the customer did not name a specific "
+                    "amount or charge type, so the refund flow was resolved to the "
+                    "subscription only by a heuristic. The customer may be asking "
+                    "about the cross-sale charge — please review."
                 )
                 try:
                     zendesk.add_internal_note(ticket_id, _note)
@@ -606,6 +599,12 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     "brand_phrase": _BRAND_PHRASE.get(brand),   # None → template default
                     "terms_url": _terms,
                     "subscription_url": _sub,
+                    # ticket #169403 (Anna 2026-07-29): when the customer asked WHY
+                    # the charge happened, use the "explained" template variant.
+                    # `brand` drives the plan-name in that explanation (16types →
+                    # "16 Types Growth Plan", else "IQ Booster brain training plan").
+                    "explain_charge": _explain_charge,
+                    "brand": brand,
                 },
             )
             if draft:
