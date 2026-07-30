@@ -293,13 +293,26 @@ def _refund_outcome_status(result: dict) -> str:
     When the bot actually resolved the refund live — i.e. it posted the
     approve OR deny reply to the customer (`refund_reply_sent`) — report it as
     an AUTO-RESOLVED success (mirrors trial/sub cancellations), split by
-    approved vs denied so the dashboard can tell them apart. Otherwise the
-    refund was drafted-only / shadow / left to a human → the ticket stays
-    `skipped_refund_request` exactly as before."""
+    approved vs denied so the dashboard can tell them apart.
+
+    `refund_failed` — an APPROVED refund on a live brand that the bot tried to
+    carry out but could NOT complete: the money move failed / was rejected
+    (create_refund `executed` False: error, dispute_open, already_refunded, …),
+    a pre-execution guard blocked it (no x-host / abuse / low-confidence route),
+    or the confirmation reply couldn't be posted after the money moved. Any of
+    these means an approved refund did NOT go out cleanly → a human must finish
+    it. `refund_execution_status` is set only inside the live approved-refund
+    branch, so its presence without a sent reply pinpoints exactly this case
+    (previously it hid inside `skipped_refund_request`).
+
+    Otherwise the refund was drafted-only / shadow / left to a human → the
+    ticket stays `skipped_refund_request` exactly as before."""
     if result.get("refund_reply_sent"):
         return ("success_refund_approved"
                 if result.get("refund_decision") == "YES"
                 else "success_refund_denied")
+    if result.get("refund_decision") == "YES" and result.get("refund_execution_status"):
+        return "refund_failed"
     return "skipped_refund_request"
 
 
@@ -1722,6 +1735,7 @@ _SHADOW_STATUS_TO_TAG = {
     "skipped_refund_request":       "shadow_would_skip_refund",
     "success_refund_approved":      "shadow_would_refund_approve",
     "success_refund_denied":        "shadow_would_refund_deny",
+    "refund_failed":                "shadow_would_refund_failed",
     "escalated_unknown":            "shadow_would_escalate",     # FIX-C: new status
     "skipped_not_handled":          "shadow_would_skip",
     "skipped_followup":             "shadow_would_skip",
