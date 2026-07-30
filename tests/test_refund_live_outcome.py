@@ -160,9 +160,10 @@ def _fake_decision(reason_code, would_be, amount="5490", currency="JPY"):
     )
 
 
-def _drive_eval(reason_code, would_be):
+def _drive_eval(reason_code, would_be, refund_ret=None):
     """Run _refund_would_be_eval live-enabled with all collaborators stubbed,
-    returning (result, zendesk_mock)."""
+    returning (result, zendesk_mock). `refund_ret` overrides create_refund's
+    return (default = a successful money move)."""
     result = {}
     fake_reply_gen = SimpleNamespace(
         REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
@@ -171,8 +172,8 @@ def _drive_eval(reason_code, would_be):
     zd = MagicMock()
     rc_client = MagicMock()
     rc_client.is_configured.return_value = False           # skip charge-detail guard
-    rc_client.create_refund.return_value = {"status": "refunded", "executed": True,
-                                            "refunded_amount": "5490"}
+    rc_client.create_refund.return_value = refund_ret if refund_ret is not None else {
+        "status": "refunded", "executed": True, "refunded_amount": "5490"}
     with patch.object(main.refund_engine, "decide", return_value=_fake_decision(reason_code, would_be)), \
          patch.object(main, "reply_generator", fake_reply_gen), \
          patch.object(main, "refunds_enabled_for", return_value=True), \
@@ -209,3 +210,57 @@ def test_e2e_denied_refund_reports_success_denied_no_sum():
     fields = {int(c.args[1]): c.args[2] for c in zd.set_custom_field.call_args_list}
     assert fields[int(main._ZENDESK_REFUND_STATUS_FIELD_ID)] == "refund_denied"
     assert int(main._ZENDESK_REFUND_SUM_FIELD_ID) not in fields   # denied → no sum
+
+
+# ── refund_failed: approved refund that could NOT be carried out ────────────
+
+def test_outcome_status_failed_when_execution_attempted_but_not_sent():
+    # API returned a non-refunded status → executed False, reply never sent.
+    r = {"refund_decision": "YES", "refund_execution_status": "error"}
+    assert main._refund_outcome_status(r) == "refund_failed"
+
+
+def test_outcome_status_failed_covers_guard_blocks():
+    for exec_s in ("skipped_no_xhost", "skipped_abuse_guard:daily_cap",
+                   "skipped_llm_disambiguated", "dispute_open", "already_refunded"):
+        r = {"refund_decision": "YES", "refund_execution_status": exec_s}
+        assert main._refund_outcome_status(r) == "refund_failed", exec_s
+
+
+def test_outcome_status_failed_when_money_moved_but_reply_failed():
+    # post_reply raised after the money moved: executed but reply not sent.
+    r = {"refund_decision": "YES", "refund_execution_status": "refunded",
+         "refund_executed": True}
+    assert main._refund_outcome_status(r) == "refund_failed"
+
+
+def test_outcome_status_denied_not_attempted_stays_skipped():
+    # A NO decision with no execution attempt is a plain skip, not a failure.
+    assert main._refund_outcome_status(
+        {"refund_decision": "NO"}) == "skipped_refund_request"
+
+
+def test_e2e_approved_refund_execution_fails_reports_refund_failed():
+    result, zd = _drive_eval(
+        "WOULD_BE_REFUNDED", True,
+        refund_ret={"status": "error", "executed": False, "message": "gateway 500"})
+    assert not result.get("refund_reply_sent")
+    assert result.get("refund_execution_status") == "error"
+    assert main._refund_outcome_status(result) == "refund_failed"
+    # No customer reply, no refund topic fields written on a failed execution.
+    zd.post_reply.assert_not_called()
+    fields = {int(c.args[1]): c.args[2] for c in zd.set_custom_field.call_args_list}
+    assert int(main._ZENDESK_REFUND_STATUS_FIELD_ID) not in fields
+
+
+def test_slack_refund_failed_shows_needs_human_line():
+    result = {
+        "status": "refund_failed", "intent": "REFUND_REQUEST", "email": "a@b.com",
+        "refund_decision": "YES", "refund_reason_code": "WOULD_BE_REFUNDED",
+        "refund_amount": "5490", "refund_currency": "JPY",
+        "refund_execution_status": "error",
+    }
+    blob = str(_blocks_for(result)["blocks"])
+    assert "COULD NOT be completed" in blob
+    assert "execution status: `error`" in blob
+    assert "Would be refunded" not in blob

@@ -187,6 +187,7 @@ class SlackClient:
             "success": "✅",
             "success_refund_approved": "💸",
             "success_refund_denied": "🚫",
+            "refund_failed": "🆘",
             "manual_review_required": "⚠️",
             "escalated_delete_account": "🗑️",
             "escalated_explanation_question": "❓",
@@ -272,6 +273,17 @@ class SlackClient:
                 wb_line = (
                     f"*Refund {'APPROVED & refunded' if rd == 'YES' else 'DENIED'}:* "
                     f"`{rc}`{amt_s}"
+                )
+            elif result.get("status") == "refund_failed" or (
+                rd == "YES" and result.get("refund_execution_status")
+            ):
+                # Approved refund the bot could NOT carry out (money move failed /
+                # blocked / reply not posted). Surface loudly with the reason so an
+                # agent finishes it — this used to hide inside skipped_refund_request.
+                _exec = result.get("refund_execution_status") or "unknown"
+                wb_line = (
+                    f"*🆘 Refund COULD NOT be completed — needs a human:* "
+                    f"`{rc}`{amt_s}\n> execution status: `{_exec}`"
                 )
             else:
                 wb_line = (
