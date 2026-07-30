@@ -121,30 +121,61 @@ def _blocks_for(result):
     return captured
 
 
-def test_slack_live_approved_shows_processed_line_and_reply_preview():
+def test_slack_live_approved_shows_refunded_line_brand_and_reply_preview():
     result = {
         "status": "success_refund_approved", "intent": "REFUND_REQUEST",
         "email": "a@b.com", "language": "JA",
         "refund_decision": "YES", "refund_reason_code": "WOULD_BE_REFUNDED",
-        "refund_amount": "5490", "refund_currency": "JPY",
+        "refund_amount": "5490", "refund_currency": "JPY", "refund_brand": "iqpro",
+        "refunds_enabled_for_brand": True,
         "refund_reply_sent": True, "reply_text": "こんにちは。返金いたします。",
     }
     blob = str(_blocks_for(result)["blocks"])
-    assert "Refund APPROVED & refunded" in blob
-    assert "Would be refunded" not in blob          # live phrasing, not would-be
-    assert "Reply preview" in blob                    # reply shown like a cancel
+    assert "REFUNDED" in blob and "approved & money moved" in blob
+    assert "Brand:" in blob and "iqpro" in blob and "refunds ✅ON" in blob
+    assert "Reply preview" in blob
 
 
-def test_slack_shadow_still_uses_would_be_line():
+def test_slack_denied_sent_shows_denied_line():
+    result = {
+        "status": "success_refund_denied", "intent": "REFUND_REQUEST",
+        "email": "a@b.com", "refund_decision": "NO",
+        "refund_reason_code": "OUTSIDE_REFUND_WINDOW", "refund_brand": "iqpro",
+        "refunds_enabled_for_brand": True, "refund_reply_sent": True,
+        "reply_text": "返金はできません。",
+    }
+    blob = str(_blocks_for(result)["blocks"])
+    assert "Refund DENIED" in blob
+
+
+def test_slack_suppressed_shows_held_for_human_with_reason():
+    # Guard 2b: enabled brand, engine would refund, but cross-sale ambiguity → human.
     result = {
         "status": "skipped_refund_request", "intent": "REFUND_REQUEST",
         "email": "a@b.com", "refund_decision": "YES",
         "refund_reason_code": "WOULD_BE_REFUNDED", "refund_amount": "5490",
-        "refund_currency": "JPY",
+        "refund_currency": "JPY", "refund_brand": "iqpro",
+        "refunds_enabled_for_brand": True,
+        "refund_reply_suppressed": "cross_sale_ambiguous_route",
     }
     blob = str(_blocks_for(result)["blocks"])
-    assert "Would be refunded" in blob
-    assert "Refund APPROVED & refunded" not in blob
+    assert "Held for a human" in blob
+    assert "cross-sale" in blob                       # explains WHY
+    assert "refunds ✅ON" in blob                      # brand is live
+
+
+def test_slack_would_be_only_when_brand_not_enabled():
+    result = {
+        "status": "skipped_refund_request", "intent": "REFUND_REQUEST",
+        "email": "a@b.com", "refund_decision": "YES",
+        "refund_reason_code": "WOULD_BE_REFUNDED", "refund_amount": "29.99",
+        "refund_currency": "EUR", "refund_brand": "iqbooster",
+        "refunds_enabled_for_brand": False,
+    }
+    blob = str(_blocks_for(result)["blocks"])
+    assert "Would-be only" in blob
+    assert "refunds NOT enabled" in blob
+    assert "iqbooster" in blob and "refunds ⭕off" in blob
 
 
 # ── End-to-end wiring of _refund_would_be_eval (approved + denied) ──────────

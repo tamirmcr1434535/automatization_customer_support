@@ -237,6 +237,15 @@ class SlackClient:
         reply_count = result.get("reply_count")
         if reply_count is not None:
             fields.append({"type": "mrkdwn", "text": f"*Bot replies so far:*\n{reply_count}"})
+        # Brand + whether refunds are live for it (refund tickets only). Makes it
+        # obvious which business a refund card belongs to and whether the bot could
+        # have acted at all.
+        _rbrand = result.get("refund_brand")
+        if _rbrand:
+            _on = result.get("refunds_enabled_for_brand")
+            _flag = (" · refunds ✅ON" if _on
+                     else " · refunds ⭕off" if _on is False else "")
+            fields.append({"type": "mrkdwn", "text": f"*Brand:*\n{_rbrand}{_flag}"})
 
         blocks = [
             {
@@ -260,40 +269,67 @@ class SlackClient:
             if err_d:
                 detail_lines.append(f"```{err_d[:400]}```")
         if result.get("refund_decision"):
-            # AN-192 would-be refund signal. Nexus-only, disputes NOT checked —
-            # a YES is a draft signal for review, NOT "safe to refund".
+            # One clear line stating what actually happened to the refund and WHY.
+            # `refund_decision` (YES/NO) is only the engine's would-be verdict on the
+            # subscription charge — NOT proof anything was refunded. What the bot did
+            # depends on brand-enablement + guards, so spell it out per case.
             rd = result.get("refund_decision")
             rc = result.get("refund_reason_code") or "—"
             amt = result.get("refund_amount")
             cur = result.get("refund_currency") or ""
             amt_s = f" ({amt} {cur})".rstrip() if amt else ""
-            if result.get("refund_reply_sent"):
-                # LIVE-resolved refund: the bot already acted (approve reply +
-                # money moved, or deny reply sent). Say what happened, not "would".
+            brand = result.get("refund_brand") or "—"
+            enabled = result.get("refunds_enabled_for_brand")
+            suppressed = result.get("refund_reply_suppressed")
+            exec_s = result.get("refund_execution_status")
+
+            _SUPPRESS_WHY = {
+                "cross_sale_ambiguous_route":
+                    "the account also has a one-time / cross-sale charge (IQ Test "
+                    "Report or Test fee) and the customer did not name a specific "
+                    "amount or charge type — the subscription itself is refundable, "
+                    "but which charge they mean is ambiguous",
+            }
+
+            if result.get("refund_reply_sent") and rd == "YES":
+                # Money actually moved and the confirmation reply went out.
                 wb_line = (
-                    f"*Refund {'APPROVED & refunded' if rd == 'YES' else 'DENIED'}:* "
-                    f"`{rc}`{amt_s}"
+                    f"*✅ REFUNDED{amt_s} — approved & money moved* (`{rc}`, brand `{brand}`)"
                 )
-            elif result.get("status") == "refund_failed" or (
-                rd == "YES" and result.get("refund_execution_status")
-            ):
-                # Approved refund the bot could NOT carry out (money move failed /
-                # blocked / reply not posted). Surface loudly with the reason so an
-                # agent finishes it — this used to hide inside skipped_refund_request.
-                _exec = result.get("refund_execution_status") or "unknown"
+            elif result.get("refund_reply_sent") and rd == "NO":
+                # A denial reply was sent (e.g. outside the refund window).
                 wb_line = (
-                    f"*🆘 Refund COULD NOT be completed — needs a human:* "
-                    f"`{rc}`{amt_s}\n> execution status: `{_exec}`"
+                    f"*🚫 Refund DENIED — denial reply sent* (`{rc}`{amt_s}, brand `{brand}`)"
+                )
+            elif result.get("status") == "refund_failed" or (rd == "YES" and exec_s):
+                # Approved on a live brand but the bot could NOT complete it
+                # (money move failed / blocked / reply not posted).
+                wb_line = (
+                    f"*🆘 Refund COULD NOT be completed — needs a human* "
+                    f"(`{rc}`{amt_s}, brand `{brand}`)\n> execution status: `{exec_s or 'unknown'}`"
+                )
+            elif suppressed:
+                # Engine WOULD refund the sub, but a safety guard held it for a human.
+                why = _SUPPRESS_WHY.get(suppressed, suppressed)
+                wb_line = (
+                    f"*🙋 Held for a human — NOT auto-refunded* (would-be {rd}, "
+                    f"brand `{brand}`)\n> _why:_ {why}"
+                )
+            elif enabled is False:
+                # Refunds are not turned on for this brand → would-be only, to a human.
+                wb_line = (
+                    f"*ℹ️ Would-be only — refunds NOT enabled for brand `{brand}`* "
+                    f"→ left to a human: {rd} — `{rc}`{amt_s}"
                 )
             else:
+                # Brand IS enabled but the bot doesn't auto-handle this case (a NO
+                # that isn't a clean out-of-window denial: NOT_FOUND / AMBIGUOUS /
+                # REPORT / ONE_TIME / amount anomaly) → to a human.
                 wb_line = (
-                    f"*Would be refunded (Nexus-only, disputes NOT checked):* "
-                    f"{rd} — `{rc}`{amt_s}"
+                    f"*🙋 Left to a human — bot only auto-handles clean in/out-of-window "
+                    f"subscription refunds* (would-be {rd} — `{rc}`{amt_s}, brand `{brand}`)"
                 )
-            # Surface the engine's plain-language explanation of the reason code
-            # (already computed, e.g. "Last subscription payment is 54d old > 8d
-            # window — previous months are non-refundable") so a reviewer sees WHY
-            # without decoding the code or the guard trail.
+            # Engine's plain-language explanation of the reason code, if any.
             hm = (result.get("refund_human_message") or "").strip()
             if hm:
                 wb_line += f"\n> _{hm[:300]}_"

@@ -473,6 +473,9 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     # Authoritative brand: Zendesk brand_id (passed in) → else domain-from-text.
     _brand = brand or _brand_key(ticket_text)
     result["refund_brand"] = _brand
+    # Whether this brand is live for real refunds — lets the Slack card explain a
+    # would-be as "brand not enabled" vs a guard holding it on an ENABLED brand.
+    result["refunds_enabled_for_brand"] = refunds_enabled_for(_brand)
 
     # ── Dispute + amount guard (charge-detail) — applies to ALL refund cases ── #
     # We must NEVER refund a charge that is (a) disputed / not refundable, or (b)
