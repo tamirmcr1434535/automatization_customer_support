@@ -287,6 +287,22 @@ def refunds_enabled_for(brand: str) -> bool:
     return (brand or "").lower() in REFUNDS_ENABLED_BRANDS
 
 
+def _refund_outcome_status(result: dict) -> str:
+    """Final `status` for a refund ticket after `_refund_would_be_eval`.
+
+    When the bot actually resolved the refund live — i.e. it posted the
+    approve OR deny reply to the customer (`refund_reply_sent`) — report it as
+    an AUTO-RESOLVED success (mirrors trial/sub cancellations), split by
+    approved vs denied so the dashboard can tell them apart. Otherwise the
+    refund was drafted-only / shadow / left to a human → the ticket stays
+    `skipped_refund_request` exactly as before."""
+    if result.get("refund_reply_sent"):
+        return ("success_refund_approved"
+                if result.get("refund_decision") == "YES"
+                else "success_refund_denied")
+    return "skipped_refund_request"
+
+
 def _parse_window_days(trail) -> "int | None":
     """Pull the country window (days) out of a guard-trail marker like
     'window[currency=8d,age=54d]'. Returns None if absent."""
@@ -661,6 +677,25 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     zendesk.post_reply(ticket_id, draft)
                     result["refund_reply_sent"] = True
                     log.info(f"[{ticket_id}] refund reply POSTED to customer (brand={brand}, {rc})")
+                    # Mirror the reply into reply_text so the per-ticket Slack card
+                    # shows the "Reply preview" exactly like a cancellation does.
+                    result["reply_text"] = draft
+                    # Topic-screen values (also logged to BQ for the report):
+                    _approved = (rc == "WOULD_BE_REFUNDED")
+                    _sum_text = _refund_sum_string(decision) if _approved else ""
+                    result["refund_status"] = "refund_approved" if _approved else "refund_denied"
+                    result["refund_sum"] = _sum_text
+                    if country:
+                        result["country"] = country
+                    # Fill the Zendesk custom fields the way an agent would. Gated
+                    # by send_ok → only ever on a live-resolved refund; never shadow.
+                    try:
+                        _set_refund_fields_for_ticket(
+                            ticket_id, approved=_approved, sum_text=_sum_text,
+                            currency=(decision.currency or ""), country=country,
+                        )
+                    except Exception as e:  # noqa: BLE001 — additive, non-blocking
+                        log.warning(f"[{ticket_id}] set refund fields failed: {e}")
                 else:
                     log.info(
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
@@ -714,8 +749,12 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     except Exception as e:  # noqa: BLE001 — strictly additive; never blocks the eval
         log.warning(f"[{ticket_id}] refund reply draft failed (non-blocking): {e}")
 
-    # REFUNDS_ENABLED is inert on this branch: there is NO live refund path.
-    # Even if true, nothing here calls refund_client.create_refund to execute.
+    # When refunds_enabled_for(brand) AND the decision is a clean approve/deny,
+    # the block above DOES execute the refund (refund_client.create_refund) and
+    # post the customer reply — the caller then reports the ticket as
+    # success_refund_approved / success_refund_denied (see _refund_outcome_status).
+    # When REFUNDS_ENABLED is false (or the brand isn't allow-listed) nothing is
+    # sent or moved: the draft/decision is logged only and it goes to a human.
     return decision
 
 # SHADOW_MODE: process ALL tickets, skip ALL writes, send Slack report per ticket.
@@ -1081,6 +1120,89 @@ def _set_country_for_ticket(ticket_id: str, country: str) -> None:
         log.info(f"[{ticket_id}] Country set to '{value}' (from {country!r})")
     except Exception as e:
         log.warning(f"[{ticket_id}] Failed to set country: {e}")
+
+# ── Zendesk refund custom fields (set ONLY on a live-resolved refund) ──── #
+# When the bot actually handles a refund end-to-end for a refunds-enabled
+# brand (posts the approve OR deny reply to the customer), it fills the same
+# Zendesk "topic screen" fields a human agent would, so the dashboard shows
+# refunds the way it shows cancellations:
+#   • Topic         → "refund"                     (tagger, id reuses _ZENDESK_TOPIC_FIELD_ID)
+#   • Refund Status → refund_approved / refund_denied
+#   • Refund Sum    → the refunded amount(s); several charges joined with "+"
+#   • Currency      → ISO tag, lowercase (jpy / eur / …)   — approved only
+#   • Country       → reuses _set_country_for_ticket        — best-effort (only if known)
+# Processor / Refund Type / Registered are deliberately LEFT to the human —
+# the refund flow can't derive them reliably. Field ids confirmed via
+# /api/v2/ticket_fields.json on wwiqtest (2026-07-30). Env vars override; set
+# to "" to disable a single field. Never raises — a reporting aid, not part of
+# the refund guarantee. Only ever called when refunds_enabled_for(brand).
+_ZENDESK_REFUND_STATUS_FIELD_ID = os.getenv(
+    "ZENDESK_REFUND_STATUS_FIELD_ID", "18408456961564",
+).strip()
+_ZENDESK_REFUND_SUM_FIELD_ID = os.getenv(
+    "ZENDESK_REFUND_SUM_FIELD_ID", "18648161739676",
+).strip()
+_ZENDESK_CURRENCY_FIELD_ID = os.getenv(
+    "ZENDESK_CURRENCY_FIELD_ID", "18648254147356",
+).strip()
+_ZENDESK_TOPIC_REFUND_VALUE = os.getenv("ZENDESK_TOPIC_REFUND", "refund")
+
+
+def _refund_sum_string(decision) -> str:
+    """Build the "Refund Sum" text: the amount(s) actually refunded. A single
+    charge → "5490"; several charges (e.g. a two-payment refund) → the amounts
+    joined with "+" like "199+1990" (the format agents use). Falls back to the
+    single computed amount. Returns "" if no amount is known."""
+    amounts: list[str] = []
+    # candidate_charges is "id:amount:date;…" — take the amount of each part.
+    raw = getattr(decision, "candidate_charges", None)
+    if raw:
+        for part in str(raw).split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            cols = part.split(":")
+            if len(cols) >= 2 and cols[1].strip():
+                amounts.append(cols[1].strip())
+    # Prefer the single verified computed amount when there's exactly one, or
+    # when we couldn't parse a multi-charge list — it is the executed amount.
+    single = getattr(decision, "computed_amount", None)
+    if len(amounts) <= 1:
+        return str(single) if single else (amounts[0] if amounts else "")
+    return "+".join(amounts)
+
+
+def _set_refund_fields_for_ticket(
+    ticket_id: str, approved: bool, sum_text: str, currency: str, country: str,
+) -> None:
+    """Set the Zendesk refund topic-screen fields after a live-resolved refund.
+
+    `approved`  → Refund Status (approved vs denied) + Topic="refund".
+    `sum_text`/`currency` → only meaningful for an APPROVED refund (money moved);
+                  for a denial they are left empty, matching how agents fill the
+                  form (see denied ticket #169768). `country` best-effort.
+    Never raises — each field is independent and non-critical."""
+    def _try(field_id: str, value: str, label: str):
+        if not field_id or not value:
+            return
+        try:
+            zendesk.set_custom_field(ticket_id, int(field_id), value)
+            log.info(f"[{ticket_id}] refund field {label} set to '{value}'")
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"[{ticket_id}] failed to set refund field {label}: {e}")
+
+    _try(_ZENDESK_TOPIC_FIELD_ID, _ZENDESK_TOPIC_REFUND_VALUE, "Topic")
+    _try(_ZENDESK_REFUND_STATUS_FIELD_ID,
+         "refund_approved" if approved else "refund_denied", "Refund Status")
+    if approved:
+        _try(_ZENDESK_REFUND_SUM_FIELD_ID, sum_text, "Refund Sum")
+        _try(_ZENDESK_CURRENCY_FIELD_ID,
+             (currency or "").strip().lower(), "Currency")
+    # Country: reuse the cancel-path helper (handles ISO-2 / name → tag). Only
+    # fires when we actually know a country — the refund flow usually doesn't.
+    if country:
+        _set_country_for_ticket(ticket_id, country)
+
 
 # ── Webhook deduplication (Firestore-backed distributed lock) ────────── #
 # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
@@ -1598,6 +1720,8 @@ _SHADOW_STATUS_TO_TAG = {
     "escalated_explanation_question":"shadow_would_escalate",
     "escalated_no_results_received":"shadow_would_escalate",
     "skipped_refund_request":       "shadow_would_skip_refund",
+    "success_refund_approved":      "shadow_would_refund_approve",
+    "success_refund_denied":        "shadow_would_refund_deny",
     "escalated_unknown":            "shadow_would_escalate",     # FIX-C: new status
     "skipped_not_handled":          "shadow_would_skip",
     "skipped_followup":             "shadow_would_skip",
@@ -1963,7 +2087,7 @@ def _process(ticket_id: str) -> dict:
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
-        result["status"] = "skipped_refund_request"
+        result["status"] = _refund_outcome_status(result)
         result["reason"] = "Refund keyword detected in subject — refund disputes require a human"
         log_result(result)
         return result
@@ -2356,7 +2480,7 @@ def _process(ticket_id: str) -> dict:
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
-        result["status"] = "skipped_refund_request"
+        result["status"] = _refund_outcome_status(result)
         result["reason"] = (
             f"Refund keywords detected in body ({_refund_context}) — human must handle any refund"
         )
@@ -2490,7 +2614,7 @@ def _process(ticket_id: str) -> dict:
         except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
 
-        result["status"] = "skipped_refund_request"
+        result["status"] = _refund_outcome_status(result)
         result["reason"] = f"{intent} — refund intents always go to a human"
         zendesk.add_tag(ticket_id, "bot_handled")
         log_result(result)

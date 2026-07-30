@@ -89,6 +89,13 @@ SCHEMA = [
     bigquery.SchemaField("refund_charge_refundable","BOOLEAN"),# dispute guard: charge-detail `refundable`
     bigquery.SchemaField("refund_execution_status","STRING"),  # refund API status (refunded / rejected / would_refund)
 
+    # Zendesk "topic screen" values written on a LIVE-resolved refund — mirror
+    # the fields an agent fills in the Zendesk UI so the report shows refunds
+    # the same way (2026-07-30).
+    bigquery.SchemaField("refund_status",    "STRING"),   # Refund Status field: refund_approved / refund_denied
+    bigquery.SchemaField("refund_sum",       "STRING"),   # Refund Sum field: "5490" or multi "199+1990" (approved only)
+    bigquery.SchemaField("country",          "STRING"),   # Country field value we set (best-effort)
+
     # Error info
     bigquery.SchemaField("error",            "STRING"),
 
@@ -207,6 +214,11 @@ def log_result(result: dict):
             "refund_charge_disputed":   result.get("refund_charge_disputed"),
             "refund_charge_refundable": result.get("refund_charge_refundable"),
             "refund_execution_status":  result.get("refund_execution_status") or "",
+
+            # Zendesk topic-screen values (live-resolved refund)
+            "refund_status":      result.get("refund_status") or "",
+            "refund_sum":         result.get("refund_sum") or "",
+            "country":            result.get("country") or "",
 
             # Error
             "error":              result.get("error") or "",

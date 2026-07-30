@@ -185,6 +185,8 @@ class SlackClient:
         # Choose emoji by status
         emoji_map = {
             "success": "✅",
+            "success_refund_approved": "💸",
+            "success_refund_denied": "🚫",
             "manual_review_required": "⚠️",
             "escalated_delete_account": "🗑️",
             "escalated_explanation_question": "❓",
@@ -264,10 +266,18 @@ class SlackClient:
             amt = result.get("refund_amount")
             cur = result.get("refund_currency") or ""
             amt_s = f" ({amt} {cur})".rstrip() if amt else ""
-            wb_line = (
-                f"*Would be refunded (Nexus-only, disputes NOT checked):* "
-                f"{rd} — `{rc}`{amt_s}"
-            )
+            if result.get("refund_reply_sent"):
+                # LIVE-resolved refund: the bot already acted (approve reply +
+                # money moved, or deny reply sent). Say what happened, not "would".
+                wb_line = (
+                    f"*Refund {'APPROVED & refunded' if rd == 'YES' else 'DENIED'}:* "
+                    f"`{rc}`{amt_s}"
+                )
+            else:
+                wb_line = (
+                    f"*Would be refunded (Nexus-only, disputes NOT checked):* "
+                    f"{rd} — `{rc}`{amt_s}"
+                )
             # Surface the engine's plain-language explanation of the reason code
             # (already computed, e.g. "Last subscription payment is 54d old > 8d
             # window — previous months are non-refundable") so a reviewer sees WHY
