@@ -132,6 +132,39 @@ def test_set_fields_skips_country_when_unknown():
     country.assert_not_called()
 
 
+# ── #3 charge-host → product/link brand ─────────────────────────────────────
+
+def test_host_to_brand_maps_known_domains():
+    assert main._host_to_brand("jp.wwpersonalitytest.com") == "wwpersonalitytest"
+    assert main._host_to_brand("16types.ai/ja") == "16types"
+    assert main._host_to_brand("16persons.com") == "16personas"
+    assert main._host_to_brand("de.wwiqtest.com") == "wwiqtest"
+    assert main._host_to_brand("iqpro.ai") == "iqpro"
+    assert main._host_to_brand("iqbooster.org/ko") == "iqbooster"
+    assert main._host_to_brand("") == ""
+    assert main._host_to_brand("unknown.example.com") == ""
+
+
+def test_charge_host_brand_prefers_candidate_charge():
+    # Cross-site: contacted brand differs from the charge host → follow the charge.
+    nexus = {"host": "16persons.com", "charges": [
+        {"charge_id": "ch_1", "host": "16persons.com", "type": "cross_sale"},
+        {"charge_id": "ch_2", "host": "16types.ai/ja", "type": "subscription"},
+    ]}
+    assert main._charge_host_brand(nexus, "ch_2") == "16types"
+
+
+def test_charge_host_brand_falls_back_to_any_then_data_then_empty():
+    # No candidate match → first charge with a host.
+    assert main._charge_host_brand(
+        {"charges": [{"charge_id": "x", "host": "iqpro.ai"}]}, "nope") == "iqpro"
+    # No charge host → subscription-level host.
+    assert main._charge_host_brand({"host": "16types.ai", "charges": []}, "") == "16types"
+    # No host anywhere (old records) → "" so caller uses the Zendesk brand.
+    assert main._charge_host_brand({"charges": [{"charge_id": "x"}]}, "x") == ""
+    assert main._charge_host_brand({}, "") == ""
+
+
 # ── Slack card ──────────────────────────────────────────────────────────────
 
 def _blocks_for(result):
