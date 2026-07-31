@@ -316,6 +316,42 @@ def _refund_outcome_status(result: dict) -> str:
     return "skipped_refund_request"
 
 
+def _cancel_subscription_after_refund(ticket_id, nexus_data, result) -> bool:
+    """Cancel the subscription behind a refund auto-reply.
+
+    The refund templates tell the customer "your subscription has also been
+    canceled" — so we MUST actually cancel it, or they keep an active sub and
+    get re-charged next cycle while holding a message that says they won't be.
+    Cancels the Nexus subscription by id via WooCommerce (Stripe-gateway subs
+    are recorded in WC); skips when Nexus reports it already cancelled. Strictly
+    additive / non-blocking. Returns True when the sub is cancelled (now or
+    already), False when the cancel could not be confirmed (→ caller flags a
+    human)."""
+    d = nexus_data or {}
+    try:
+        if d.get("was_already_cancelled"):
+            result["refund_sub_already_cancelled"] = True
+            result["refund_subscription_cancelled"] = True
+            return True
+        sub_id = d.get("subscription_id")
+        if not sub_id:
+            result["refund_subscription_cancelled"] = False
+            return False
+        res = woo._cancel_sub_by_id(int(sub_id))
+        ok = bool(res.get("cancelled"))
+        result["refund_subscription_cancelled"] = ok
+        if ok:
+            log.info(f"[{ticket_id}] refund: subscription {sub_id} cancelled")
+        else:
+            log.warning(f"[{ticket_id}] refund: subscription {sub_id} cancel NOT confirmed "
+                        f"(status={res.get('status')})")
+        return ok
+    except Exception as e:  # noqa: BLE001 — never block the refund on a cancel hiccup
+        log.warning(f"[{ticket_id}] refund: cancel-after-refund failed: {e}")
+        result["refund_subscription_cancelled"] = False
+        return False
+
+
 def _parse_window_days(trail) -> "int | None":
     """Pull the country window (days) out of a guard-trail marker like
     'window[currency=8d,age=54d]'. Returns None if absent."""
@@ -690,6 +726,10 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # money to have actually moved (no-op stub unless dev API configured).
                 send_ok = refunds_enabled_for(brand) and (rc != "WOULD_BE_REFUNDED" or executed)
                 if send_ok:
+                    # The reply promises the subscription is cancelled → cancel it
+                    # for real BEFORE replying (both approve and deny templates say
+                    # so), so the customer isn't re-charged next cycle.
+                    _cancelled = _cancel_subscription_after_refund(ticket_id, nexus_data, result)
                     zendesk.post_reply(ticket_id, draft)
                     result["refund_reply_sent"] = True
                     log.info(f"[{ticket_id}] refund reply POSTED to customer (brand={brand}, {rc})")
@@ -712,6 +752,23 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         )
                     except Exception as e:  # noqa: BLE001 — additive, non-blocking
                         log.warning(f"[{ticket_id}] set refund fields failed: {e}")
+                    # If we could NOT confirm the cancel, the reply still told the
+                    # customer it's cancelled — flag it so a human finishes it.
+                    if not _cancelled:
+                        try:
+                            zendesk.add_internal_note(
+                                ticket_id,
+                                "🤖⚠️ Refund handled, but AUTO-CANCEL of the subscription "
+                                "could NOT be confirmed. The reply already told the customer "
+                                "it is cancelled — please cancel it manually to prevent a "
+                                "re-charge.")
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # #4: close the ticket now that the refund is fully handled.
+                    try:
+                        zendesk.solve_ticket(ticket_id)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning(f"[{ticket_id}] refund: solve_ticket failed: {e}")
                 else:
                     log.info(
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "

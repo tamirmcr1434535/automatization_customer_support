@@ -164,6 +164,52 @@ def test_slack_suppressed_shows_held_for_human_with_reason():
     assert "refunds ✅ON" in blob                      # brand is live
 
 
+# ── #2 cancellation-after-refund + #4 solve ─────────────────────────────────
+
+def test_cancel_after_refund_already_cancelled_skips_wc():
+    r = {}
+    w = MagicMock()
+    with patch.object(main, "woo", w):
+        ok = main._cancel_subscription_after_refund(
+            "1", {"was_already_cancelled": True, "subscription_id": 9}, r)
+    assert ok is True and r["refund_subscription_cancelled"] is True
+    w._cancel_sub_by_id.assert_not_called()          # already cancelled → no WC call
+
+
+def test_cancel_after_refund_calls_wc_by_id():
+    r = {}
+    w = MagicMock()
+    w._cancel_sub_by_id.return_value = {"cancelled": True, "status": "success"}
+    with patch.object(main, "woo", w):
+        ok = main._cancel_subscription_after_refund("1", {"subscription_id": 555}, r)
+    assert ok is True and r["refund_subscription_cancelled"] is True
+    w._cancel_sub_by_id.assert_called_once_with(555)
+
+
+def test_cancel_after_refund_failure_returns_false():
+    r = {}
+    w = MagicMock()
+    w._cancel_sub_by_id.return_value = {"cancelled": False, "status": "error"}
+    with patch.object(main, "woo", w):
+        ok = main._cancel_subscription_after_refund("1", {"subscription_id": 555}, r)
+    assert ok is False and r["refund_subscription_cancelled"] is False
+
+
+def test_cancel_after_refund_no_subid_returns_false():
+    r = {}
+    with patch.object(main, "woo", MagicMock()):
+        ok = main._cancel_subscription_after_refund("1", {}, r)
+    assert ok is False
+
+
+def test_e2e_approved_solves_ticket_and_flags_unconfirmed_cancel():
+    # In the harness nexus_data is None → cancel can't be confirmed → the bot
+    # must (a) still solve the ticket, (b) leave a manual-cancel warning note.
+    result, zd = _drive_eval("WOULD_BE_REFUNDED", True)
+    assert zd.solve_ticket.called
+    assert any("AUTO-CANCEL" in str(c) for c in zd.add_internal_note.call_args_list)
+
+
 def test_slack_would_be_only_when_brand_not_enabled():
     result = {
         "status": "skipped_refund_request", "intent": "REFUND_REQUEST",
