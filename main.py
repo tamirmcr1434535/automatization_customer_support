@@ -283,6 +283,130 @@ def _charge_host_brand(nexus_data, candidate_charge_id: str) -> str:
     return _host_to_brand(d.get("host"))
 
 
+def _candidate_charge(nexus_data, candidate_charge_id):
+    """The refunded charge dict (candidate → first with a host → first), or {}.
+    Carries `host` + `provider` used to fill Registered / Processor / Country."""
+    charges = (nexus_data or {}).get("charges") or []
+    if candidate_charge_id:
+        for c in charges:
+            if c.get("charge_id") == candidate_charge_id:
+                return c
+    for c in charges:
+        if c.get("host"):
+            return c
+    return charges[0] if charges else {}
+
+
+# ── host → locale → reply language / country (AN-192) ─────────────────────── #
+# `host` carries the product-site locale as a subdomain ("jp.wwpersonalitytest
+# .com", "de.wwiqtest.com") or a path segment ("16types.ai/ja"). We use it as a
+# proxy for BOTH the customer's language (so a JP customer isn't answered in EN
+# — the subject-keyword path had no classifier language and defaulted to EN) and
+# the Country field. Best-effort: unknown locale → "".
+_LOCALE_LANG = {
+    "jp": "JP", "ja": "JP", "kr": "KR", "ko": "KR", "kor": "KR", "de": "DE",
+    "fr": "FR", "es": "ES", "it": "IT", "nl": "NL", "pt": "PT", "ptr": "PT",
+    "tr": "TR", "tur": "TR", "se": "SV", "sv": "SV", "nor": "NO", "no": "NO",
+    "pl": "PL", "cn": "ZH-CN", "zh": "ZH-CN", "hk": "ZH-TW", "id": "ID",
+    "vi": "VI", "vn": "VI", "ar": "AR", "sa": "AR", "en": "EN",
+}
+_LOCALE_COUNTRY = {
+    "jp": "jp", "ja": "jp", "kr": "kr", "ko": "kr", "kor": "kr", "de": "de",
+    "fr": "fr", "es": "es", "it": "it", "nl": "nl", "pt": "pt", "ptr": "pt",
+    "tr": "tr", "tur": "tr", "se": "se", "sv": "se", "nor": "no", "no": "no",
+    "pl": "pl", "cn": "cn", "hk": "hk", "id": "id", "vi": "vn", "vn": "vn",
+    "sa": "sa", "ar": "sa",
+}
+
+
+def _host_locale(host: str) -> str:
+    """Pull the locale token out of a charge host — leading subdomain
+    ("jp.wwpersonalitytest.com" → "jp") or a path locale ("16types.ai/ja" →
+    "ja"). "" when there's no locale (e.g. bare "16types.ai")."""
+    h = (host or "").strip().lower()
+    if not h:
+        return ""
+    domain, _, path = h.partition("/")
+    parts = domain.split(".")
+    # subdomain locale: <loc>.brand.tld (≥3 labels, first is a known locale)
+    if len(parts) >= 3 and parts[0] in _LOCALE_LANG:
+        return parts[0]
+    # path locale: brand.tld/<loc>[/...]
+    seg = path.split("/")[0] if path else ""
+    if seg in _LOCALE_LANG:
+        return seg
+    return ""
+
+
+def _locale_lang(host: str) -> str:
+    return _LOCALE_LANG.get(_host_locale(host), "")
+
+
+def _locale_country(host: str) -> str:
+    return _LOCALE_COUNTRY.get(_host_locale(host), "")
+
+
+# ── Processor (charge.provider → Zendesk Processor tagger value) ──────────── #
+_PROCESSOR_MAP = {
+    "stripe": "stripe", "stripe2": "stripe2", "solidgate": "solidgate",
+    "paypal": "paypal", "tranzila": "tranzila", "bluesnap": "bluesnap",
+}
+
+
+def _processor_value(provider: str, paypal_order_id=None) -> str:
+    if paypal_order_id:
+        return "paypal"
+    return _PROCESSOR_MAP.get((provider or "").strip().lower(), "")
+
+
+# ── Registered (host brand + cross_sale → tagger value) ───────────────────── #
+# (base_value, plus_cross_value). NB "qt_сross" has a CYRILLIC 'с' — copied
+# verbatim from the field options. iqbooster has no Registered option (it's the
+# subscription funnel, not a front-end test) → left to the human.
+_REGISTERED_BY_BRAND = {
+    "wwiqtest":          ("iq_test", "qt_сross"),
+    "wwpersonalitytest": ("personality_test", "pt_cross"),
+    "quickiqtest":       ("quick_iq_test", "quick_iq_cross"),
+    "16personas":        ("16_persons_test", "16_persons_cross"),
+    "iqpro":             ("iq_pro_test", "iq_pro_test__cross"),
+    "16types":           ("16_types_test", "16_types_test_cross"),
+}
+
+
+def _registered_value(host_brand: str, cross_sale: bool) -> str:
+    pair = _REGISTERED_BY_BRAND.get(host_brand)
+    if not pair:
+        return ""
+    return pair[1] if cross_sale else pair[0]
+
+
+# ── Refund Type (charge type + brand → tagger value) ──────────────────────── #
+# subscription/renewal → "sub" for every brand. cross_sale (the report) and
+# first_sale (the initial test/certificate) map per brand — the report product
+# name differs. Brands without a clean option → "" (human fills it).
+_REFUND_TYPE_REPORT = {
+    "wwiqtest": "iq_test_report", "iqbooster": "iq_test_report",
+    "iqpro": "iq_test_report", "quickiqtest": "iq_test_report",
+    "wwpersonalitytest": "pt_report", "16personas": "16persons_report",
+    "16types": "16type_personality_report",
+}
+_REFUND_TYPE_FIRST = {
+    "wwiqtest": "iq_test_certificate", "iqbooster": "iq_test_certificate",
+    "iqpro": "iq_test_certificate", "quickiqtest": "iq_test_certificate",
+}
+
+
+def _refund_type_value(charge_type: str, host_brand: str) -> str:
+    t = (charge_type or "").strip().lower()
+    if t in ("subscription", "renewal"):
+        return "sub"
+    if t == "cross_sale":
+        return _REFUND_TYPE_REPORT.get(host_brand, "")
+    if t == "first_sale":
+        return _REFUND_TYPE_FIRST.get(host_brand, "")
+    return ""
+
+
 # ── Amount guard: standard renewal price per currency (from the Pricing sheet).
 # An auto-refund's charge must be a non-zero amount within ±20% of this — anything
 # else (0/null, an unknown currency, or an anomalous amount) is escalated to a
@@ -695,20 +819,29 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 except Exception as e:  # noqa: BLE001 — note is best-effort
                     log.warning(f"[{ticket_id}] refund suppress note failed: {e}")
         if rc in reply_generator.REFUND_AUTOREPLY_CODES and not _refund_suppress:
-            _lang = classification.get("language", "EN")
             _win = _parse_window_days(decision.guard_trail)
             _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
             _amt = (f"{decision.computed_amount} {decision.currency}".strip()
                     if decision.computed_amount else "")
+            # The refunded charge carries `host` (product site) + `provider`.
+            _cand_charge = _candidate_charge(nexus_data, decision.candidate_charge_id)
+            _charge_host = _cand_charge.get("host") or (nexus_data or {}).get("host") or ""
             # Product/link brand follows the CHARGE host (authoritative product
             # site), not the Zendesk inbox the customer emailed — so a partner-
             # site purchase (e.g. contacted 16personas, charge on 16types.ai)
             # gets that product's legal links + plan name. Falls back to the
             # Zendesk brand when the charge carries no host (old records).
-            _link_brand = _charge_host_brand(nexus_data, decision.candidate_charge_id) or brand
+            _link_brand = _host_to_brand(_charge_host) or brand
             if _link_brand != brand:
                 log.info(f"[{ticket_id}] refund reply product resolved via charge host: "
                          f"link_brand={_link_brand!r} (contacted brand={brand!r})")
+            # Reply language: a real (non-EN) classifier detection wins; otherwise
+            # the host-site locale (jp.* → JP) — this fixes the subject-keyword
+            # path which had no classifier language and defaulted to EN, so JP
+            # customers were answered in English (#171049).
+            _clf_lang = (classification.get("language") or "").strip()
+            _lang = _clf_lang if _clf_lang and _clf_lang.upper() != "EN" else (
+                _locale_lang(_charge_host) or "EN")
             _terms, _sub = refund_reply_links.links_for(_link_brand, _lang)  # per-site+language
             draft = reply_generator.generate_refund_reply(
                 rc, _lang,
@@ -805,7 +938,12 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     # the fields raced and reverted them (live #171024). One request
                     # = no race → fields always stick.
                     _fields = _build_refund_fields(
-                        _approved, _sum_text, (decision.currency or ""), country)
+                        _approved, _sum_text, (decision.currency or ""),
+                        host=_charge_host, host_brand=_link_brand,
+                        cross_sale=bool((nexus_data or {}).get("cross_sale")),
+                        provider=_cand_charge.get("provider"),
+                        paypal_order_id=_cand_charge.get("paypal_order_id"),
+                        charge_type=decision.charge_type)
                     try:
                         zendesk.reply_solve_and_set_fields(ticket_id, draft, _fields)
                         log.info(f"[{ticket_id}] refund reply POSTED + solved + fields set "
@@ -822,8 +960,10 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     result["reply_text"] = draft
                     result["refund_status"] = "refund_approved" if _approved else "refund_denied"
                     result["refund_sum"] = _sum_text
-                    if country:
-                        result["country"] = country
+                    # Country logged from the same host-locale proxy written to Zendesk.
+                    _country_tag = _locale_country(_charge_host) or country
+                    if _country_tag:
+                        result["country"] = _country_tag
                 else:
                     log.info(
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
@@ -1291,6 +1431,15 @@ _ZENDESK_REFUND_SUM_FIELD_ID = os.getenv(
 _ZENDESK_CURRENCY_FIELD_ID = os.getenv(
     "ZENDESK_CURRENCY_FIELD_ID", "18648254147356",
 ).strip()
+_ZENDESK_REGISTERED_FIELD_ID = os.getenv(
+    "ZENDESK_REGISTERED_FIELD_ID", "18169677598364",
+).strip()
+_ZENDESK_PROCESSOR_FIELD_ID = os.getenv(
+    "ZENDESK_PROCESSOR_FIELD_ID", "18169699524508",
+).strip()
+_ZENDESK_REFUND_TYPE_FIELD_ID = os.getenv(
+    "ZENDESK_REFUND_TYPE_FIELD_ID", "18169784937372",
+).strip()
 _ZENDESK_TOPIC_REFUND_VALUE = os.getenv("ZENDESK_TOPIC_REFUND", "refund")
 
 
@@ -1319,30 +1468,37 @@ def _refund_sum_string(decision) -> str:
 
 
 def _build_refund_fields(
-    approved: bool, sum_text: str, currency: str, country: str,
+    approved: bool, sum_text: str, currency: str, *,
+    host: str = "", host_brand: str = "", cross_sale: bool = False,
+    provider: str = "", paypal_order_id=None, charge_type: str = "",
 ) -> dict:
-    """Build the {field_id: value} map for the refund topic-screen fields.
+    """Build the {field_id: value} map for ALL refund topic-screen fields a human
+    fills (approval #169738 / denial #169768), from the refunded charge:
 
-    Topic + Refund Status always; Refund Sum + Currency only for an APPROVED
-    refund (money moved) — a denial leaves them empty, matching how agents fill
-    the form (see denied #169768); Country best-effort (only if resolvable).
+      • Topic          → "refund" (always)
+      • Refund Status  → refund_approved / refund_denied (always)
+      • Refund Sum + Currency → APPROVED only (denial leaves them empty, #169768)
+      • Registered     → host site + cross_sale flag        (e.g. Personality Test +Cross)
+      • Processor      → charge.provider                    (Stripe → stripe)
+      • Refund Type    → charge.type + brand                (sub / iq_test_report / …)
+      • Country        → host locale proxy                  (jp.* → Japan)
 
-    Returned as a dict so the caller can write them TOGETHER with the reply +
-    solved-status in ONE atomic PUT. That is essential: separate field / solve
-    PUTs raced, and the status-only solve PUT reverted the fields set a moment
-    earlier (live #171024: bot set them 12:41:49, its own solve wiped them
-    12:41:50). One PUT = no race, fields always stick."""
+    Each derived field is best-effort — omitted when it can't be resolved, so a
+    human still fills the rest. Returned as a dict for the caller to write in ONE
+    atomic PUT with the reply + solved status (separate PUTs raced and the solve
+    reverted the fields — live #171024)."""
     fields = {
         _ZENDESK_TOPIC_FIELD_ID: _ZENDESK_TOPIC_REFUND_VALUE,
         _ZENDESK_REFUND_STATUS_FIELD_ID:
             "refund_approved" if approved else "refund_denied",
+        _ZENDESK_REGISTERED_FIELD_ID: _registered_value(host_brand, cross_sale),
+        _ZENDESK_PROCESSOR_FIELD_ID: _processor_value(provider, paypal_order_id),
+        _ZENDESK_REFUND_TYPE_FIELD_ID: _refund_type_value(charge_type, host_brand),
+        _ZENDESK_COUNTRY_FIELD_ID: _locale_country(host),
     }
     if approved:
         fields[_ZENDESK_REFUND_SUM_FIELD_ID] = sum_text
         fields[_ZENDESK_CURRENCY_FIELD_ID] = (currency or "").strip().lower()
-    _cval = _country_field_value(country)
-    if _cval:
-        fields[_ZENDESK_COUNTRY_FIELD_ID] = _cval
     return {k: v for k, v in fields.items() if k and v}
 
 
