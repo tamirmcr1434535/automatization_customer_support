@@ -347,6 +347,30 @@ class ZendeskClient:
             ]}},
         )
 
+    def set_custom_fields(self, ticket_id: str, fields: dict):
+        """Set several ticket custom fields in ONE PUT.
+
+        `fields` is {field_id: value}. Doing them together is atomic — a
+        single ticket update — which avoids the lost-update races that hit
+        several rapid back-to-back single-field PUTs (only the last-applied
+        one would stick). Empty values are skipped. No-op if nothing to set.
+        Zendesk merges custom_fields by id, so untouched fields are preserved.
+        """
+        entries = [
+            {"id": int(fid), "value": val}
+            for fid, val in (fields or {}).items()
+            if fid and val not in (None, "")
+        ]
+        if not entries:
+            return
+        if self.dry_run:
+            log.info(f"[DRY] custom_fields {entries} → #{ticket_id}")
+            return
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
+            json={"ticket": {"custom_fields": entries}},
+        )
+
     def add_tag(self, ticket_id: str, tag: str):
         if self.dry_run and not self.shadow_mode:
             log.info(f"[DRY] tag '{tag}' → #{ticket_id}")

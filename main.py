@@ -1254,23 +1254,26 @@ def _set_refund_fields_for_ticket(
     `sum_text`/`currency` → only meaningful for an APPROVED refund (money moved);
                   for a denial they are left empty, matching how agents fill the
                   form (see denied ticket #169768). `country` best-effort.
-    Never raises — each field is independent and non-critical."""
-    def _try(field_id: str, value: str, label: str):
-        if not field_id or not value:
-            return
-        try:
-            zendesk.set_custom_field(ticket_id, int(field_id), value)
-            log.info(f"[{ticket_id}] refund field {label} set to '{value}'")
-        except Exception as e:  # noqa: BLE001
-            log.warning(f"[{ticket_id}] failed to set refund field {label}: {e}")
+    Never raises — reporting aid, not part of the refund guarantee.
 
-    _try(_ZENDESK_TOPIC_FIELD_ID, _ZENDESK_TOPIC_REFUND_VALUE, "Topic")
-    _try(_ZENDESK_REFUND_STATUS_FIELD_ID,
-         "refund_approved" if approved else "refund_denied", "Refund Status")
+    All the tagger/text fields go in ONE batched PUT: firing them as separate
+    back-to-back single-field updates raced against each other + post_reply, so
+    only the last-applied one stuck (live #170909 got only Refund Sum). Country
+    stays separate — it needs the lazy name→tag resolution and is usually empty."""
+    fields = {
+        _ZENDESK_TOPIC_FIELD_ID: _ZENDESK_TOPIC_REFUND_VALUE,
+        _ZENDESK_REFUND_STATUS_FIELD_ID:
+            "refund_approved" if approved else "refund_denied",
+    }
     if approved:
-        _try(_ZENDESK_REFUND_SUM_FIELD_ID, sum_text, "Refund Sum")
-        _try(_ZENDESK_CURRENCY_FIELD_ID,
-             (currency or "").strip().lower(), "Currency")
+        fields[_ZENDESK_REFUND_SUM_FIELD_ID] = sum_text
+        fields[_ZENDESK_CURRENCY_FIELD_ID] = (currency or "").strip().lower()
+    try:
+        zendesk.set_custom_fields(ticket_id, fields)
+        log.info(f"[{ticket_id}] refund fields set (batched): "
+                 f"{ {k: v for k, v in fields.items() if v} }")
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[{ticket_id}] failed to set refund fields: {e}")
     # Country: reuse the cancel-path helper (handles ISO-2 / name → tag). Only
     # fires when we actually know a country — the refund flow usually doesn't.
     if country:
