@@ -73,63 +73,39 @@ def test_refund_sum_empty_when_no_amount():
     assert main._refund_sum_string(d) == ""
 
 
-# ── _set_refund_fields_for_ticket ───────────────────────────────────────────
+# ── _build_refund_fields ────────────────────────────────────────────────────
 
-def test_set_fields_approved_batches_topic_status_sum_currency_and_country():
-    zd = MagicMock()
-    with patch.object(main, "zendesk", zd), \
-         patch.object(main, "_set_country_for_ticket") as country:
-        main._set_refund_fields_for_ticket(
-            "111", approved=True, sum_text="5490", currency="JPY", country="Japan")
-    # ONE batched call carrying all four fields (not 4 racing single PUTs).
-    zd.set_custom_field.assert_not_called()
-    zd.set_custom_fields.assert_called_once()
-    fields = zd.set_custom_fields.call_args.args[1]
+def test_build_refund_fields_approved_includes_topic_status_sum_currency_country():
+    with patch.object(main, "_country_field_value", return_value="jp"):
+        fields = main._build_refund_fields(
+            approved=True, sum_text="5490", currency="JPY", country="Japan")
     assert fields[main._ZENDESK_TOPIC_FIELD_ID] == "refund"
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_approved"
     assert fields[main._ZENDESK_REFUND_SUM_FIELD_ID] == "5490"
     assert fields[main._ZENDESK_CURRENCY_FIELD_ID] == "jpy"   # lowercased tag
-    country.assert_called_once_with("111", "Japan")
+    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
 
 
-def test_set_fields_denied_leaves_sum_and_currency_out():
-    zd = MagicMock()
-    with patch.object(main, "zendesk", zd), \
-         patch.object(main, "_set_country_for_ticket"):
-        main._set_refund_fields_for_ticket(
-            "222", approved=False, sum_text="", currency="JPY", country="")
-    fields = zd.set_custom_fields.call_args.args[1]
+def test_build_refund_fields_denied_leaves_sum_and_currency_out():
+    with patch.object(main, "_country_field_value", return_value=""):
+        fields = main._build_refund_fields(
+            approved=False, sum_text="", currency="JPY", country="")
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_denied"
-    # Denied → no Sum / Currency in the payload (mirrors how agents fill the form)
-    assert main._ZENDESK_REFUND_SUM_FIELD_ID not in fields
+    assert main._ZENDESK_REFUND_SUM_FIELD_ID not in fields   # denied → no sum
     assert main._ZENDESK_CURRENCY_FIELD_ID not in fields
+    assert main._ZENDESK_COUNTRY_FIELD_ID not in fields      # unresolved country → skipped
 
 
-def test_zendesk_set_custom_fields_single_put_skips_empty():
+def test_reply_solve_and_set_fields_is_one_atomic_put():
     from zendesk_client import ZendeskClient
     zc = ZendeskClient("sub", "e@e.com", "tok", dry_run=False)
     with patch.object(zc, "_request_with_retry") as req:
-        zc.set_custom_fields("5", {111: "a", 222: "", 333: "b", None: "x"})
-    req.assert_called_once()   # ONE PUT for all fields
-    payload = req.call_args.kwargs["json"]["ticket"]["custom_fields"]
-    assert {e["id"]: e["value"] for e in payload} == {111: "a", 333: "b"}  # empties/None dropped
-
-
-def test_zendesk_set_custom_fields_noop_when_all_empty():
-    from zendesk_client import ZendeskClient
-    zc = ZendeskClient("sub", "e@e.com", "tok", dry_run=False)
-    with patch.object(zc, "_request_with_retry") as req:
-        zc.set_custom_fields("5", {111: "", 222: None})
-    req.assert_not_called()
-
-
-def test_set_fields_skips_country_when_unknown():
-    zd = MagicMock()
-    with patch.object(main, "zendesk", zd), \
-         patch.object(main, "_set_country_for_ticket") as country:
-        main._set_refund_fields_for_ticket(
-            "333", approved=True, sum_text="10", currency="EUR", country="")
-    country.assert_not_called()
+        zc.reply_solve_and_set_fields("5", "hello", {111: "a", 222: "", 333: "b"})
+    req.assert_called_once()   # ONE PUT: reply + solve + fields together
+    body = req.call_args.kwargs["json"]["ticket"]
+    assert body["status"] == "solved"
+    assert body["comment"] == {"body": "hello", "public": True}
+    assert {e["id"]: e["value"] for e in body["custom_fields"]} == {111: "a", 333: "b"}
 
 
 # ── #3 charge-host → product/link brand ─────────────────────────────────────
@@ -258,9 +234,11 @@ def test_cancel_after_refund_no_subid_returns_false():
 
 def test_e2e_approved_solves_ticket_and_flags_unconfirmed_cancel():
     # In the harness nexus_data is None → cancel can't be confirmed → the bot
-    # must (a) still solve the ticket, (b) leave a manual-cancel warning note.
+    # must (a) reply+solve+fields in the one atomic call, (b) leave a manual-
+    # cancel warning note. solve_ticket is NOT called separately (folded in).
     result, zd = _drive_eval("WOULD_BE_REFUNDED", True)
-    assert zd.solve_ticket.called
+    assert zd.reply_solve_and_set_fields.called
+    zd.solve_ticket.assert_not_called()
     assert any("AUTO-CANCEL" in str(c) for c in zd.add_internal_note.call_args_list)
 
 
@@ -327,18 +305,22 @@ def test_e2e_approved_refund_reports_success_and_sets_fields():
     assert result.get("refund_reply_sent") is True
     assert result.get("reply_text")                       # reply mirrored for Slack
     assert main._refund_outcome_status(result) == "success_refund_approved"
-    fields = zd.set_custom_fields.call_args.args[1]
+    # reply + solve + fields in ONE atomic call: (ticket_id, body, fields_dict)
+    args = zd.reply_solve_and_set_fields.call_args.args
+    fields = args[2]
+    assert args[1]                                            # reply body present
     assert fields[main._ZENDESK_TOPIC_FIELD_ID] == "refund"
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_approved"
     assert fields[main._ZENDESK_REFUND_SUM_FIELD_ID] == "5490"
     assert fields[main._ZENDESK_CURRENCY_FIELD_ID] == "jpy"
+    zd.solve_ticket.assert_not_called()                       # solve folded into the atomic PUT
 
 
 def test_e2e_denied_refund_reports_success_denied_no_sum():
     result, zd = _drive_eval("OUTSIDE_REFUND_WINDOW", False)
     assert result.get("refund_reply_sent") is True
     assert main._refund_outcome_status(result) == "success_refund_denied"
-    fields = zd.set_custom_fields.call_args.args[1]
+    fields = zd.reply_solve_and_set_fields.call_args.args[2]
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_denied"
     assert main._ZENDESK_REFUND_SUM_FIELD_ID not in fields   # denied → no sum
 

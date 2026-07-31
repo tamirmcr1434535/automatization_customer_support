@@ -408,6 +408,28 @@ class ZendeskClient:
             json={"ticket": {"status": "solved"}},
         )
 
+    def reply_solve_and_set_fields(self, ticket_id: str, body: str, custom_fields: dict):
+        """Post a PUBLIC reply, set status=solved, and set custom fields — all in
+        ONE PUT. Atomic on purpose: doing the reply/fields and a separate solve
+        as back-to-back PUTs raced, and the status-only solve reverted the custom
+        fields set a moment earlier (Zendesk #171024). One request = no race.
+        `custom_fields` is {field_id: value}; empty values are dropped."""
+        entries = [
+            {"id": int(fid), "value": val}
+            for fid, val in (custom_fields or {}).items()
+            if fid and val not in (None, "")
+        ]
+        if self.dry_run:
+            log.info(f"[DRY] reply+solve+fields → #{ticket_id}: fields={entries}")
+            return
+        ticket = {"status": "solved", "comment": {"body": body, "public": True}}
+        if entries:
+            ticket["custom_fields"] = entries
+        self._request_with_retry(
+            "PUT", f"{self.base}/tickets/{ticket_id}.json",
+            json={"ticket": ticket},
+        )
+
     def was_recently_handled(
         self, email: str, hours: int = 24, exclude_ticket_id: str = ""
     ) -> bool:

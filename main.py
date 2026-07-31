@@ -785,30 +785,11 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     # for real BEFORE replying (both approve and deny templates say
                     # so), so the customer isn't re-charged next cycle.
                     _cancelled = _cancel_subscription_after_refund(ticket_id, nexus_data, result)
-                    zendesk.post_reply(ticket_id, draft)
-                    result["refund_reply_sent"] = True
-                    log.info(f"[{ticket_id}] refund reply POSTED to customer (brand={brand}, {rc})")
-                    # Mirror the reply into reply_text so the per-ticket Slack card
-                    # shows the "Reply preview" exactly like a cancellation does.
-                    result["reply_text"] = draft
-                    # Topic-screen values (also logged to BQ for the report):
                     _approved = (rc == "WOULD_BE_REFUNDED")
                     _sum_text = _refund_sum_string(decision) if _approved else ""
-                    result["refund_status"] = "refund_approved" if _approved else "refund_denied"
-                    result["refund_sum"] = _sum_text
-                    if country:
-                        result["country"] = country
-                    # Fill the Zendesk custom fields the way an agent would. Gated
-                    # by send_ok → only ever on a live-resolved refund; never shadow.
-                    try:
-                        _set_refund_fields_for_ticket(
-                            ticket_id, approved=_approved, sum_text=_sum_text,
-                            currency=(decision.currency or ""), country=country,
-                        )
-                    except Exception as e:  # noqa: BLE001 — additive, non-blocking
-                        log.warning(f"[{ticket_id}] set refund fields failed: {e}")
-                    # If we could NOT confirm the cancel, the reply still told the
-                    # customer it's cancelled — flag it so a human finishes it.
+                    # If the auto-cancel could not be confirmed, flag it FIRST (an
+                    # internal note — a comment, so it can't clobber fields/status).
+                    # The public reply already promises cancellation.
                     if not _cancelled:
                         try:
                             zendesk.add_internal_note(
@@ -819,11 +800,30 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                                 "re-charge.")
                         except Exception:  # noqa: BLE001
                             pass
-                    # #4: close the ticket now that the refund is fully handled.
+                    # FINAL Zendesk write — reply + solve + all refund topic-screen
+                    # fields in ONE atomic PUT. Doing solve as a separate PUT after
+                    # the fields raced and reverted them (live #171024). One request
+                    # = no race → fields always stick.
+                    _fields = _build_refund_fields(
+                        _approved, _sum_text, (decision.currency or ""), country)
                     try:
-                        zendesk.solve_ticket(ticket_id)
+                        zendesk.reply_solve_and_set_fields(ticket_id, draft, _fields)
+                        log.info(f"[{ticket_id}] refund reply POSTED + solved + fields set "
+                                 f"(brand={brand}, {rc}, fields={_fields})")
                     except Exception as e:  # noqa: BLE001
-                        log.warning(f"[{ticket_id}] refund: solve_ticket failed: {e}")
+                        # Fallback: at least get the reply to the customer.
+                        log.warning(f"[{ticket_id}] atomic reply/solve/fields failed ({e}); "
+                                    f"posting reply only")
+                        try:
+                            zendesk.post_reply(ticket_id, draft)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    result["refund_reply_sent"] = True
+                    result["reply_text"] = draft
+                    result["refund_status"] = "refund_approved" if _approved else "refund_denied"
+                    result["refund_sum"] = _sum_text
+                    if country:
+                        result["country"] = country
                 else:
                     log.info(
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
@@ -1249,6 +1249,24 @@ def _set_country_for_ticket(ticket_id: str, country: str) -> None:
     except Exception as e:
         log.warning(f"[{ticket_id}] Failed to set country: {e}")
 
+
+def _country_field_value(country: str) -> str:
+    """Resolve a country (ISO-2 or English name) to the Zendesk Country field
+    tag ("jp", "us", …), or "" if unset/unknown. Lets the refund flow fold
+    Country into the same atomic PUT as the other fields instead of a separate
+    set_custom_field call. Never raises."""
+    if not _ZENDESK_COUNTRY_FIELD_ID or not country:
+        return ""
+    raw = country.strip()
+    if not raw:
+        return ""
+    if len(raw) == 2 and raw.isalpha():
+        return raw.lower()
+    try:
+        return _load_country_name_to_tag().get(raw.lower(), "")
+    except Exception:  # noqa: BLE001
+        return ""
+
 # ── Zendesk refund custom fields (set ONLY on a live-resolved refund) ──── #
 # When the bot actually handles a refund end-to-end for a refunds-enabled
 # brand (posts the approve OR deny reply to the customer), it fills the same
@@ -1300,21 +1318,20 @@ def _refund_sum_string(decision) -> str:
     return "+".join(amounts)
 
 
-def _set_refund_fields_for_ticket(
-    ticket_id: str, approved: bool, sum_text: str, currency: str, country: str,
-) -> None:
-    """Set the Zendesk refund topic-screen fields after a live-resolved refund.
+def _build_refund_fields(
+    approved: bool, sum_text: str, currency: str, country: str,
+) -> dict:
+    """Build the {field_id: value} map for the refund topic-screen fields.
 
-    `approved`  → Refund Status (approved vs denied) + Topic="refund".
-    `sum_text`/`currency` → only meaningful for an APPROVED refund (money moved);
-                  for a denial they are left empty, matching how agents fill the
-                  form (see denied ticket #169768). `country` best-effort.
-    Never raises — reporting aid, not part of the refund guarantee.
+    Topic + Refund Status always; Refund Sum + Currency only for an APPROVED
+    refund (money moved) — a denial leaves them empty, matching how agents fill
+    the form (see denied #169768); Country best-effort (only if resolvable).
 
-    All the tagger/text fields go in ONE batched PUT: firing them as separate
-    back-to-back single-field updates raced against each other + post_reply, so
-    only the last-applied one stuck (live #170909 got only Refund Sum). Country
-    stays separate — it needs the lazy name→tag resolution and is usually empty."""
+    Returned as a dict so the caller can write them TOGETHER with the reply +
+    solved-status in ONE atomic PUT. That is essential: separate field / solve
+    PUTs raced, and the status-only solve PUT reverted the fields set a moment
+    earlier (live #171024: bot set them 12:41:49, its own solve wiped them
+    12:41:50). One PUT = no race, fields always stick."""
     fields = {
         _ZENDESK_TOPIC_FIELD_ID: _ZENDESK_TOPIC_REFUND_VALUE,
         _ZENDESK_REFUND_STATUS_FIELD_ID:
@@ -1323,16 +1340,10 @@ def _set_refund_fields_for_ticket(
     if approved:
         fields[_ZENDESK_REFUND_SUM_FIELD_ID] = sum_text
         fields[_ZENDESK_CURRENCY_FIELD_ID] = (currency or "").strip().lower()
-    try:
-        zendesk.set_custom_fields(ticket_id, fields)
-        log.info(f"[{ticket_id}] refund fields set (batched): "
-                 f"{ {k: v for k, v in fields.items() if v} }")
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"[{ticket_id}] failed to set refund fields: {e}")
-    # Country: reuse the cancel-path helper (handles ISO-2 / name → tag). Only
-    # fires when we actually know a country — the refund flow usually doesn't.
-    if country:
-        _set_country_for_ticket(ticket_id, country)
+    _cval = _country_field_value(country)
+    if _cval:
+        fields[_ZENDESK_COUNTRY_FIELD_ID] = _cval
+    return {k: v for k, v in fields.items() if k and v}
 
 
 # ── Webhook deduplication (Firestore-backed distributed lock) ────────── #

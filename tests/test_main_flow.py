@@ -1669,7 +1669,8 @@ def test_refund_reply_sent_when_enabled_for_deny():
             ticket_text="please refund my subscription", as_of_date="2026-07-24T00:00:00Z")
     assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"
     assert result.get("refund_reply_sent") is True
-    zd.post_reply.assert_called_once_with("9201", "DRAFT")
+    # reply + solve + fields in one atomic call: (ticket_id, body, fields)
+    assert zd.reply_solve_and_set_fields.call_args.args[:2] == ("9201", "DRAFT")
 
 
 def test_refund_approved_reply_NOT_sent_without_execution():
@@ -1814,7 +1815,7 @@ def test_refund_executed_when_enabled_and_clean():
     rcm.create_refund.assert_called_once()
     assert result.get("refund_executed") is True
     assert result.get("refund_execution_status") == "refunded"
-    zd.post_reply.assert_called_once()         # executed → approved reply sent
+    zd.reply_solve_and_set_fields.assert_called_once()   # executed → approved reply + solve + fields
 
 
 def test_abuse_guard_blocks_execution():
@@ -1996,7 +1997,7 @@ def test_refund_reply_sent_only_for_enabled_brand():
     res_on, zd_on = run("https://jap.wwiqtest.com")
     assert res_on.get("refund_reply_sent") is True
     assert res_on.get("refund_brand") == "wwiqtest"
-    zd_on.post_reply.assert_called_once()
+    zd_on.reply_solve_and_set_fields.assert_called_once()
     # different brand (not in allowlist) → drafted + logged, NOT posted
     res_off, zd_off = run("https://16types.ai")
     assert "refund_reply_sent" not in res_off
@@ -2104,7 +2105,7 @@ def test_refund_explanation_question_uses_explained_template():
     _rc, _lang, _data = gen.call_args.args
     assert _data.get("explain_charge") is True
     assert result.get("refund_reply_sent") is True                  # deny sent (with explanation)
-    zd.post_reply.assert_called_once_with("9210", "DRAFT")
+    assert zd.reply_solve_and_set_fields.call_args.args[:2] == ("9210", "DRAFT")
 
 
 def test_refund_clean_subscription_still_auto_answers_when_asked_no_why():
