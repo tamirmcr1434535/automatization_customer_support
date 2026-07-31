@@ -75,25 +75,55 @@ def test_refund_sum_empty_when_no_amount():
 
 # ── _build_refund_fields ────────────────────────────────────────────────────
 
-def test_build_refund_fields_approved_includes_topic_status_sum_currency_country():
-    with patch.object(main, "_country_field_value", return_value="jp"):
-        fields = main._build_refund_fields(
-            approved=True, sum_text="5490", currency="JPY", country="Japan")
+def test_build_refund_fields_approved_full_set_from_charge():
+    # Approved renewal on wwpersonalitytest JP with a cross-sale on the account.
+    fields = main._build_refund_fields(
+        approved=True, sum_text="5490", currency="JPY",
+        host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
+        cross_sale=True, provider="Stripe", charge_type="renewal")
     assert fields[main._ZENDESK_TOPIC_FIELD_ID] == "refund"
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_approved"
     assert fields[main._ZENDESK_REFUND_SUM_FIELD_ID] == "5490"
-    assert fields[main._ZENDESK_CURRENCY_FIELD_ID] == "jpy"   # lowercased tag
-    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
+    assert fields[main._ZENDESK_CURRENCY_FIELD_ID] == "jpy"
+    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"          # from host locale
+    assert fields[main._ZENDESK_PROCESSOR_FIELD_ID] == "stripe"    # from provider
+    assert fields[main._ZENDESK_REGISTERED_FIELD_ID] == "pt_cross" # brand + cross_sale
+    assert fields[main._ZENDESK_REFUND_TYPE_FIELD_ID] == "sub"     # renewal → Sub
 
 
 def test_build_refund_fields_denied_leaves_sum_and_currency_out():
-    with patch.object(main, "_country_field_value", return_value=""):
-        fields = main._build_refund_fields(
-            approved=False, sum_text="", currency="JPY", country="")
+    fields = main._build_refund_fields(
+        approved=False, sum_text="", currency="JPY",
+        host="", host_brand="", cross_sale=False, provider="", charge_type="")
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_denied"
     assert main._ZENDESK_REFUND_SUM_FIELD_ID not in fields   # denied → no sum
     assert main._ZENDESK_CURRENCY_FIELD_ID not in fields
-    assert main._ZENDESK_COUNTRY_FIELD_ID not in fields      # unresolved country → skipped
+    assert main._ZENDESK_COUNTRY_FIELD_ID not in fields      # no host → no country
+    assert main._ZENDESK_PROCESSOR_FIELD_ID not in fields    # unknown → skipped
+    assert main._ZENDESK_REGISTERED_FIELD_ID not in fields
+
+
+def test_refund_field_derivers():
+    # host → locale → language / country
+    assert main._host_locale("jp.wwpersonalitytest.com") == "jp"
+    assert main._host_locale("16types.ai/ja") == "ja"
+    assert main._host_locale("16types.ai") == ""
+    assert main._locale_lang("de.wwiqtest.com") == "DE"
+    assert main._locale_country("kor.wwiqtest.com") == "kr"
+    # Processor
+    assert main._processor_value("Stripe") == "stripe"
+    assert main._processor_value("", paypal_order_id="PO-1") == "paypal"
+    assert main._processor_value("weird") == ""
+    # Registered (base vs +Cross)
+    assert main._registered_value("16types", True) == "16_types_test_cross"
+    assert main._registered_value("16types", False) == "16_types_test"
+    assert main._registered_value("iqbooster", True) == ""      # no option → human
+    # Refund Type (brand-mapped)
+    assert main._refund_type_value("renewal", "wwpersonalitytest") == "sub"
+    assert main._refund_type_value("cross_sale", "16personas") == "16persons_report"
+    assert main._refund_type_value("cross_sale", "wwiqtest") == "iq_test_report"
+    assert main._refund_type_value("first_sale", "iqpro") == "iq_test_certificate"
+    assert main._refund_type_value("cross_sale", "iqbooster") == "iq_test_report"
 
 
 def test_reply_solve_and_set_fields_is_one_atomic_put():
