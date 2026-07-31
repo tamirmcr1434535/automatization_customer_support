@@ -237,6 +237,52 @@ def _refund_xhost(brand: str) -> str:
     return _REFUND_XHOST.get(brand, "")
 
 
+# ── Charge `host` → brand_key (AN-192 refund product/link resolution) ──── #
+# Nexus now returns a `host` on each charge + at the subscription level (added
+# by backend 2026-07-31): the actual product SITE the charge lives on, e.g.
+# "jp.wwpersonalitytest.com" or "16types.ai/ja". This is the authoritative
+# product signal — it can differ from the Zendesk brand the customer emailed
+# (they contact one site but bought on a partner site: #170907 contacted
+# 16personas, charge host = 16types.ai). We map it to a brand_key so the refund
+# reply's legal links + product name follow the CHARGE, not the inbox. Matched
+# by root-domain substring (tolerates language subdomains / path locales).
+_HOST_BRAND_MARKERS = [
+    ("wwpersonalitytest", "wwpersonalitytest"),
+    ("16types.ai",        "16types"),
+    ("16persons.com",     "16personas"),
+    ("iqpro",             "iqpro"),
+    ("iqbooster",         "iqbooster"),
+    ("quickiqtest",       "quickiqtest"),
+    ("wwiqtest",          "wwiqtest"),
+]
+
+
+def _host_to_brand(host: str) -> str:
+    """Map a Nexus charge `host` domain to our brand_key, or "" if unknown."""
+    h = (host or "").lower()
+    for marker, brand in _HOST_BRAND_MARKERS:
+        if marker in h:
+            return brand
+    return ""
+
+
+def _charge_host_brand(nexus_data, candidate_charge_id: str) -> str:
+    """Brand_key from the refunded charge's `host` — prefer the candidate charge
+    (the one being refunded), else any charge, else the subscription-level host.
+    Returns "" when no host is present (old records) → caller falls back to the
+    Zendesk brand."""
+    d = nexus_data or {}
+    charges = d.get("charges") or []
+    if candidate_charge_id:
+        for c in charges:
+            if c.get("charge_id") == candidate_charge_id and c.get("host"):
+                return _host_to_brand(c.get("host"))
+    for c in charges:
+        if c.get("host"):
+            return _host_to_brand(c.get("host"))
+    return _host_to_brand(d.get("host"))
+
+
 # ── Amount guard: standard renewal price per currency (from the Pricing sheet).
 # An auto-refund's charge must be a non-zero amount within ±20% of this — anything
 # else (0/null, an unknown currency, or an anomalous amount) is escalated to a
@@ -654,7 +700,16 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
             _amt = (f"{decision.computed_amount} {decision.currency}".strip()
                     if decision.computed_amount else "")
-            _terms, _sub = refund_reply_links.links_for(brand, _lang)  # per-site+language
+            # Product/link brand follows the CHARGE host (authoritative product
+            # site), not the Zendesk inbox the customer emailed — so a partner-
+            # site purchase (e.g. contacted 16personas, charge on 16types.ai)
+            # gets that product's legal links + plan name. Falls back to the
+            # Zendesk brand when the charge carries no host (old records).
+            _link_brand = _charge_host_brand(nexus_data, decision.candidate_charge_id) or brand
+            if _link_brand != brand:
+                log.info(f"[{ticket_id}] refund reply product resolved via charge host: "
+                         f"link_brand={_link_brand!r} (contacted brand={brand!r})")
+            _terms, _sub = refund_reply_links.links_for(_link_brand, _lang)  # per-site+language
             draft = reply_generator.generate_refund_reply(
                 rc, _lang,
                 {
@@ -664,7 +719,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     "refund_window_days": _win,
                     "charges_list": (f"- {_amt} (charged {_cdate})".rstrip() if _amt else ""),
                     "it_falls": "it falls",
-                    "brand_phrase": _BRAND_PHRASE.get(brand),   # None → template default
+                    "brand_phrase": _BRAND_PHRASE.get(_link_brand),   # None → template default
                     "terms_url": _terms,
                     "subscription_url": _sub,
                     # ticket #169403 (Anna 2026-07-29): when the customer asked WHY
@@ -672,7 +727,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     # `brand` drives the plan-name in that explanation (16types →
                     # "16 Types Growth Plan", else "IQ Booster brain training plan").
                     "explain_charge": _explain_charge,
-                    "brand": brand,
+                    "brand": _link_brand,
                 },
             )
             if draft:
