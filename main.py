@@ -945,7 +945,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         paypal_order_id=_cand_charge.get("paypal_order_id"),
                         charge_type=decision.charge_type)
                     try:
-                        zendesk.reply_solve_and_set_fields(ticket_id, draft, _fields)
+                        zendesk.reply_solve_and_set_fields(
+                            ticket_id, draft, _fields, additional_tags=["bot_handled"])
                         log.info(f"[{ticket_id}] refund reply POSTED + solved + fields set "
                                  f"(brand={brand}, {rc}, fields={_fields})")
                     except Exception as e:  # noqa: BLE001
@@ -2783,7 +2784,12 @@ def _process(ticket_id: str) -> dict:
         result["reason"] = (
             f"Refund keywords detected in body ({_refund_context}) — human must handle any refund"
         )
-        zendesk.add_tag(ticket_id, "bot_handled")
+        # On a LIVE-resolved refund, bot_handled was already added inside the
+        # atomic reply_solve_and_set_fields PUT — a separate add_tag POST here
+        # races that PUT's field-tags and can wipe them (#171200). Only tag
+        # separately when the refund was NOT resolved live (drafted / to a human).
+        if not result.get("refund_reply_sent"):
+            zendesk.add_tag(ticket_id, "bot_handled")
         log_result(result)
         return result
 
@@ -2915,7 +2921,10 @@ def _process(ticket_id: str) -> dict:
 
         result["status"] = _refund_outcome_status(result)
         result["reason"] = f"{intent} — refund intents always go to a human"
-        zendesk.add_tag(ticket_id, "bot_handled")
+        # Live-resolved refund already tagged atomically (see above) — a separate
+        # add_tag here races the atomic PUT's field-tags and can wipe them (#171200).
+        if not result.get("refund_reply_sent"):
+            zendesk.add_tag(ticket_id, "bot_handled")
         log_result(result)
         return result
 
