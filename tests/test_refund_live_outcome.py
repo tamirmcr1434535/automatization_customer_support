@@ -126,16 +126,20 @@ def test_refund_field_derivers():
     assert main._refund_type_value("cross_sale", "iqbooster") == "iq_test_report"
 
 
-def test_reply_solve_and_set_fields_is_one_atomic_put():
+def test_reply_solve_and_set_fields_is_one_atomic_put_with_tags():
     from zendesk_client import ZendeskClient
     zc = ZendeskClient("sub", "e@e.com", "tok", dry_run=False)
     with patch.object(zc, "_request_with_retry") as req:
-        zc.reply_solve_and_set_fields("5", "hello", {111: "a", 222: "", 333: "b"})
-    req.assert_called_once()   # ONE PUT: reply + solve + fields together
+        zc.reply_solve_and_set_fields(
+            "5", "hello", {111: "a", 222: "", 333: "b"}, additional_tags=["bot_handled"])
+    req.assert_called_once()   # ONE PUT: reply + solve + fields + tag together
     body = req.call_args.kwargs["json"]["ticket"]
     assert body["status"] == "solved"
     assert body["comment"] == {"body": "hello", "public": True}
     assert {e["id"]: e["value"] for e in body["custom_fields"]} == {111: "a", 333: "b"}
+    # bot_handled added via additional_tags (ADD, never replace) — no separate
+    # add_tag POST that could race and wipe the field-tags (#171200).
+    assert body["additional_tags"] == ["bot_handled"]
 
 
 # ── #3 charge-host → product/link brand ─────────────────────────────────────

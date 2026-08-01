@@ -408,23 +408,33 @@ class ZendeskClient:
             json={"ticket": {"status": "solved"}},
         )
 
-    def reply_solve_and_set_fields(self, ticket_id: str, body: str, custom_fields: dict):
-        """Post a PUBLIC reply, set status=solved, and set custom fields — all in
-        ONE PUT. Atomic on purpose: doing the reply/fields and a separate solve
-        as back-to-back PUTs raced, and the status-only solve reverted the custom
-        fields set a moment earlier (Zendesk #171024). One request = no race.
-        `custom_fields` is {field_id: value}; empty values are dropped."""
+    def reply_solve_and_set_fields(self, ticket_id: str, body: str, custom_fields: dict,
+                                   additional_tags=None):
+        """Post a PUBLIC reply, set status=solved, set custom fields, AND add tags
+        — all in ONE PUT. Atomic on purpose:
+          • a separate status-only solve PUT reverted the custom fields set a
+            moment earlier (#171024);
+          • a separate add_tag POST (Zendesk does an internal read-modify-write on
+            the tag set) raced the field-tags this PUT adds and, on a stale read,
+            reverted them to just the new tag — wiping every tagger custom field
+            (#171200). `additional_tags` (Zendesk's own "add these" semantics)
+            avoids that: the tag is applied inside this single update, never as a
+            separate racing write.
+        `custom_fields` is {field_id: value}; empty values dropped."""
         entries = [
             {"id": int(fid), "value": val}
             for fid, val in (custom_fields or {}).items()
             if fid and val not in (None, "")
         ]
+        tags = [t for t in (additional_tags or []) if t]
         if self.dry_run:
-            log.info(f"[DRY] reply+solve+fields → #{ticket_id}: fields={entries}")
+            log.info(f"[DRY] reply+solve+fields → #{ticket_id}: fields={entries} tags={tags}")
             return
         ticket = {"status": "solved", "comment": {"body": body, "public": True}}
         if entries:
             ticket["custom_fields"] = entries
+        if tags:
+            ticket["additional_tags"] = tags   # ADD (never replace) — atomic
         self._request_with_retry(
             "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": ticket},
