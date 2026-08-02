@@ -796,6 +796,13 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             )
             if _has_cross_or_first and _soft_routed:
                 _refund_suppress = "cross_sale_ambiguous_route"
+            elif rc == "WOULD_BE_REFUNDED" and not _has_explicit_refund_demand(eff_text or ""):
+                # Customer reported an unrecognised charge (身に覚えのない…) but never
+                # asked for their money back — this is an EXPLANATION request, not a
+                # refund. NEVER auto-move money for someone who didn't ask; leave it
+                # to a human (#172054). (An OUTSIDE-window inquiry still gets the
+                # explained deny — no money moves there — per Anna's design.)
+                _refund_suppress = "explanation_only_no_refund_demand"
         if _refund_suppress:
             result["refund_reply_suppressed"] = _refund_suppress
             log.info(
@@ -806,14 +813,24 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             # mode we record the suppression (BQ/Slack) but never mutate the ticket,
             # so Anna's shadow eval stays non-invasive.
             if refunds_enabled_for(brand):
-                _note = (
-                    "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
-                    "The account also has a one-time / cross-sale charge (IQ Test "
-                    "Report or Test fee) and the customer did not name a specific "
-                    "amount or charge type, so the refund flow was resolved to the "
-                    "subscription only by a heuristic. The customer may be asking "
-                    "about the cross-sale charge — please review."
-                )
+                if _refund_suppress == "explanation_only_no_refund_demand":
+                    _note = (
+                        "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
+                        "The customer reported an unrecognised charge (e.g. sent a "
+                        "screenshot / '身に覚えのない請求') but did NOT ask for a refund — "
+                        "this is an EXPLANATION request, not a refund. The bot did not "
+                        "auto-refund. Please explain the charge (trial → auto-renewal) "
+                        "or issue a refund only if the customer asks."
+                    )
+                else:
+                    _note = (
+                        "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
+                        "The account also has a one-time / cross-sale charge (IQ Test "
+                        "Report or Test fee) and the customer did not name a specific "
+                        "amount or charge type, so the refund flow was resolved to the "
+                        "subscription only by a heuristic. The customer may be asking "
+                        "about the cross-sale charge — please review."
+                    )
                 try:
                     zendesk.add_internal_note(ticket_id, _note)
                 except Exception as e:  # noqa: BLE001 — note is best-effort
@@ -4561,6 +4578,40 @@ def _contains_refund_request(text: str) -> bool:
     if _contains_billing_amount_complaint(text):
         return True
     return False
+
+
+# ── Explicit refund DEMAND vs "unrecognised charge" inquiry ─────────────── #
+# `_REFUND_KEYWORDS` (above) also matches unrecognised/unexpected-charge phrasing
+# (身に覚えの…, "unexpected charge", 不正請求). That correctly ROUTES such tickets to
+# the refund flow, but on its own it is NOT a request for money back — a customer
+# who just sends a screenshot of a charge with "I don't recognise this" is asking
+# us to EXPLAIN the charge, not to refund it (#172054: no refund word anywhere,
+# the agent set Topic=Explanation). Before auto-refunding we require an EXPLICIT
+# refund demand ("give my money back") — these words only.
+_REFUND_DEMAND_WORDS = [
+    "返金", "払い戻し", "取り戻し",                # JP: refund / money back
+    "refund", "money back", "money-back", "chargeback",
+    "환불",                                         # KR
+    "rückerstattung", "rückzahlung", "erstattet",  # DE
+    "remboursement", "rembourser",                 # FR
+    "reembolso",                                   # ES/PT
+    "rimborso",                                    # IT
+    "возврат",                                     # RU
+    "terugbetaling", "terugbetalen",               # NL
+    "tilbakebetaling", "återbetalning", "tilbagebetaling",  # NO/SE/DA
+    "hoàn tiền",                                   # VI
+    "استرداد", "استرجاع",                          # AR
+    "クーリングオフ",                              # JP cooling-off (legal → implies refund)
+]
+
+
+def _has_explicit_refund_demand(text: str) -> bool:
+    """True when the customer explicitly asks for their money BACK (返金 / refund /
+    払い戻し / …). Distinct from merely reporting an unrecognised charge
+    (身に覚えのない…, "unexpected charge"), which is a request to EXPLAIN the charge.
+    Gate for auto-refunding: never move money for someone who didn't ask for it."""
+    t = (text or "").lower()
+    return any(w in t for w in _REFUND_DEMAND_WORDS)
 
 
 # ── Strong refund signals ────────────────────────────────────────────── #

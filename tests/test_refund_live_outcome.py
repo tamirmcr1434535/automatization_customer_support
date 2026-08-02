@@ -266,6 +266,37 @@ def test_cancel_after_refund_no_subid_returns_false():
     assert ok is False
 
 
+def test_has_explicit_refund_demand():
+    # Explicit "money back" demands → True
+    assert main._has_explicit_refund_demand("返金してください")
+    assert main._has_explicit_refund_demand("Please refund me")
+    assert main._has_explicit_refund_demand("환불 요청합니다")
+    # Unrecognised-charge inquiry WITHOUT a refund word → False (= explanation)
+    assert not main._has_explicit_refund_demand("テストの後に身に覚えのない請求あり")
+    assert not main._has_explicit_refund_demand("I don't recognize this charge")
+    assert not main._has_explicit_refund_demand("")
+
+
+def test_e2e_explanation_only_charge_is_not_auto_refunded():
+    # Customer reported an unrecognised charge (would-be YES) but never asked for
+    # a refund → suppressed to a human, NOT auto-refunded (#172054).
+    result, zd = _drive_eval(
+        "WOULD_BE_REFUNDED", True, ticket_text="身に覚えのない請求があります")
+    assert not result.get("refund_reply_sent")           # no auto-refund reply
+    assert result.get("refund_reply_suppressed") == "explanation_only_no_refund_demand"
+    assert main._refund_outcome_status(result) == "skipped_refund_request"  # → human
+    # internal note explains it's an explanation request
+    assert any("EXPLANATION request" in str(c) for c in zd.add_internal_note.call_args_list)
+
+
+def test_e2e_explicit_refund_demand_still_auto_refunds():
+    # Same window decision but WITH a refund demand → normal auto-refund.
+    result, zd = _drive_eval(
+        "WOULD_BE_REFUNDED", True, ticket_text="身に覚えのない請求、返金してください")
+    assert result.get("refund_reply_sent") is True
+    assert result.get("refund_reply_suppressed") is None
+
+
 def test_e2e_approved_solves_ticket_and_flags_unconfirmed_cancel():
     # In the harness nexus_data is None → cancel can't be confirmed → the bot
     # must (a) reply+solve+fields in the one atomic call, (b) leave a manual-
@@ -303,10 +334,11 @@ def _fake_decision(reason_code, would_be, amount="5490", currency="JPY"):
     )
 
 
-def _drive_eval(reason_code, would_be, refund_ret=None):
+def _drive_eval(reason_code, would_be, refund_ret=None, ticket_text="返金してください"):
     """Run _refund_would_be_eval live-enabled with all collaborators stubbed,
     returning (result, zendesk_mock). `refund_ret` overrides create_refund's
-    return (default = a successful money move)."""
+    return; `ticket_text` is the customer text (default has an explicit refund
+    demand so the auto-refund is not suppressed)."""
     result = {}
     fake_reply_gen = SimpleNamespace(
         REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
@@ -328,7 +360,7 @@ def _drive_eval(reason_code, would_be, refund_ret=None):
         main._refund_would_be_eval(
             "555", "cust@x.com", "REFUND_REQUEST",
             {"confidence": 0.95, "language": "JA"}, result,
-            ticket_text="返金してください", as_of_date="2026-07-30T00:00:00Z",
+            ticket_text=ticket_text, as_of_date="2026-07-30T00:00:00Z",
             brand="wwiqtest",
         )
     return result, zd
