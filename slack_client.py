@@ -289,6 +289,10 @@ class SlackClient:
                     "Report or Test fee) and the customer did not name a specific "
                     "amount or charge type — the subscription itself is refundable, "
                     "but which charge they mean is ambiguous",
+                "explanation_only_no_refund_demand":
+                    "the customer reported an unrecognised charge (screenshot / "
+                    "'身に覚えのない請求') but did NOT ask for a refund — this is an "
+                    "EXPLANATION request, not a refund; the bot did not auto-refund",
             }
 
             if result.get("refund_reply_sent") and rd == "YES":
