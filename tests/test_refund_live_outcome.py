@@ -301,6 +301,61 @@ def test_e2e_explicit_refund_demand_still_auto_refunds():
     assert result.get("refund_reply_suppressed") is None
 
 
+# ── follow-up on an already-done refund (read full ticket history) ──────────
+
+def test_prior_refund_evidence_from_refunded_charge():
+    nexus = {"charges": [
+        {"amount": "5490", "currency": "JPY", "date": "2026-07-19",
+         "refunded_at": "2026-07-19T09:45:23Z", "status": "refund_initiated"},
+        {"amount": "1990", "currency": "JPY", "status": "success", "refunded_at": None},
+    ]}
+    with patch.object(main, "zendesk", MagicMock(get_requester_tickets=MagicMock(return_value={}))):
+        ev = main._prior_refund_evidence("req1", "999", nexus)
+    assert ev and ev["refunded_charges"][0]["amount"] == "5490"
+
+
+def test_prior_refund_evidence_from_ticket_history():
+    zd = MagicMock()
+    zd.get_requester_tickets.return_value = {
+        163870: {"id": 163870, "tags": ["refund_approved", "sub_renewal_refund"]},
+        999:    {"id": 999, "tags": ["bot_handled"]},           # current — excluded
+    }
+    with patch.object(main, "zendesk", zd):
+        ev = main._prior_refund_evidence("req1", "999", {"charges": []})
+    assert ev and ev["prior_tickets"] == ["163870"]
+
+
+def test_prior_refund_evidence_none_when_no_history_and_no_refunded_charge():
+    zd = MagicMock()
+    zd.get_requester_tickets.return_value = {5: {"id": 5, "tags": ["trial_cancellation"]}}
+    with patch.object(main, "zendesk", zd):
+        assert main._prior_refund_evidence("req1", "999", {"charges": [{"status": "success"}]}) is None
+
+
+def test_e2e_followup_existing_refund_held_for_human():
+    result = {}
+    fake_reply_gen = SimpleNamespace(
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
+        generate_refund_reply=lambda rc, lang, data: "DRAFT")
+    zd = MagicMock()
+    ev = {"refunded_charges": [{"amount": "5490", "currency": "JPY",
+          "date": "2026-07-19", "refunded_at": "2026-07-19"}], "prior_tickets": ["163870"]}
+    with patch.object(main.refund_engine, "decide", return_value=_fake_decision("WOULD_BE_REFUNDED", True)), \
+         patch.object(main, "reply_generator", fake_reply_gen), \
+         patch.object(main, "refunds_enabled_for", return_value=True), \
+         patch.object(main, "refund_client", MagicMock(is_configured=MagicMock(return_value=False))), \
+         patch.object(main, "nexus_client", None), \
+         patch.object(main, "_prior_refund_evidence", return_value=ev), \
+         patch.object(main, "zendesk", zd):
+        main._refund_would_be_eval("999", "c@x.com", "REFUND_REQUEST",
+                                   {"confidence": 0.95, "language": "JA"}, result,
+                                   ticket_text="返金してください", requester_id="req1")
+    assert result.get("refund_reply_suppressed") == "followup_existing_refund"
+    assert not result.get("refund_reply_sent")                 # never auto-refunded
+    zd.reply_solve_and_set_fields.assert_not_called()
+    assert any("already" in str(c).lower() for c in zd.add_internal_note.call_args_list)
+
+
 def test_e2e_approved_solves_ticket_and_flags_unconfirmed_cancel():
     # In the harness nexus_data is None → cancel can't be confirmed → the bot
     # must (a) reply+solve+fields in the one atomic call, (b) leave a manual-

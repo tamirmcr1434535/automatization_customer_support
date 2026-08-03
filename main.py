@@ -553,8 +553,63 @@ def _charge_date_from(as_of_iso, age_days) -> str:
         return ""
 
 
+def _prior_refund_evidence(requester_id, exclude_ticket_id, nexus_data):
+    """Evidence that a refund for this customer was ALREADY processed → the
+    current refund contact is a follow-up, not a new request. Two sources:
+      • charge state (Nexus): a charge carries `refunded_at` / status refunded;
+      • ticket history: a PRIOR ticket (not this one) tagged refund-completed —
+        read via `get_requester_tickets` (the customer's FULL history, same
+        real-time endpoint the merger uses), not just the current ticket.
+    Returns {refunded_charges, prior_tickets} or None. Fail-open (never raises)."""
+    d = nexus_data or {}
+    refunded = [
+        c for c in (d.get("charges") or [])
+        if c.get("refunded_at")
+        or str(c.get("status", "")).lower() in ("refunded", "refund_initiated")
+    ]
+    prior = []
+    try:
+        if requester_id:
+            hist = zendesk.get_requester_tickets(str(requester_id)) or {}
+            for tid, t in hist.items():
+                if str(tid) == str(exclude_ticket_id):
+                    continue
+                tags = {str(x).lower() for x in (t.get("tags") or [])}
+                if tags & {"refund_approved", "sub_renewal_refund"}:
+                    prior.append(str(tid))
+    except Exception as e:  # noqa: BLE001 — history is best-effort context
+        log.warning(f"[{exclude_ticket_id}] prior-refund history lookup failed: {e}")
+    if not refunded and not prior:
+        return None
+    return {
+        "refunded_charges": [
+            {"amount": c.get("amount"), "currency": c.get("currency"),
+             "date": str(c.get("date"))[:10], "refunded_at": str(c.get("refunded_at"))[:10]}
+            for c in refunded[:5]
+        ],
+        "prior_tickets": prior[:5],
+    }
+
+
+def _followup_note(evidence) -> str:
+    """Agent-facing note for a follow-up on an already-done refund."""
+    parts = ["🤖 Refund NOT auto-handled — this looks like a follow-up on a refund "
+             "that was ALREADY processed (likely a 'not received yet' inquiry; "
+             "card/bank refunds can take up to ~10 business days)."]
+    for c in (evidence or {}).get("refunded_charges") or []:
+        parts.append(f"• already refunded: {c.get('amount')} {c.get('currency')} "
+                     f"(charged {c.get('date')}, refunded {c.get('refunded_at')})")
+    pri = (evidence or {}).get("prior_tickets") or []
+    if pri:
+        parts.append("• prior refund ticket(s): " + ", ".join("#" + t for t in pri))
+    parts.append("Please confirm the refund status with the customer; do NOT issue "
+                 "a second refund unless it's a genuinely different charge.")
+    return "\n".join(parts)
+
+
 def _refund_would_be_eval(ticket_id, email, intent, classification, result,
-                          ticket_text="", country="", as_of_date=None, brand=""):
+                          ticket_text="", country="", as_of_date=None, brand="",
+                          requester_id=""):
     """Compute the would-be refund decision (flow #1, Nexus-only) and record it on
     `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
     Never moves money. Caller wraps this in try/except (strictly additive).
@@ -747,6 +802,29 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         f"[{ticket_id}] would_be_refunded={result['refund_decision']} "
         f"reason={decision.reason_code} charge={decision.candidate_charge_id}"
     )
+
+    # ── Follow-up on an ALREADY-DONE refund → always leave it to a human ───── #
+    # Read the customer's FULL ticket history (like the trial/cancel merger) +
+    # the charge refund state. If a refund was already processed for this account
+    # (a charge carries refunded_at, or a prior ticket is tagged refund-done), a
+    # new refund contact is almost always a "I haven't received it yet" follow-up
+    # (bank/card settlement lag) — NOT a new refund. Never auto-refund it (would
+    # double-refund) and never auto-deny; hand it to a human WITH the context of
+    # what was already refunded. Runs on ALL brands (even refunds-off), and the
+    # note is added regardless of the soft-start gate. Fail-open. (#172447)
+    _followup = _prior_refund_evidence(requester_id, ticket_id, nexus_data)
+    if _followup:
+        result["refund_followup_existing"] = _followup
+        result["refund_reply_suppressed"] = "followup_existing_refund"
+        _fu_note = _followup_note(_followup)
+        try:
+            zendesk.add_internal_note(ticket_id, _fu_note)
+            result["refund_note_added"] = True
+            log.info(f"[{ticket_id}] refund follow-up on an already-done refund "
+                     f"— left to a human (evidence: {_followup})")
+        except Exception as e:  # noqa: BLE001 — note is best-effort
+            log.warning(f"[{ticket_id}] follow-up note failed: {e}")
+        return decision  # skip the auto-reply/refund block entirely
 
     # ── AN-192 refund reply: shadow draft + gated send ───────────────────── #
     # For the reason codes we auto-answer, build the customer-facing draft and log
@@ -2401,6 +2479,7 @@ def _process(ticket_id: str) -> dict:
                 ticket_text=f"{subject}\n{body}",  # body holds the amount (subject rarely does)
                 as_of_date=ticket.get("created_at"),
                 brand=_zendesk_brand_key(ticket),
+                requester_id=ticket.get("requester_id"),
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -2794,6 +2873,7 @@ def _process(ticket_id: str) -> dict:
                 ticket_text=f"{subject}\n{body}",
                 as_of_date=ticket.get("created_at"),
                 brand=_zendesk_brand_key(ticket),
+                requester_id=ticket.get("requester_id"),
             )
         except Exception as e:  # noqa: BLE001
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
@@ -2932,6 +3012,7 @@ def _process(ticket_id: str) -> dict:
                 ticket_text=f"{subject}\n{body}",
                 as_of_date=ticket.get("created_at"),
                 brand=_zendesk_brand_key(ticket),
+                requester_id=ticket.get("requester_id"),
             )
         except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
