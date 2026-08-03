@@ -293,6 +293,11 @@ class SlackClient:
                     "the customer reported an unrecognised charge (screenshot / "
                     "'身に覚えのない請求') but did NOT ask for a refund — this is an "
                     "EXPLANATION request, not a refund; the bot did not auto-refund",
+                "followup_existing_refund":
+                    "a refund for this customer was ALREADY processed (see the "
+                    "ticket history / a charge with refunded_at) — this is a "
+                    "follow-up ('not received yet', bank/card settlement lag), not "
+                    "a new refund; the bot did not auto-refund",
             }
 
             if result.get("refund_reply_sent") and rd == "YES":
