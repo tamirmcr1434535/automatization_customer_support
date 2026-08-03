@@ -221,11 +221,15 @@ def test_slack_suppressed_shows_held_for_human_with_reason():
         "refund_currency": "JPY", "refund_brand": "iqpro",
         "refunds_enabled_for_brand": True,
         "refund_reply_suppressed": "cross_sale_ambiguous_route",
+        "refund_human_message": "Latest subscription 5490 JPY is within the window → would refund this charge.",
     }
     blob = str(_blocks_for(result)["blocks"])
     assert "Held for a human" in blob
     assert "cross-sale" in blob                       # explains WHY
     assert "refunds ✅ON" in blob                      # brand is live
+    # No misleading "would-be YES" / "would refund this charge" on a HELD ticket (#170821)
+    assert "would-be" not in blob.lower()
+    assert "would refund this charge" not in blob
 
 
 # ── #2 cancellation-after-refund + #4 solve ─────────────────────────────────
