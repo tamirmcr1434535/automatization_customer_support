@@ -313,11 +313,15 @@ class SlackClient:
                     f"(`{rc}`{amt_s}, brand `{brand}`)\n> execution status: `{exec_s or 'unknown'}`"
                 )
             elif suppressed:
-                # Engine WOULD refund the sub, but a safety guard held it for a human.
+                # A safety guard held it for a human. Do NOT lead with "would-be
+                # YES" / "would refund this charge" — the account has more than one
+                # charge and we are NOT refunding, so a YES headline is misleading
+                # (it's only the subscription-in-isolation decision). State the
+                # ambiguity instead.
                 why = _SUPPRESS_WHY.get(suppressed, suppressed)
                 wb_line = (
-                    f"*🙋 Held for a human — NOT auto-refunded* (would-be {rd}, "
-                    f"brand `{brand}`)\n> _why:_ {why}"
+                    f"*🙋 Held for a human — NOT auto-refunded* (brand `{brand}`)\n"
+                    f"> _why:_ {why}"
                 )
             elif enabled is False:
                 # Refunds are not turned on for this brand → would-be only, to a human.
@@ -334,8 +338,11 @@ class SlackClient:
                     f"subscription refunds* (would-be {rd} — `{rc}`{amt_s}, brand `{brand}`)"
                 )
             # Engine's plain-language explanation of the reason code, if any.
+            # Skip it for a SUPPRESSED (held) refund: that message says "would
+            # refund this charge", which contradicts "NOT auto-refunded" and is
+            # what confused operators (#170821). The `why` already covers it.
             hm = (result.get("refund_human_message") or "").strip()
-            if hm:
+            if hm and not suppressed:
                 wb_line += f"\n> _{hm[:300]}_"
             detail_lines.append(wb_line)
         if result.get("reason"):
