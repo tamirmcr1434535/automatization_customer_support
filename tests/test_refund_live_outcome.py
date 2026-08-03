@@ -81,7 +81,7 @@ def test_build_refund_fields_approved_full_set_from_charge():
         approved=True, sum_text="5490", currency="JPY",
         host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
         cross_sale=True, provider="Stripe", charge_type="renewal")
-    assert fields[main._ZENDESK_TOPIC_FIELD_ID] == "refund"
+    assert fields[main._ZENDESK_TOPIC_FIELD_ID] == "sub_renewal_refund"  # renewal → own Topic
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_approved"
     assert fields[main._ZENDESK_REFUND_SUM_FIELD_ID] == "5490"
     assert fields[main._ZENDESK_CURRENCY_FIELD_ID] == "jpy"
@@ -89,6 +89,23 @@ def test_build_refund_fields_approved_full_set_from_charge():
     assert fields[main._ZENDESK_PROCESSOR_FIELD_ID] == "stripe"    # from provider
     assert fields[main._ZENDESK_REGISTERED_FIELD_ID] == "pt_cross" # brand + cross_sale
     assert fields[main._ZENDESK_REFUND_TYPE_FIELD_ID] == "sub"     # renewal → Sub
+
+
+def test_build_refund_fields_topic_sub_renewal_vs_plain_refund():
+    # Renewal (2nd+ payment) → "Sub Renewal Refund" Topic, for BOTH approve+deny.
+    for approved in (True, False):
+        f = main._build_refund_fields(
+            approved=approved, sum_text="4990", currency="JPY",
+            host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
+            charge_type="renewal")
+        assert f[main._ZENDESK_TOPIC_FIELD_ID] == "sub_renewal_refund"
+    # First subscription / report / one-time → plain "Refund".
+    for ct in ("subscription", "cross_sale", "first_sale", ""):
+        f = main._build_refund_fields(
+            approved=True, sum_text="5490", currency="JPY",
+            host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
+            charge_type=ct)
+        assert f[main._ZENDESK_TOPIC_FIELD_ID] == "refund", ct
 
 
 def test_build_refund_fields_denied_leaves_sum_and_currency_out():

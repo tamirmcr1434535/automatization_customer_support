@@ -1614,6 +1614,13 @@ _ZENDESK_REFUND_TYPE_FIELD_ID = os.getenv(
     "ZENDESK_REFUND_TYPE_FIELD_ID", "18169784937372",
 ).strip()
 _ZENDESK_TOPIC_REFUND_VALUE = os.getenv("ZENDESK_TOPIC_REFUND", "refund")
+# A subscription-RENEWAL refund (2nd+ payment) gets its own Topic value so it
+# reports separately from a first-subscription/report refund — this is the tag
+# Anna filters on (`sub_renewal_refund`, an existing option on the Topic field).
+# The refund engine tags the target charge `renewal` vs `subscription`, and
+# search-subscription exposes it (charge.type / renewal_subscriptions).
+_ZENDESK_TOPIC_SUB_RENEWAL_REFUND_VALUE = os.getenv(
+    "ZENDESK_TOPIC_SUB_RENEWAL_REFUND", "sub_renewal_refund")
 
 
 def _refund_sum_string(decision) -> str:
@@ -1661,8 +1668,13 @@ def _build_refund_fields(
     human still fills the rest. Returned as a dict for the caller to write in ONE
     atomic PUT with the reply + solved status (separate PUTs raced and the solve
     reverted the fields — live #171024)."""
+    _is_renewal = (charge_type or "").strip().lower() == "renewal"
     fields = {
-        _ZENDESK_TOPIC_FIELD_ID: _ZENDESK_TOPIC_REFUND_VALUE,
+        # Renewal refunds report under the "Sub Renewal Refund" Topic (own tag);
+        # first-sub / report / one-time refunds stay plain "Refund".
+        _ZENDESK_TOPIC_FIELD_ID: (
+            _ZENDESK_TOPIC_SUB_RENEWAL_REFUND_VALUE if _is_renewal
+            else _ZENDESK_TOPIC_REFUND_VALUE),
         _ZENDESK_REFUND_STATUS_FIELD_ID:
             "refund_approved" if approved else "refund_denied",
         _ZENDESK_REGISTERED_FIELD_ID: _registered_value(host_brand, cross_sale),
