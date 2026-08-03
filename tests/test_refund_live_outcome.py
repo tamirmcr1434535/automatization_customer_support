@@ -126,6 +126,82 @@ def test_refund_field_derivers():
     assert main._refund_type_value("cross_sale", "iqbooster") == "iq_test_report"
 
 
+# ── Reply language from the customer's own text (host=None WC/PayPal fix) ──── #
+
+def test_detect_lang_from_text_by_script():
+    assert main._detect_lang_from_text("5490円の払い戻しを要求します") == "JP"  # kana
+    assert main._detect_lang_from_text("返金しろ") == "JP"                      # kana
+    assert main._detect_lang_from_text("환불 요청합니다") == "KR"                # hangul
+    assert main._detect_lang_from_text("我要退款") == "ZH-CN"                    # han, no kana
+    assert main._detect_lang_from_text("Please refund me") == ""               # latin → caller falls back
+    assert main._detect_lang_from_text("Widerruf des Vertrags") == ""          # latin, not guessed
+    assert main._detect_lang_from_text("") == ""
+
+
+def test_country_fallbacks_currency_then_lang():
+    assert main._country_from_currency("JPY") == "jp"
+    assert main._country_from_currency("jpy") == "jp"
+    assert main._country_from_currency("EUR") == ""      # ambiguous → empty
+    assert main._country_from_currency("USD") == ""
+    assert main._country_from_lang("JP") == "jp"
+    assert main._country_from_lang("KR") == "kr"
+    assert main._country_from_lang("EN") == ""           # never guess a country for EN
+
+
+def test_build_refund_fields_country_fallback_when_host_has_no_locale():
+    # WC/PayPal charge: host is empty → country comes from the caller-resolved
+    # value (currency/language), not the (absent) host locale.
+    fields = main._build_refund_fields(
+        approved=True, sum_text="5490", currency="JPY",
+        host="", host_brand="16types", cross_sale=True,
+        provider="PayPal", charge_type="subscription", country="jp")
+    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
+    # host locale still wins when present (unchanged behaviour)
+    f2 = main._build_refund_fields(
+        approved=True, sum_text="1", currency="JPY",
+        host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
+        country="de")
+    assert f2[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
+
+
+def test_e2e_jp_text_answered_in_japanese_even_when_classifier_says_EN():
+    # #172548: pure-Japanese refund on a WC/PayPal charge (host=None). The
+    # subject-keyword path passes language="EN"; the reply must still go out in
+    # Japanese (detected from the customer's text) and Country must be filled.
+    captured = {}
+    def _gen(rc, lang, data):
+        captured["lang"] = lang
+        return "本文"
+    fake_reply_gen = SimpleNamespace(
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
+        generate_refund_reply=_gen)
+    zd = MagicMock()
+    rc_client = MagicMock()
+    rc_client.is_configured.return_value = False
+    rc_client.create_refund.return_value = {
+        "status": "refunded", "executed": True, "refunded_amount": "5490"}
+    result = {}
+    with patch.object(main.refund_engine, "decide", return_value=_fake_decision("WOULD_BE_REFUNDED", True)), \
+         patch.object(main, "reply_generator", fake_reply_gen), \
+         patch.object(main, "refunds_enabled_for", return_value=True), \
+         patch.object(main, "_refund_xhost", return_value="host"), \
+         patch.object(main, "refund_client", rc_client), \
+         patch.object(main, "refund_abuse", SimpleNamespace(check=lambda b, e: (True, ""))), \
+         patch.object(main, "nexus_client", None), \
+         patch.object(main, "zendesk", zd):
+        main._refund_would_be_eval(
+            "555", "c@x.com", "REFUND_REQUEST",
+            {"confidence": 0.95, "language": "EN"}, result,
+            ticket_text="5490円の払い戻しを要求します",
+            as_of_date="2026-07-30T00:00:00Z", brand="iqpro")
+    assert captured["lang"] == "JP"                       # NOT English
+    assert result.get("refund_reply_sent") is True
+    # Country filled from the JPY currency even though the charge had no host.
+    fields = zd.reply_solve_and_set_fields.call_args.args[2]
+    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
+    assert result.get("country") == "jp"
+
+
 def test_reply_solve_and_set_fields_is_one_atomic_put_with_tags():
     from zendesk_client import ZendeskClient
     zc = ZendeskClient("sub", "e@e.com", "tok", dry_run=False)

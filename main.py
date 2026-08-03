@@ -346,6 +346,69 @@ def _locale_country(host: str) -> str:
     return _LOCALE_COUNTRY.get(_host_locale(host), "")
 
 
+# ── Reply-language detection from the CUSTOMER'S OWN TEXT ─────────────────── #
+# The charge `host` is our first proxy for the customer's language, but Nexus
+# returns host=None for WooCommerce / PayPal charges (every field null), and the
+# subject-keyword refund path hard-codes language="EN" (it short-circuits before
+# classification). Both left JP/KR/… customers answered in ENGLISH on a live
+# auto-refund (#172548: a pure-Japanese 払い戻し request got the EN master).
+#
+# Script-based detection is reliable for the non-Latin markets these brands sell
+# into (JP/KR/ZH/TH/AR/RU) — a customer who writes in kana/hangul/etc. must be
+# answered in that language. Latin-script languages (DE/FR/ES/…) are NOT guessed
+# here (ambiguous by script) — those keep relying on the classifier / host
+# locale, so this never mislabels an English customer as German.
+def _detect_lang_from_text(text: str) -> str:
+    """Best-effort reply-language code from the customer's own message, by script.
+    Returns a code matching `_LOCALE_LANG` values (JP/KR/ZH-CN/TH/AR/RU) or ""
+    when the script is Latin/unknown (caller then falls back to host locale/EN)."""
+    t = text or ""
+    if not t:
+        return ""
+    has_kana = any(
+        "぀" <= c <= "ゟ" or "゠" <= c <= "ヿ" for c in t
+    )
+    if has_kana:
+        return "JP"                                   # kana ⇒ unambiguously Japanese
+    if any("가" <= c <= "힣" for c in t):
+        return "KR"                                   # hangul syllables
+    if any("฀" <= c <= "๿" for c in t):
+        return "TH"
+    if any("؀" <= c <= "ۿ" for c in t):
+        return "AR"
+    if any("Ѐ" <= c <= "ӿ" for c in t):
+        return "RU"                                   # Cyrillic (RU/UA — RU reply)
+    # Han without any kana ⇒ Chinese (Japanese would carry kana, handled above).
+    if any("一" <= c <= "鿿" for c in t):
+        return "ZH-CN"
+    return ""
+
+
+# ── Country fallbacks when the charge host carries no locale ──────────────── #
+# host=None (WC/PayPal) ⇒ _locale_country() is empty, so the Country field went
+# blank on ~10/11 live refunds. Derive it from the (unambiguous) charge currency
+# first, then the reply language. Only single-country signals are mapped — EUR /
+# USD / EN stay empty rather than guessing the wrong country.
+_CURRENCY_COUNTRY = {
+    "jpy": "jp", "krw": "kr", "vnd": "vn", "thb": "th", "idr": "id",
+    "twd": "tw", "pln": "pl", "try": "tr", "rub": "ru", "uah": "ua",
+    "brl": "br", "mxn": "mx", "inr": "in",
+}
+_LANG_COUNTRY = {
+    "JP": "jp", "KR": "kr", "VI": "vn", "TH": "th", "ID": "id",
+    "ZH-TW": "tw", "PL": "pl", "TR": "tr", "RU": "ru", "AR": "sa",
+    "DE": "de", "FR": "fr", "IT": "it", "NL": "nl",
+}
+
+
+def _country_from_currency(currency: str) -> str:
+    return _CURRENCY_COUNTRY.get((currency or "").strip().lower(), "")
+
+
+def _country_from_lang(lang: str) -> str:
+    return _LANG_COUNTRY.get((lang or "").strip().upper(), "")
+
+
 # ── Processor (charge.provider → Zendesk Processor tagger value) ──────────── #
 _PROCESSOR_MAP = {
     "stripe": "stripe", "stripe2": "stripe2", "solidgate": "solidgate",
@@ -930,13 +993,26 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             if _link_brand != brand:
                 log.info(f"[{ticket_id}] refund reply product resolved via charge host: "
                          f"link_brand={_link_brand!r} (contacted brand={brand!r})")
-            # Reply language: a real (non-EN) classifier detection wins; otherwise
-            # the host-site locale (jp.* → JP) — this fixes the subject-keyword
-            # path which had no classifier language and defaulted to EN, so JP
-            # customers were answered in English (#171049).
+            # Reply language, in priority order:
+            #   1. a real (non-EN) classifier detection (it committed to a language)
+            #   2. the customer's OWN text by script (JP/KR/ZH/… — fixes the case
+            #      where the classifier said/defaulted "EN" but the customer wrote
+            #      in Japanese: the subject-keyword path hard-codes language="EN"
+            #      and Nexus returns host=None for WC/PayPal charges, so both the
+            #      classifier and the host locale gave EN → JP customer answered in
+            #      English on a live auto-refund, #172548 / #171049)
+            #   3. the host-site locale (jp.* → JP), 4. EN.
             _clf_lang = (classification.get("language") or "").strip()
             _lang = _clf_lang if _clf_lang and _clf_lang.upper() != "EN" else (
-                _locale_lang(_charge_host) or "EN")
+                _detect_lang_from_text(eff_text) or _locale_lang(_charge_host) or "EN")
+            # Country for the Zendesk field: host locale is empty for WC/PayPal
+            # charges (host=None), so fall back to the unambiguous charge currency
+            # (JPY→jp) then the reply language. Left blank rather than guessed for
+            # ambiguous signals (EUR/USD/EN).
+            _country_resolved = (_locale_country(_charge_host)
+                                 or _country_from_currency(decision.currency)
+                                 or _country_from_lang(_lang)
+                                 or country)
             _terms, _sub = refund_reply_links.links_for(_link_brand, _lang)  # per-site+language
             draft = reply_generator.generate_refund_reply(
                 rc, _lang,
@@ -1038,7 +1114,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         cross_sale=bool((nexus_data or {}).get("cross_sale")),
                         provider=_cand_charge.get("provider"),
                         paypal_order_id=_cand_charge.get("paypal_order_id"),
-                        charge_type=decision.charge_type)
+                        charge_type=decision.charge_type,
+                        country=_country_resolved)
                     try:
                         zendesk.reply_solve_and_set_fields(
                             ticket_id, draft, _fields, additional_tags=["bot_handled"])
@@ -1056,10 +1133,10 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     result["reply_text"] = draft
                     result["refund_status"] = "refund_approved" if _approved else "refund_denied"
                     result["refund_sum"] = _sum_text
-                    # Country logged from the same host-locale proxy written to Zendesk.
-                    _country_tag = _locale_country(_charge_host) or country
-                    if _country_tag:
-                        result["country"] = _country_tag
+                    # Country logged = the same value written to Zendesk (host
+                    # locale → currency → language fallback).
+                    if _country_resolved:
+                        result["country"] = _country_resolved
                 else:
                     log.info(
                         f"[{ticket_id}] refund reply drafted + logged, NOT sent "
@@ -1567,6 +1644,7 @@ def _build_refund_fields(
     approved: bool, sum_text: str, currency: str, *,
     host: str = "", host_brand: str = "", cross_sale: bool = False,
     provider: str = "", paypal_order_id=None, charge_type: str = "",
+    country: str = "",
 ) -> dict:
     """Build the {field_id: value} map for ALL refund topic-screen fields a human
     fills (approval #169738 / denial #169768), from the refunded charge:
@@ -1590,7 +1668,9 @@ def _build_refund_fields(
         _ZENDESK_REGISTERED_FIELD_ID: _registered_value(host_brand, cross_sale),
         _ZENDESK_PROCESSOR_FIELD_ID: _processor_value(provider, paypal_order_id),
         _ZENDESK_REFUND_TYPE_FIELD_ID: _refund_type_value(charge_type, host_brand),
-        _ZENDESK_COUNTRY_FIELD_ID: _locale_country(host),
+        # host locale first; caller-resolved country (currency/language) as fallback
+        # so WC/PayPal charges (host=None) still fill the field.
+        _ZENDESK_COUNTRY_FIELD_ID: _locale_country(host) or country,
     }
     if approved:
         fields[_ZENDESK_REFUND_SUM_FIELD_ID] = sum_text
