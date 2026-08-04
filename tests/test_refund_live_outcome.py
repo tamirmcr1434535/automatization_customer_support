@@ -80,12 +80,12 @@ def test_build_refund_fields_approved_full_set_from_charge():
     fields = main._build_refund_fields(
         approved=True, sum_text="5490", currency="JPY",
         host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
-        cross_sale=True, provider="Stripe", charge_type="renewal")
+        cross_sale=True, provider="Stripe", charge_type="renewal", country="jp")
     assert fields[main._ZENDESK_TOPIC_FIELD_ID] == "sub_renewal_refund"  # renewal → own Topic
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_approved"
     assert fields[main._ZENDESK_REFUND_SUM_FIELD_ID] == "5490"
     assert fields[main._ZENDESK_CURRENCY_FIELD_ID] == "jpy"
-    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"          # from host locale
+    assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"          # caller-resolved country
     assert fields[main._ZENDESK_PROCESSOR_FIELD_ID] == "stripe"    # from provider
     assert fields[main._ZENDESK_REGISTERED_FIELD_ID] == "pt_cross" # brand + cross_sale
     assert fields[main._ZENDESK_REFUND_TYPE_FIELD_ID] == "sub"     # renewal → Sub
@@ -165,20 +165,27 @@ def test_country_fallbacks_currency_then_lang():
     assert main._country_from_lang("EN") == ""           # never guess a country for EN
 
 
-def test_build_refund_fields_country_fallback_when_host_has_no_locale():
-    # WC/PayPal charge: host is empty → country comes from the caller-resolved
-    # value (currency/language), not the (absent) host locale.
+def test_build_refund_fields_uses_caller_resolved_country():
+    # The Country field is whatever the caller resolved (charge-API billing country
+    # first, then host locale → currency → language). _build_refund_fields no longer
+    # re-derives it from the host — so it stays consistent with the reply/logging.
     fields = main._build_refund_fields(
         approved=True, sum_text="5490", currency="JPY",
         host="", host_brand="16types", cross_sale=True,
         provider="PayPal", charge_type="subscription", country="jp")
     assert fields[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
-    # host locale still wins when present (unchanged behaviour)
+    # The caller-resolved value wins even when a host locale is present (the caller
+    # already folded host locale into the resolution — e.g. charge-API country "de").
     f2 = main._build_refund_fields(
         approved=True, sum_text="1", currency="JPY",
         host="jp.wwpersonalitytest.com", host_brand="wwpersonalitytest",
         country="de")
-    assert f2[main._ZENDESK_COUNTRY_FIELD_ID] == "jp"
+    assert f2[main._ZENDESK_COUNTRY_FIELD_ID] == "de"
+    # No resolved country → field omitted (human fills it).
+    f3 = main._build_refund_fields(
+        approved=True, sum_text="1", currency="USD",
+        host="", host_brand="iqpro", country="")
+    assert main._ZENDESK_COUNTRY_FIELD_ID not in f3
 
 
 def test_e2e_jp_text_answered_in_japanese_even_when_classifier_says_EN():
@@ -190,7 +197,9 @@ def test_e2e_jp_text_answered_in_japanese_even_when_classifier_says_EN():
         captured["lang"] = lang
         return "本文"
     fake_reply_gen = SimpleNamespace(
-        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY",
+                                "OUTSIDE_REFUND_WINDOW"},
+        REFUND_APPROVE_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"},
         generate_refund_reply=_gen)
     zd = MagicMock()
     rc_client = MagicMock()
@@ -428,7 +437,9 @@ def test_prior_refund_evidence_none_when_no_history_and_no_refunded_charge():
 def test_e2e_followup_existing_refund_held_for_human():
     result = {}
     fake_reply_gen = SimpleNamespace(
-        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY",
+                                "OUTSIDE_REFUND_WINDOW"},
+        REFUND_APPROVE_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"},
         generate_refund_reply=lambda rc, lang, data: "DRAFT")
     zd = MagicMock()
     ev = {"refunded_charges": [{"amount": "5490", "currency": "JPY",
@@ -493,7 +504,9 @@ def _drive_eval(reason_code, would_be, refund_ret=None, ticket_text="返金し�
     demand so the auto-refund is not suppressed)."""
     result = {}
     fake_reply_gen = SimpleNamespace(
-        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"},
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY",
+                                "OUTSIDE_REFUND_WINDOW"},
+        REFUND_APPROVE_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"},
         generate_refund_reply=lambda rc, lang, data: "こんにちは。ご対応します。",
     )
     zd = MagicMock()
@@ -541,6 +554,70 @@ def test_e2e_denied_refund_reports_success_denied_no_sum():
     fields = zd.reply_solve_and_set_fields.call_args.args[2]
     assert fields[main._ZENDESK_REFUND_STATUS_FIELD_ID] == "refund_denied"
     assert main._ZENDESK_REFUND_SUM_FIELD_ID not in fields   # denied → no sum
+
+
+def _drive_eval_with_history(reason_code, would_be, history):
+    """Like _drive_eval but with a requester_id and a stubbed ticket history, so the
+    dispute / follow-up branches (which read get_requester_tickets) can fire."""
+    result = {}
+    fake_reply_gen = SimpleNamespace(
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY",
+                                "OUTSIDE_REFUND_WINDOW"},
+        REFUND_APPROVE_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"},
+        generate_refund_reply=lambda rc, lang, data: "本文",
+    )
+    zd = MagicMock()
+    zd.get_requester_tickets.return_value = history
+    rc_client = MagicMock()
+    rc_client.is_configured.return_value = False
+    with patch.object(main.refund_engine, "decide", return_value=_fake_decision(reason_code, would_be)), \
+         patch.object(main, "reply_generator", fake_reply_gen), \
+         patch.object(main, "refunds_enabled_for", return_value=True), \
+         patch.object(main, "_refund_xhost", return_value="host"), \
+         patch.object(main, "refund_client", rc_client), \
+         patch.object(main, "refund_abuse", SimpleNamespace(check=lambda b, e: (True, ""))), \
+         patch.object(main, "nexus_client", None), \
+         patch.object(main, "zendesk", zd):
+        main._refund_would_be_eval(
+            "555", "cust@x.com", "REFUND_REQUEST",
+            {"confidence": 0.95, "language": "JA"}, result,
+            ticket_text="返金してください", as_of_date="2026-07-30T00:00:00Z",
+            brand="wwiqtest", requester_id="9001",
+        )
+    return result, zd
+
+
+def test_e2e_opened_dispute_history_escalates_no_autoreply():
+    # #172715: an in-window approve, BUT a prior/this ticket is tagged opened_dispute
+    # (charge API may show disputed=False — dispute already closed). Must NOT auto-reply
+    # (neither approve nor deny); leave an internal note for a human.
+    history = {164536: {"tags": ["16_types_test_cross", "opened_dispute", "refund_denied"]},
+               555: {"tags": ["jp"]}}
+    result, zd = _drive_eval_with_history("WOULD_BE_REFUNDED", True, history)
+    assert result.get("refund_reply_suppressed") == "opened_dispute"
+    assert not result.get("refund_reply_sent")
+    zd.reply_solve_and_set_fields.assert_not_called()          # no customer reply
+    zd.post_reply.assert_not_called()
+    zd.add_internal_note.assert_called_once()                  # human context note
+    assert "dispute" in zd.add_internal_note.call_args.args[1].lower()
+
+
+def test_e2e_opened_dispute_also_blocks_a_denial():
+    # The escalation must also stop an auto-DENY (the #172715 real outcome was a
+    # bot-sent denial on a disputed charge).
+    history = {164536: {"tags": ["opened_dispute"]}}
+    result, zd = _drive_eval_with_history("OUTSIDE_REFUND_WINDOW", False, history)
+    assert result.get("refund_reply_suppressed") == "opened_dispute"
+    assert not result.get("refund_reply_sent")
+    zd.reply_solve_and_set_fields.assert_not_called()
+
+
+def test_e2e_no_dispute_history_does_not_escalate():
+    # Control: clean history (no dispute tag) → the dispute branch does NOT fire.
+    history = {555: {"tags": ["jp"]}}
+    result, zd = _drive_eval_with_history("WOULD_BE_REFUNDED", True, history)
+    assert result.get("refund_reply_suppressed") != "opened_dispute"
+    assert "refund_dispute_evidence" not in result
 
 
 # ── refund_failed: approved refund that could NOT be carried out ────────────

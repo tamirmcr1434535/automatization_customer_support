@@ -44,6 +44,11 @@ sys.modules.setdefault("bq_logger", MagicMock())
 
 import main  # noqa: E402 — must come after sys.modules patching
 
+# The stubbed reply_generator has no real attributes; give it the approve-code set
+# main.py reads to decide execution (both single-charge + "approve last" cases).
+main.reply_generator.REFUND_APPROVE_CODES = {
+    "WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"}
+
 from tests.conftest import make_zendesk_ticket  # noqa: E402
 
 

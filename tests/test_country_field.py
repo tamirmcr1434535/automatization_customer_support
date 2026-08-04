@@ -311,3 +311,60 @@ def test_country_empty_when_no_source(mock_get, mock_request):
 
     result = _wc_client().cancel_subscription("test@example.com")
     assert result["country"] == "", result
+
+
+# ── Fix #1: opened-dispute / chargeback → escalate (leave to a human) ─────── #
+
+def test_dispute_evidence_from_ticket_tag():
+    # A dispute tag on ANY of the customer's tickets (incl. this one) → evidence,
+    # even when the charge API shows disputed=False (dispute already closed).
+    hist = {172715: {"tags": ["16_types_test", "opened_dispute", "refund_denied"]}}
+    ev = main._dispute_evidence(hist, {"charges": [{"charge_id": "c1", "disputed": False}]},
+                                {"provider": "PayPal"})
+    assert ev is not None
+    assert "172715" in ev["tickets"]
+    assert ev["provider"] == "PayPal"
+
+
+def test_dispute_evidence_from_nexus_disputed_flag():
+    ev = main._dispute_evidence({}, {"charges": [
+        {"charge_id": "c9", "disputed": True, "provider": "Stripe"}]}, None)
+    assert ev is not None
+    assert ev["disputed_charge_ids"] == ["c9"]
+    assert ev["provider"] == "Stripe"
+
+
+def test_dispute_evidence_none_when_clean():
+    hist = {1: {"tags": ["refund_approved", "jp"]}}
+    ev = main._dispute_evidence(hist, {"charges": [{"charge_id": "c1", "disputed": False}]}, None)
+    assert ev is None
+
+
+def test_dispute_note_mentions_channel():
+    paypal = main._dispute_note({"provider": "PayPal", "tickets": ["164536"], "disputed_charge_ids": []})
+    assert "PayPal" in paypal and "#164536" in paypal
+    assert "Do NOT issue a refund" in paypal
+    bank = main._dispute_note({"provider": "stripe", "tickets": [], "disputed_charge_ids": ["c9"]})
+    assert "bank" in bank.lower() or "stripe" in bank.lower()
+
+
+# ── Fix #3: Country custom field resolved from the charge API (full name) ──── #
+
+def test_country_field_value_maps_full_name(monkeypatch):
+    # charge API returns a full billing-country name → mapped to the field tag.
+    monkeypatch.setattr(main, "_COUNTRY_NAME_TO_TAG",
+                        {"united states": "us", "japan": "jp"})
+    assert main._country_field_value("United States") == "us"
+    assert main._country_field_value("Japan") == "jp"
+
+
+def test_country_field_value_iso2_passthrough():
+    # A 2-letter code needs no lookup.
+    assert main._country_field_value("JP") == "jp"
+    assert main._country_field_value("us") == "us"
+
+
+def test_country_field_value_unknown_is_blank(monkeypatch):
+    monkeypatch.setattr(main, "_COUNTRY_NAME_TO_TAG", {"japan": "jp"})
+    assert main._country_field_value("Atlantis") == ""
+    assert main._country_field_value("") == ""

@@ -46,7 +46,14 @@ def test_unhandled_reason_returns_none():
 
 
 def test_autoreply_codes_set():
-    assert rg.REFUND_AUTOREPLY_CODES == {"WOULD_BE_REFUNDED", "OUTSIDE_REFUND_WINDOW"}
+    assert rg.REFUND_AUTOREPLY_CODES == {
+        "WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY", "OUTSIDE_REFUND_WINDOW"}
+
+
+def test_approve_codes_set():
+    # Both the single-charge approve and the "approve last, deny earlier"
+    # multi-charge case move money on the latest charge.
+    assert rg.REFUND_APPROVE_CODES == {"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"}
 
 
 # ── "Explained" variant (ticket #169403, Anna 2026-07-29) ────────────────── #
@@ -89,3 +96,34 @@ def test_explained_has_no_markdown_brackets():
              "terms_url": "https://x/terms.pdf", "subscription_url": "https://x/sub.pdf"})
         assert "](" not in out and "[" not in out and "]" not in out
         assert "Terms and Conditions: https://x/terms.pdf" in out
+
+
+# ── Multi-charge "approved only for last charge" template ────────────────── #
+
+def test_last_only_template_approves_latest_and_denies_earlier():
+    out = rg.generate_refund_reply(
+        "WOULD_BE_REFUNDED_LAST_ONLY", "EN",
+        {"charge_amount": "5490 JPY", "charge_date": "2026-07-19", "refund_window_days": 8})
+    assert out is not None
+    assert "most recent charge of 5490 JPY (charge dated 2026-07-19)" in out
+    assert "approved and processed" in out
+    assert "your earlier charge(s) do not qualify" in out
+    assert "within our applicable refund window (8 days" in out
+    # short (no-explanation) variant
+    assert "Explanation of the charge:" not in out
+
+
+def test_last_only_explained_variant():
+    out = rg.generate_refund_reply(
+        "WOULD_BE_REFUNDED_LAST_ONLY", "EN",
+        {"charge_amount": "5490 JPY", "charge_date": "2026-07-19",
+         "refund_window_days": 8, "explain_charge": True, "brand": "16types"})
+    assert out is not None
+    assert "Explanation of the charge:" in out
+    assert "16 Types Growth Plan" in out          # brand-specific plan name
+    assert "earlier charge(s) do not qualify" in out
+
+
+def test_last_only_is_autoreply_and_approve_code():
+    assert "WOULD_BE_REFUNDED_LAST_ONLY" in rg.REFUND_AUTOREPLY_CODES
+    assert "WOULD_BE_REFUNDED_LAST_ONLY" in rg.REFUND_APPROVE_CODES

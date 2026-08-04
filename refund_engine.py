@@ -39,6 +39,12 @@ REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
 # ── Reason codes ─────────────────────────────────────────────────────────── #
 RC_WOULD_BE_REFUNDED  = "WOULD_BE_REFUNDED"    # YES — latest sub renewal within window
+RC_WOULD_BE_REFUNDED_LAST_ONLY = "WOULD_BE_REFUNDED_LAST_ONLY"  # YES on the latest renewal
+                                               # (within window), but the customer also has
+                                               # EARLIER renewal charges already outside the
+                                               # window → refund the latest ONLY, and the reply
+                                               # must tell the customer the earlier one(s) don't
+                                               # qualify (Anna's "approved only for last charge").
 RC_UNABLE_TO_EVAL     = "UNABLE_TO_EVAL"       # Nexus not available
 RC_OUT_OF_SCOPE       = "OUT_OF_SCOPE"         # not a refund intent
 RC_LOW_CONFIDENCE     = "LOW_CONFIDENCE"       # classifier below threshold
@@ -593,6 +599,30 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                              trail, candidate_charges=_charges_summary(subs), **base, **common)
 
         trail.append("would_be")
+        # Multi-charge case (Anna's "approved only for last charge"): the LATEST
+        # renewal is within the window, but the customer ALSO has earlier renewal
+        # charges that are already outside it. Money-wise we still refund ONLY the
+        # latest (`target`); the reply must additionally tell the customer the
+        # earlier charge(s) don't qualify. `candidate_charge_id`/`computed_amount`
+        # stay the latest, so refund execution + Refund Sum cover the latest only.
+        earlier_out = [
+            c for c in subs
+            if c.get("charge_id") != target.get("charge_id")
+            and _charge_date(c) is not None
+            and (adate - _charge_date(c)).days > window
+        ]
+        if earlier_out:
+            trail.append(f"earlier_out_of_window[{len(earlier_out)}]")
+            return _decision(
+                True, RC_WOULD_BE_REFUNDED_LAST_ONLY,
+                f"Latest subscription (renewal) {amt}{(' ' + str(cur)) if cur else ''} is within "
+                f"the {window}d {wsrc} refund window (charged {days}d ago) → refund this charge; "
+                f"{len(earlier_out)} earlier renewal charge(s) are outside the window and are NOT "
+                f"refunded (customer told so in the same reply).",
+                trail,
+                candidate_charges=_charges_summary([target]),  # sum = latest only
+                **base, **common)
+
         return _decision(
             True, RC_WOULD_BE_REFUNDED,
             f"Latest subscription (renewal) {amt}{(' ' + str(cur)) if cur else ''} is within the "

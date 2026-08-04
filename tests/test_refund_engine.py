@@ -468,3 +468,47 @@ def test_preferred_charge_unknown_id_ignored_stays_ambiguous():
     d = decide(_ctx(nexus_data=_data(charges), ticket_text="refund",
                     preferred_charge_id="ch_does_not_exist"), CFG)
     assert d.reason_code == re_.RC_AMBIGUOUS_FLOW and "llm_disambiguated" not in d.guard_trail
+
+
+# ── Multi-charge: approve LATEST, deny EARLIER (Anna "approved only for last") ─ #
+
+def test_last_only_when_latest_in_window_and_earlier_out():
+    # Two renewals: latest within window, earlier one well outside → LAST_ONLY,
+    # candidate = the LATEST charge (only that one is refunded/summed).
+    charges = [_sub("ch_new", 5490, "2026-07-19"),   # 1d before ticket → in window
+               _sub("ch_old", 5490, "2026-05-20")]   # ~61d → outside
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-20T00:00:00Z",
+                    ticket_text="refund all my payments"), CFG)
+    assert d.would_be_refunded is True
+    assert d.reason_code == re_.RC_WOULD_BE_REFUNDED_LAST_ONLY
+    assert d.candidate_charge_id == "ch_new"
+    assert any(t.startswith("earlier_out_of_window") for t in d.guard_trail)
+    # Refund Sum must cover ONLY the latest (candidate_charges is the latest alone).
+    assert d.candidate_charges == "ch_new:5490:2026-07-19"
+
+
+def test_single_charge_stays_plain_would_be():
+    charges = [_sub("ch_new", 5490, "2026-07-19")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-20T00:00:00Z",
+                    ticket_text="refund"), CFG)
+    assert d.reason_code == re_.RC_WOULD_BE_REFUNDED  # NOT last_only
+
+
+def test_two_charges_both_in_window_not_last_only():
+    # No earlier charge is OUTSIDE the window → plain approve (engine still refunds
+    # only the latest; there is nothing to deny).
+    charges = [_sub("ch_new", 5490, "2026-07-19"),
+               _sub("ch_new2", 5490, "2026-07-18")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-20T00:00:00Z",
+                    ticket_text="refund"), CFG)
+    assert d.reason_code == re_.RC_WOULD_BE_REFUNDED
+    assert d.candidate_charge_id == "ch_new"
+
+
+def test_last_only_latest_outside_window_denies_all():
+    # If even the latest is outside the window → deny everything (not last_only).
+    charges = [_sub("ch_new", 5490, "2026-07-01"), _sub("ch_old", 5490, "2026-05-20")]
+    d = decide(_ctx(nexus_data=_data(charges), as_of_date="2026-07-20T00:00:00Z",
+                    country="JP", ticket_text="refund"), CFG)
+    assert d.would_be_refunded is False
+    assert d.reason_code == re_.RC_OUTSIDE_REFUND_WINDOW

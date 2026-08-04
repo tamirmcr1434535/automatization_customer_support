@@ -616,13 +616,27 @@ def _charge_date_from(as_of_iso, age_days) -> str:
         return ""
 
 
-def _prior_refund_evidence(requester_id, exclude_ticket_id, nexus_data):
+def _requester_history(requester_id, ticket_id):
+    """Fetch the customer's FULL ticket history once (real-time endpoint, same the
+    merger uses), keyed by ticket id. Shared by the follow-up + dispute checks so
+    we make ONE Zendesk call. Returns {} on any failure (fail-open)."""
+    if not requester_id:
+        return {}
+    try:
+        return zendesk.get_requester_tickets(str(requester_id)) or {}
+    except Exception as e:  # noqa: BLE001 — history is best-effort context
+        log.warning(f"[{ticket_id}] requester-history lookup failed: {e}")
+        return {}
+
+
+def _prior_refund_evidence(requester_id, exclude_ticket_id, nexus_data, history=None):
     """Evidence that a refund for this customer was ALREADY processed → the
     current refund contact is a follow-up, not a new request. Two sources:
       • charge state (Nexus): a charge carries `refunded_at` / status refunded;
       • ticket history: a PRIOR ticket (not this one) tagged refund-completed —
         read via `get_requester_tickets` (the customer's FULL history, same
         real-time endpoint the merger uses), not just the current ticket.
+    `history` = pre-fetched requester-history dict (else it is fetched here).
     Returns {refunded_charges, prior_tickets} or None. Fail-open (never raises)."""
     d = nexus_data or {}
     refunded = [
@@ -632,14 +646,13 @@ def _prior_refund_evidence(requester_id, exclude_ticket_id, nexus_data):
     ]
     prior = []
     try:
-        if requester_id:
-            hist = zendesk.get_requester_tickets(str(requester_id)) or {}
-            for tid, t in hist.items():
-                if str(tid) == str(exclude_ticket_id):
-                    continue
-                tags = {str(x).lower() for x in (t.get("tags") or [])}
-                if tags & {"refund_approved", "sub_renewal_refund"}:
-                    prior.append(str(tid))
+        hist = history if history is not None else _requester_history(requester_id, exclude_ticket_id)
+        for tid, t in (hist or {}).items():
+            if str(tid) == str(exclude_ticket_id):
+                continue
+            tags = {str(x).lower() for x in (t.get("tags") or [])}
+            if tags & {"refund_approved", "sub_renewal_refund"}:
+                prior.append(str(tid))
     except Exception as e:  # noqa: BLE001 — history is best-effort context
         log.warning(f"[{exclude_ticket_id}] prior-refund history lookup failed: {e}")
     if not refunded and not prior:
@@ -667,6 +680,73 @@ def _followup_note(evidence) -> str:
         parts.append("• prior refund ticket(s): " + ", ".join("#" + t for t in pri))
     parts.append("Please confirm the refund status with the customer; do NOT issue "
                  "a second refund unless it's a genuinely different charge.")
+    return "\n".join(parts)
+
+
+# ── Opened dispute / chargeback → always leave the refund to a human ──────── #
+# The Google-Doc macro has a dedicated "Opened Dispute" flow (PayPal dispute /
+# Stripe chargeback): while a dispute is being handled by PayPal or the bank we
+# must NOT auto-refund (double/conflicting action) NOR auto-deny — a human sends
+# the dispute macro. The charge-API `disputed` flag only reflects a CURRENTLY-open
+# dispute, so a follow-up after a dispute already closed (won/lost) shows
+# disputed=False (#172715). We therefore ALSO treat the Zendesk `opened_dispute` /
+# chargeback tag — on THIS ticket or ANY of the customer's tickets — as evidence.
+_DISPUTE_TAGS = {
+    "opened_dispute", "dispute_opened", "disputed", "dispute",
+    "chargeback", "charge_back", "paypal_dispute",
+}
+
+
+def _dispute_evidence(history, nexus_data, candidate_charge):
+    """Evidence of an opened / already-handled payment dispute for this customer.
+    Sources (fail-open):
+      • Nexus charge flagged `disputed`;
+      • any of the customer's Zendesk tickets (incl. this one) tagged with a
+        dispute/chargeback tag.
+    Returns {provider, tickets, disputed_charge_ids} or None."""
+    disputed_charges = [
+        c for c in ((nexus_data or {}).get("charges") or [])
+        if c.get("disputed") is True
+    ]
+    tickets = []
+    for tid, t in (history or {}).items():
+        tags = {str(x).lower() for x in (t.get("tags") or [])}
+        if tags & _DISPUTE_TAGS:
+            tickets.append(str(tid))
+    if not disputed_charges and not tickets:
+        return None
+    # Provider (PayPal vs bank/Stripe) drives which dispute macro the agent uses.
+    provider = ""
+    if disputed_charges:
+        provider = str(disputed_charges[0].get("provider") or "")
+    if not provider and candidate_charge:
+        provider = str(candidate_charge.get("provider") or "")
+    return {
+        "provider": provider,
+        "tickets": tickets[:5],
+        "disputed_charge_ids": [c.get("charge_id") for c in disputed_charges[:5]],
+    }
+
+
+def _dispute_note(evidence) -> str:
+    """Agent-facing note for a ticket with an opened/handled dispute."""
+    prov = str((evidence or {}).get("provider") or "").lower()
+    if "paypal" in prov:
+        chan = "PayPal (use the \"Disputed via PayPal\" macro)"
+    elif prov:
+        chan = f"the payment provider / bank ({prov}) — use the \"Opened Dispute (Stripe)\" macro"
+    else:
+        chan = "PayPal or the bank — use the matching \"Opened Dispute\" macro"
+    parts = ["🤖 Refund NOT auto-handled — an opened/handled dispute is on record for this "
+             f"customer, so this must be handled by a human via {chan}."]
+    tk = (evidence or {}).get("tickets") or []
+    if tk:
+        parts.append("• dispute-tagged ticket(s): " + ", ".join("#" + t for t in tk))
+    dc = [c for c in (evidence or {}).get("disputed_charge_ids") or [] if c]
+    if dc:
+        parts.append("• charge(s) flagged disputed in Nexus: " + ", ".join(dc))
+    parts.append("Do NOT issue a refund via our system while a dispute is open — PayPal / the "
+                 "bank decides, and their decision is binding. Confirm the dispute status first.")
     return "\n".join(parts)
 
 
@@ -807,6 +887,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     # Read-only lookup; on any guard failure OVERRIDE the decision to NO → human.
     # Only runs when the refund API is configured (REFUND_API_* env); otherwise
     # skipped, so prod (unconfigured) behaves exactly as before.
+    _charge_api_country = ""   # billing country from the charge API (full name, e.g. "Japan")
     try:
         _cand = decision.candidate_charge_id
         if _cand and refund_client.is_configured():
@@ -815,6 +896,11 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 result["refund_charge_disputed"] = bool(_det.get("disputed"))
                 result["refund_charge_refundable"] = _det.get("refundable")
                 result["refund_charge_refunded_at"] = _det.get("refunded_at")
+                # The charge carries the AUTHORITATIVE billing country (e.g. "Japan",
+                # "United States") — the Zendesk Country field is filled from this,
+                # not guessed from currency/language (was the #172732 blank-country gap).
+                _charge_api_country = (_det.get("country") or "").strip()
+                result["refund_charge_country"] = _charge_api_country
                 _override = None
                 if _det.get("disputed"):
                     _override = ("REFUND_DISPUTE_OPEN",
@@ -829,7 +915,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     # signal, so one payment can never be refunded twice here.
                     _override = ("REFUND_NOT_REFUNDABLE",
                                  "The charge is not refundable (already refunded / blocked) — a human must handle.")
-                elif decision.reason_code == "WOULD_BE_REFUNDED":
+                elif decision.reason_code in reply_generator.REFUND_APPROVE_CODES:
                     _ok, _why = _amount_guard(_det.get("amount"), _det.get("currency"))
                     if not _ok:
                         _override = ("REFUND_AMOUNT_ANOMALY",
@@ -875,7 +961,27 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     # double-refund) and never auto-deny; hand it to a human WITH the context of
     # what was already refunded. Runs on ALL brands (even refunds-off), and the
     # note is added regardless of the soft-start gate. Fail-open. (#172447)
-    _followup = _prior_refund_evidence(requester_id, ticket_id, nexus_data)
+    _hist = _requester_history(requester_id, ticket_id)   # ONE call, shared below
+
+    # ── Opened dispute / chargeback → always leave the refund to a human ───── #
+    # (macro "Opened Dispute"). Checked BEFORE the follow-up + auto-reply blocks:
+    # while a PayPal dispute / bank chargeback is on record we must neither
+    # auto-refund (double/conflicting action) nor auto-deny (#172715). Runs on ALL
+    # brands; note added regardless of the soft-start gate. Fail-open.
+    _dispute = _dispute_evidence(_hist, nexus_data, _candidate_charge(nexus_data, decision.candidate_charge_id))
+    if _dispute:
+        result["refund_dispute_evidence"] = _dispute
+        result["refund_reply_suppressed"] = "opened_dispute"
+        try:
+            zendesk.add_internal_note(ticket_id, _dispute_note(_dispute))
+            result["refund_note_added"] = True
+            log.info(f"[{ticket_id}] refund left to a human — opened/handled dispute "
+                     f"(evidence: {_dispute})")
+        except Exception as e:  # noqa: BLE001 — note is best-effort
+            log.warning(f"[{ticket_id}] dispute note failed: {e}")
+        return decision  # skip the auto-reply/refund block entirely
+
+    _followup = _prior_refund_evidence(requester_id, ticket_id, nexus_data, history=_hist)
     if _followup:
         result["refund_followup_existing"] = _followup
         result["refund_reply_suppressed"] = "followup_existing_refund"
@@ -937,7 +1043,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             )
             if _has_cross_or_first and _soft_routed:
                 _refund_suppress = "cross_sale_ambiguous_route"
-            elif rc == "WOULD_BE_REFUNDED" and not _has_explicit_refund_demand(eff_text or ""):
+            elif rc in reply_generator.REFUND_APPROVE_CODES and not _has_explicit_refund_demand(eff_text or ""):
                 # Customer reported an unrecognised charge (身に覚えのない…) but never
                 # asked for their money back — this is an EXPLANATION request, not a
                 # refund. NEVER auto-move money for someone who didn't ask; leave it
@@ -1005,11 +1111,15 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             _clf_lang = (classification.get("language") or "").strip()
             _lang = _clf_lang if _clf_lang and _clf_lang.upper() != "EN" else (
                 _detect_lang_from_text(eff_text) or _locale_lang(_charge_host) or "EN")
-            # Country for the Zendesk field: host locale is empty for WC/PayPal
-            # charges (host=None), so fall back to the unambiguous charge currency
-            # (JPY→jp) then the reply language. Left blank rather than guessed for
-            # ambiguous signals (EUR/USD/EN).
-            _country_resolved = (_locale_country(_charge_host)
+            # Country for the Zendesk field. FIRST source is the AUTHORITATIVE billing
+            # country the charge API returns per payment (full name → field tag, e.g.
+            # "United States"→us, "Japan"→jp) — this fixes the #172732 blank-country
+            # gap where a USD/EN customer got no country because currency/language are
+            # ambiguous. Only when the charge API gave nothing do we fall back to the
+            # host locale → unambiguous charge currency (JPY→jp) → reply language;
+            # still left blank rather than guessed for ambiguous signals (EUR/USD/EN).
+            _country_resolved = (_country_field_value(_charge_api_country)
+                                 or _locale_country(_charge_host)
                                  or _country_from_currency(decision.currency)
                                  or _country_from_lang(_lang)
                                  or country)
@@ -1042,7 +1152,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # is a no-op unless REFUNDS_ENABLED (self.enabled) AND the refund API
                 # is configured (REFUND_API_*). In prod both are off → nothing moves.
                 # On dev (REFUND_API_* set + REFUNDS_ENABLED=true) it really refunds.
-                if rc == "WOULD_BE_REFUNDED" and refunds_enabled_for(brand):
+                if rc in reply_generator.REFUND_APPROVE_CODES and refunds_enabled_for(brand):
                     _routed_by_llm = "llm_disambiguated" in (decision.guard_trail or [])
                     # x-host safety: PROD enforces x-host per brand. If we could not
                     # resolve one (unknown / unmapped brand), we do NOT know which
@@ -1083,13 +1193,14 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 executed = bool(result.get("refund_executed"))
                 # Soft-start gate: brand must be enabled; APPROVED also needs the
                 # money to have actually moved (no-op stub unless dev API configured).
-                send_ok = refunds_enabled_for(brand) and (rc != "WOULD_BE_REFUNDED" or executed)
+                send_ok = refunds_enabled_for(brand) and (
+                    rc not in reply_generator.REFUND_APPROVE_CODES or executed)
                 if send_ok:
                     # The reply promises the subscription is cancelled → cancel it
                     # for real BEFORE replying (both approve and deny templates say
                     # so), so the customer isn't re-charged next cycle.
                     _cancelled = _cancel_subscription_after_refund(ticket_id, nexus_data, result)
-                    _approved = (rc == "WOULD_BE_REFUNDED")
+                    _approved = rc in reply_generator.REFUND_APPROVE_CODES
                     _sum_text = _refund_sum_string(decision) if _approved else ""
                     # If the auto-cancel could not be confirmed, flag it FIRST (an
                     # internal note — a comment, so it can't clobber fields/status).
@@ -1147,7 +1258,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # spike the note flags that auto-refunds are PAUSED pending review —
                 # they stay routed to a human until refunds are manually re-enabled.
                 _exec = str(result.get("refund_execution_status") or "")
-                if rc == "WOULD_BE_REFUNDED" and not executed and _exec.startswith("skipped_"):
+                if rc in reply_generator.REFUND_APPROVE_CODES and not executed and _exec.startswith("skipped_"):
                     if _exec.startswith("skipped_abuse_guard"):
                         _guard_note = (
                             "🤖⚠️ Auto-refund PAUSED — refund volume/velocity above normal "
@@ -1680,9 +1791,9 @@ def _build_refund_fields(
         _ZENDESK_REGISTERED_FIELD_ID: _registered_value(host_brand, cross_sale),
         _ZENDESK_PROCESSOR_FIELD_ID: _processor_value(provider, paypal_order_id),
         _ZENDESK_REFUND_TYPE_FIELD_ID: _refund_type_value(charge_type, host_brand),
-        # host locale first; caller-resolved country (currency/language) as fallback
-        # so WC/PayPal charges (host=None) still fill the field.
-        _ZENDESK_COUNTRY_FIELD_ID: _locale_country(host) or country,
+        # Country: the caller already fully resolves this (charge-API billing country
+        # first, then host locale → currency → language), so use it as-is here.
+        _ZENDESK_COUNTRY_FIELD_ID: country,
     }
     if approved:
         fields[_ZENDESK_REFUND_SUM_FIELD_ID] = sum_text

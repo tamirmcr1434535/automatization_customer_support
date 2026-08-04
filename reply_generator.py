@@ -292,7 +292,16 @@ def english_fallback_reply(intent: str, cancel_result: dict) -> str:
 # refundable if the test wasn't taken). So the bot no longer auto-answers it → human.
 REFUND_AUTOREPLY_CODES = {
     "WOULD_BE_REFUNDED",
+    "WOULD_BE_REFUNDED_LAST_ONLY",
     "OUTSIDE_REFUND_WINDOW",
+}
+
+# Reason codes that APPROVE (move money on) the latest charge. Callers (main.py)
+# use this to decide execution / _approved / amount-guard for BOTH the plain
+# single-charge approve and the "approve last, deny earlier" multi-charge case.
+REFUND_APPROVE_CODES = {
+    "WOULD_BE_REFUNDED",
+    "WOULD_BE_REFUNDED_LAST_ONLY",
 }
 
 
@@ -353,6 +362,35 @@ def _master_generic_denied(d: dict) -> str:
         "Your subscription has also been canceled, so no further charges will be made.\n\n"
         "If you have any questions about the product itself, please don't hesitate to reach out "
         "to us directly."
+    )
+
+
+# ── Multi-charge refund: approve the LATEST, deny the earlier ones ───────── #
+# Reproduced VERBATIM from the "Macros for AI Bot" Google Doc (WWIQTEST — Generic
+# "Generic Refund Approved only for last charge"). Used when the customer asks to
+# refund several subscription payments but only the most recent one is within the
+# refund window: we approve + refund the latest, and tell them the earlier
+# charge(s) don't qualify — in a SINGLE reply (was the #172975 gap: the bot
+# replied about the latest only and stayed silent on the earlier charges).
+def _master_generic_approved_last_only(d: dict) -> str:
+    terms, sub = _links(d)
+    return (
+        "Hello,\n\n"
+        "Thank you for reaching out, and we appreciate your patience while we looked into this.\n\n"
+        "Status of your request:\n\n"
+        f"We've reviewed your refund request for your {_brand_phrase(d)} charges. Your most recent "
+        f"charge of {d.get('charge_amount','')} (charge dated {d.get('charge_date','')}) falls "
+        f"within our applicable refund window ({d.get('refund_window_days','')} days from the "
+        "payment date), so this refund has been approved and processed to your original payment "
+        "method. Please allow up to 10 business days for the amount to appear, depending on your "
+        "bank or card issuer.\n\n"
+        "However, your earlier charge(s) do not qualify for a refund under our policy, as it falls "
+        "outside the applicable refund window. We understand this may be disappointing and "
+        "apologize for any inconvenience.\n\n"
+        f"You can read more about our refund policy in our Terms and Conditions: {terms} and "
+        f"review our Subscription Policies: {sub} for details on billing terms.\n\n"
+        "Your subscription has also been canceled, so no further charges will be made. If you'd "
+        "like help with the product itself, please don't hesitate to reach out to us directly."
     )
 
 
@@ -442,13 +480,40 @@ def _master_generic_denied_explained(d: dict) -> str:
     )
 
 
+def _master_generic_approved_last_only_explained(d: dict) -> str:
+    """"Approve latest, deny earlier" with the trial→auto-renewal explanation block
+    prepended (customer asked WHY they were charged)."""
+    terms, sub = _links(d)
+    return (
+        "Hello,\n\n"
+        "Thank you for contacting us. We appreciate your patience while we review your request.\n\n"
+        f"{_charge_explanation_block(d, plural=True)}\n\n"
+        "Outcome of your request:\n"
+        f"We have reviewed your refund request regarding your {_brand_phrase(d)} charges. Your most "
+        f"recent charge of {d.get('charge_amount','')}, dated {d.get('charge_date','')}, falls "
+        f"within our applicable refund window ({d.get('refund_window_days','')} days from the "
+        "payment date). Accordingly, this refund has been approved and processed to your original "
+        "payment method. Please allow up to 10 business days for the refunded amount to appear, "
+        "depending on your bank or card issuer.\n\n"
+        "However, your earlier charge(s) do not qualify for a refund under our policy, as they fall "
+        "outside the applicable refund window. We regret any inconvenience this may cause.\n\n"
+        f"For further information, please refer to our Terms and Conditions: {terms} and our "
+        f"Subscription Policies: {sub}.\n\n"
+        "Your subscription has been cancelled, and no further charges will be applied.\n\n"
+        "Should you have any questions regarding the product itself, please do not hesitate to "
+        "contact us."
+    )
+
+
 _REFUND_MASTERS = {
     "WOULD_BE_REFUNDED": _master_generic_approved,
+    "WOULD_BE_REFUNDED_LAST_ONLY": _master_generic_approved_last_only,
     "OUTSIDE_REFUND_WINDOW": _master_generic_denied,
 }
 
 _REFUND_MASTERS_EXPLAINED = {
     "WOULD_BE_REFUNDED": _master_generic_approved_explained,
+    "WOULD_BE_REFUNDED_LAST_ONLY": _master_generic_approved_last_only_explained,
     "OUTSIDE_REFUND_WINDOW": _master_generic_denied_explained,
 }
 
