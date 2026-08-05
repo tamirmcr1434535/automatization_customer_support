@@ -3126,7 +3126,10 @@ def _process(ticket_id: str) -> dict:
             f"(\"what is this payment?\") unanswered. Please identify the "
             f"charge(s) they are asking about and reply manually.",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result.update({
             "status": "escalated_explanation_question",
             "action": "escalated_to_agent_explanation_question",
@@ -3168,7 +3171,10 @@ def _process(ticket_id: str) -> dict:
             f"Please check the account: was the result ever delivered, "
             f"and reply to the customer manually before closing.",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result.update({
             "status": "escalated_no_results_received",
             "action": "escalated_to_agent_no_results_received",
@@ -3271,7 +3277,10 @@ def _process(ticket_id: str) -> dict:
             f"confidence {confidence:.0%}). Requires manual handling — "
             f"data deletion per privacy policy.",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result.update({
             "status": "escalated_delete_account",
             "action": "escalated_to_agent_delete_account",
@@ -3297,7 +3306,10 @@ def _process(ticket_id: str) -> dict:
             f"Reasoning: {classification.get('reasoning', 'N/A')}\n\n"
             f"Please review this ticket manually."
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result["status"] = "escalated_unknown"
         result["reason"] = (
             f"UNKNOWN intent after all safety nets — confidence={confidence:.0%}, "
@@ -3506,7 +3518,10 @@ def _process(ticket_id: str) -> dict:
             f"{('Keywords detected: ' + ', '.join(_keyword_hint_parts)) if _keyword_hint_parts else 'No keyword signals detected.'}\n\n"
             f"Please review and handle this ticket manually.",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result["status"] = "escalated_low_confidence"
         result["reason"] = (
             f"Confidence {confidence:.0%} below 80% threshold. "
@@ -3667,7 +3682,10 @@ def _process(ticket_id: str) -> dict:
             f"Error: {error_kind} at step `{error_step}`\n"
             f"Detail: {error_detail[:300]}",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result.update({
             "status": "wc_lookup_error",
             "action": "slack_alerted_wc_error",
@@ -3758,7 +3776,10 @@ def _process(ticket_id: str) -> dict:
             f"For developer:\n"
             f"Customer email {email} found in {found_in}, no active subscription.",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result.update({
             "status": "manual_review_required",
             "action": "slack_alerted_no_active_sub",
@@ -3857,7 +3878,10 @@ def _process(ticket_id: str) -> dict:
             f"All lookup paths exhausted (primary email, alt emails from ticket, "
             f"Stripe fallback).",
         )
-        zendesk.set_open(ticket_id)
+        # Anna 2026-08-05: the bot did NOT send a customer reply here (escalation /
+        # note only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents' reply-rate
+        # and bonus; agents still see NEW tickets in the queue (note + review tags).
         result.update({
             "status": "escalated_not_found",
             "action": "slack_alerted_not_found",
@@ -3930,7 +3954,8 @@ def _escalate_legacy_card_digits_ticket(
         "customer. Please locate the subscription manually and handle "
         "this ticket.",
     )
-    zendesk.set_open(ticket_id)
+    # Anna 2026-08-05: bot did NOT reply → leave the ticket NEW (do NOT set Open;
+    # Open hurts agent reply-rate/bonus). The note + tags keep it visible to agents.
     result.update({
         "status": "escalated_legacy_card_digits",
         "action": "slack_alerted_legacy_card_digits",
@@ -4128,7 +4153,7 @@ def _finish_cancellation(
             f"Please follow up with a localised reply in {language} if "
             f"appropriate.",
         )
-        zendesk.set_open(ticket_id)
+        zendesk.set_open(ticket_id)  # a PUBLIC reply (EN fallback) WAS sent → Open is correct here
         result.update({
             "status": "success_en_fallback",
             "action": "cancelled_en_fallback_reply",

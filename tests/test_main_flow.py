@@ -247,7 +247,8 @@ class TestProcess:
         result = main._process("1010")
         assert result["status"] == "escalated_explanation_question"
         mock_zd.add_tag.assert_any_call("1010", "needs_manual_review")
-        mock_zd.set_open.assert_called_once_with("1010")
+        # No customer reply → leave the ticket NEW, do NOT set Open (Anna 2026-08-05).
+        mock_zd.set_open.assert_not_called()
         mock_zd.post_reply.assert_not_called()
 
     # D3. Pure cancellation (no "what is this?" question) → still auto-cancels
@@ -290,7 +291,8 @@ class TestProcess:
         result = main._process("1012")
         assert result["status"] == "escalated_no_results_received"
         mock_zd.add_tag.assert_any_call("1012", "needs_manual_review")
-        mock_zd.set_open.assert_called_once_with("1012")
+        # No customer reply → leave the ticket NEW, do NOT set Open (Anna 2026-08-05).
+        mock_zd.set_open.assert_not_called()
         mock_zd.post_reply.assert_not_called()
 
     # D5. "I did not consent to the charge" → refund keyword override
@@ -570,7 +572,8 @@ class TestProcess:
         mock_zd.post_reply_and_set_pending.assert_not_called()
         mock_zd.solve_ticket.assert_not_called()
 
-    # J. Not found anywhere → ticket re-opened with escalation tags, NOT solved.
+    # J. Not found anywhere → ticket left NEW with escalation tags, NOT solved, NOT
+    #    opened (no customer reply → Open would hurt agent reply-rate; Anna 2026-08-05).
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
     @patch.object(main, "stripe_cli")
@@ -586,7 +589,8 @@ class TestProcess:
         main._process("1009")
         mock_zd.solve_ticket.assert_not_called()
         mock_zd.post_reply.assert_not_called()
-        mock_zd.set_open.assert_called_once_with("1009")
+        # No customer reply → leave the ticket NEW, do NOT set Open (Anna 2026-08-05).
+        mock_zd.set_open.assert_not_called()
         tags_added = [c.args[1] for c in mock_zd.add_tag.call_args_list]
         # Current escalation tag set — replaces the retired awaiting_card_digits.
         assert "bot_handled" in tags_added
@@ -611,7 +615,8 @@ class TestProcess:
         mock_stripe.cancel_subscription.return_value = _stripe_not_found("specific@example.com")
         result = main._process("5555")
         assert result["status"] == "escalated_not_found"
-        mock_zd.set_open.assert_called_once_with("5555")
+        # No customer reply → leave the ticket NEW, do NOT set Open (Anna 2026-08-05).
+        mock_zd.set_open.assert_not_called()
         # The escalation internal note must mention the looked-up email so a
         # human can pick up where the bot left off.
         note_call = mock_zd.add_internal_note.call_args
