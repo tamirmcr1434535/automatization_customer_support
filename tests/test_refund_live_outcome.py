@@ -672,3 +672,64 @@ def test_slack_refund_failed_shows_needs_human_line():
     assert "COULD NOT be completed" in blob
     assert "execution status: `error`" in blob
     assert "Would be refunded" not in blob
+
+
+# ── #174380: a kanji NAME in an English body must not pick a CJK reply language ──
+
+def test_detect_lang_kanji_name_in_english_body_is_not_chinese():
+    body = (
+        "First Name: 佐藤\nLast Name: 颯\nMessage: Hello, I only intended to purchase "
+        "the personality test for the one-time fee. I did not realize I was subscribing. "
+        "Please cancel and refund the charges. Thank you."
+    )
+    # 3 kanji (the name) in a long English body → NOT Chinese.
+    assert main._detect_lang_from_text(body) == ""
+
+
+def test_detect_lang_real_chinese_still_detected():
+    assert main._detect_lang_from_text("您好，我要申请退款，请取消我的订阅并退还费用。") == "ZH-CN"
+    assert main._detect_lang_from_text("我要退款") == "ZH-CN"          # short but Han-dominant
+
+
+def test_detect_lang_kana_wins_even_with_kanji_name():
+    assert main._detect_lang_from_text("返金してください。佐藤 颯") == "JP"
+
+
+def test_is_latin_dominant():
+    assert main._is_latin_dominant("Hello, please refund my subscription. Thank you.") is True
+    assert main._is_latin_dominant("您好我要退款") is False
+    assert main._is_latin_dominant("佐藤 颯") is False
+    assert main._is_latin_dominant("") is False
+
+
+def test_e2e_english_body_with_kanji_name_answered_in_english():
+    # #174380 end-to-end: classifier says EN, body is English, customer signs with a
+    # kanji name. Reply language MUST be English (was Chinese).
+    captured = {}
+    fake_reply_gen = SimpleNamespace(
+        REFUND_AUTOREPLY_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY",
+                                "OUTSIDE_REFUND_WINDOW"},
+        REFUND_APPROVE_CODES={"WOULD_BE_REFUNDED", "WOULD_BE_REFUNDED_LAST_ONLY"},
+        generate_refund_reply=lambda rc, lang, data: captured.setdefault("lang", lang) or "body")
+    zd = MagicMock()
+    rc_client = MagicMock()
+    rc_client.is_configured.return_value = False
+    rc_client.create_refund.return_value = {
+        "status": "refunded", "executed": True, "refunded_amount": "5490"}
+    result = {}
+    with patch.object(main.refund_engine, "decide", return_value=_fake_decision("WOULD_BE_REFUNDED", True)), \
+         patch.object(main, "reply_generator", fake_reply_gen), \
+         patch.object(main, "refunds_enabled_for", return_value=True), \
+         patch.object(main, "_refund_xhost", return_value="host"), \
+         patch.object(main, "refund_client", rc_client), \
+         patch.object(main, "refund_abuse", SimpleNamespace(check=lambda b, e: (True, ""))), \
+         patch.object(main, "nexus_client", None), \
+         patch.object(main, "zendesk", zd):
+        main._refund_would_be_eval(
+            "174380", "satohayate.1414@gmail.com", "REFUND_REQUEST",
+            {"confidence": 0.95, "language": "EN"}, result,
+            ticket_text=("First Name: 佐藤 Last Name: 颯 Message: Hello, I only intended to "
+                         "purchase the personality test for the one-time fee. Please cancel "
+                         "and refund. Thank you."),
+            as_of_date="2026-08-06T00:00:00Z", brand="wwpersonalitytest")
+    assert captured["lang"] == "EN"        # NOT "ZH-CN"

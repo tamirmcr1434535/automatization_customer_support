@@ -378,10 +378,26 @@ def _detect_lang_from_text(text: str) -> str:
         return "AR"
     if any("Ѐ" <= c <= "ӿ" for c in t):
         return "RU"                                   # Cyrillic (RU/UA — RU reply)
-    # Han without any kana ⇒ Chinese (Japanese would carry kana, handled above).
-    if any("一" <= c <= "鿿" for c in t):
+    # Han without any kana ⇒ Chinese — but ONLY when Han is the DOMINANT script of
+    # the message, not a few kanji in an otherwise-English body. A Japanese
+    # customer's kanji NAME in an English contact-form email must NOT be read as
+    # Chinese: #174380 wrote in English and signed "佐藤 颯", and the reply went out
+    # in Chinese. Kanji names are 1–4 chars; a real Chinese message is Han-dominant.
+    han = sum(1 for c in t if "一" <= c <= "鿿")
+    latin = sum(1 for c in t if c.isascii() and c.isalpha())
+    if han >= 4 and han >= latin:
         return "ZH-CN"
     return ""
+
+
+def _is_latin_dominant(text: str) -> bool:
+    """True when the message is genuinely written in a Latin-script language
+    (English/DE/FR/…) — a real amount of Latin prose. Used only after
+    `_detect_lang_from_text` found no strong non-Latin script, to answer an English
+    email in English instead of falling to the charge host's locale (which would
+    reply in e.g. Japanese to a JP-market customer who chose to write in English)."""
+    t = text or ""
+    return sum(1 for c in t if c.isascii() and c.isalpha()) >= 12
 
 
 # ── Country fallbacks when the charge host carries no locale ──────────────── #
@@ -1107,10 +1123,18 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             #      and Nexus returns host=None for WC/PayPal charges, so both the
             #      classifier and the host locale gave EN → JP customer answered in
             #      English on a live auto-refund, #172548 / #171049)
-            #   3. the host-site locale (jp.* → JP), 4. EN.
+            #   3. if the body is genuinely English (Latin-dominant), answer in EN —
+            #      do NOT fall to the host locale (that answered an English email in
+            #      Japanese). This also prevents a kanji NAME in an English body from
+            #      picking a CJK reply (#174380 → answered in Chinese).
+            #   4. the host-site locale (jp.* → JP), 5. EN.
             _clf_lang = (classification.get("language") or "").strip()
-            _lang = _clf_lang if _clf_lang and _clf_lang.upper() != "EN" else (
-                _detect_lang_from_text(eff_text) or _locale_lang(_charge_host) or "EN")
+            if _clf_lang and _clf_lang.upper() != "EN":
+                _lang = _clf_lang
+            else:
+                _lang = (_detect_lang_from_text(eff_text)
+                         or ("EN" if _is_latin_dominant(eff_text) else "")
+                         or _locale_lang(_charge_host) or "EN")
             # Country for the Zendesk field. FIRST source is the AUTHORITATIVE billing
             # country the charge API returns per payment (full name → field tag, e.g.
             # "United States"→us, "Japan"→jp) — this fixes the #172732 blank-country
