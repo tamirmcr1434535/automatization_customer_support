@@ -55,6 +55,12 @@ RC_OUTSIDE_REFUND_WINDOW = "OUTSIDE_REFUND_WINDOW"  # last payment older than th
 RC_WINDOW_UNKNOWN     = "WINDOW_UNKNOWN"       # missing charge/ticket date → can't compute window
 RC_REPORT_NOT_REFUNDABLE = "REPORT_NOT_REFUNDABLE_PER_TOS"  # flow #2 — IQ Test Report is not refunded
 RC_AMBIGUOUS_FLOW     = "AMBIGUOUS_FLOW"       # can't tell which charge/flow the customer means → human
+# Customer named specific amount(s) that match NONE of the refundable charges found — a
+# stronger signal of a wrong account/email or a missing cross-brand charge than plain
+# ambiguity, so it gets its own code (#175712: customer said 199+1990, Nexus returned only
+# unrelated 5490 renewals; a weak keyword match then answered about the wrong charge and a
+# human had to walk it back after the reply upset the customer).
+RC_STATED_AMOUNT_MISMATCH = "STATED_AMOUNT_MISMATCH"
 RC_EVAL_ERROR         = "EVAL_ERROR"           # fail-closed on unexpected error
 
 # ── Country → refund window (days). Only entries differing from the 14-day
@@ -505,6 +511,28 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         _groups = (("subscription", subs), ("report", reports), ("first_sale", firsts))
         present = [t for t, chs in _groups if chs]
         by_amount = [t for t, chs in _groups if chs and any(_charge_amount(c) in stated_set for c in chs)]
+
+        if stated_set and not by_amount and len(refundable) > 1:
+            # The customer named specific amount(s) and NONE of them match any refundable
+            # charge we found — do not let a weaker signal (date/keyword/heuristic, below)
+            # paper over that mismatch and confidently answer about the WRONG charge. Checked
+            # against every group (subs+reports+firsts combined via `refundable`), not just
+            # whichever type a later rule would otherwise pick.
+            #
+            # Only when MORE THAN ONE charge exists: with exactly one refundable charge on the
+            # whole account there is nothing else it could be, so a garbled/converted amount
+            # stays informational-only (test_stated_amount_is_informational_only, by design —
+            # see the module docstring). With 2+ charges a hard mismatch is real evidence the
+            # customer means a charge we never found (#175712: 199+1990 named, account only
+            # had two unrelated 5490 renewals from a different site — the bot answered about
+            # them anyway and had to be corrected by a human after upsetting the customer).
+            return _decision(False, RC_STATED_AMOUNT_MISMATCH,
+                             f"Customer named amount(s) {[str(a) for a in sorted(stated_set)]} that "
+                             f"match none of the {len(refundable)} refundable charge(s) found on "
+                             f"this account — likely a different account/email, or a charge on "
+                             f"another site the lookup didn't surface. A human must verify.",
+                             trail, candidate_charges=_charges_summary(refundable), **common)
+
         target_type = None
         if len(by_amount) == 1:                       # A: stated amount picks one flow
             target_type = by_amount[0]
