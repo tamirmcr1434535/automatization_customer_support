@@ -92,6 +92,9 @@ SCHEMA = [
     # Zendesk "topic screen" values written on a LIVE-resolved refund — mirror
     # the fields an agent fills in the Zendesk UI so the report shows refunds
     # the same way (2026-07-30).
+    bigquery.SchemaField("refund_topic",     "STRING"),   # Topic field we set: refund / sub_renewal_refund
+    bigquery.SchemaField("refund_denied_charges", "STRING"),   # charges the denial covers: id:amount:date;…
+    bigquery.SchemaField("refund_denied_charges_listed", "INTEGER"),  # how many were itemised in the reply
     bigquery.SchemaField("refund_status",    "STRING"),   # Refund Status field: refund_approved / refund_denied
     bigquery.SchemaField("refund_sum",       "STRING"),   # Refund Sum field: "5490" or multi "199+1990" (approved only)
     bigquery.SchemaField("country",          "STRING"),   # Country field value we set (best-effort)
@@ -216,6 +219,9 @@ def log_result(result: dict):
             "refund_execution_status":  result.get("refund_execution_status") or "",
 
             # Zendesk topic-screen values (live-resolved refund)
+            "refund_topic":       result.get("refund_topic") or "",
+            "refund_denied_charges": result.get("refund_denied_charges") or "",
+            "refund_denied_charges_listed": int(result.get("refund_denied_charges_listed") or 0),
             "refund_status":      result.get("refund_status") or "",
             "refund_sum":         result.get("refund_sum") or "",
             "country":            result.get("country") or "",

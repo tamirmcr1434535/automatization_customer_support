@@ -620,6 +620,38 @@ def _parse_window_age(trail) -> "int | None":
     return None
 
 
+def _denied_charges_list(denied_charges: str, currency: str) -> tuple[str, int]:
+    """Render the engine's `denied_charges` ("id:amount:date;…", newest first) as the
+    bullet list the deny templates drop into their `charges_list` slot:
+
+        - 4990 JPY (charged 2026-07-31)
+        - 4990 JPY (charged 2026-04-30)
+
+    Returns (list_text, count). ("", 0) when there is nothing to render, so the caller
+    falls back to the single-charge line and behaviour is unchanged.
+
+    Nastya 2026-08-10: the bot listed only the LATEST charge even when the customer
+    asked about a dozen renewals, so past payments were never mentioned in the denial
+    (worst live case #175502 — 14 charges seen, 1 listed).
+    """
+    cur = (currency or "").strip()
+    lines, seen = [], set()
+    for part in str(denied_charges or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        cols = part.split(":")
+        if len(cols) < 3:
+            continue
+        cid, amount, cdate = cols[0].strip(), cols[1].strip(), cols[2].strip()
+        if not amount or cid in seen:
+            continue
+        seen.add(cid)
+        amt = f"{amount} {cur}".strip()
+        lines.append(f"- {amt} (charged {cdate})".rstrip() if cdate else f"- {amt}")
+    return "\n".join(lines), len(lines)
+
+
 def _charge_date_from(as_of_iso, age_days) -> str:
     """Best-effort charge date = ticket date − age. '' if either is missing."""
     if not as_of_iso or age_days is None:
@@ -1103,6 +1135,20 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             _cdate = _charge_date_from(as_of_date, _parse_window_age(decision.guard_trail))
             _amt = (f"{decision.computed_amount} {decision.currency}".strip()
                     if decision.computed_amount else "")
+            # Every charge the denial covers, itemised (was: only the latest one).
+            #  • OUTSIDE_REFUND_WINDOW → all renewals, all refused → `charges_list`
+            #  • WOULD_BE_REFUNDED_LAST_ONLY → the EARLIER refused ones (the latest is
+            #    approved and already named in the template) → `earlier_charges_list`
+            _charges_list, _n_denied = _denied_charges_list(
+                getattr(decision, "denied_charges", "") or "", decision.currency or "")
+            _earlier_list = _charges_list if rc == "WOULD_BE_REFUNDED_LAST_ONLY" else ""
+            if _earlier_list:
+                _charges_list = ""      # not a slot the LAST_ONLY template uses
+            result["refund_denied_charges"] = getattr(decision, "denied_charges", "") or ""
+            result["refund_denied_charges_listed"] = _n_denied
+            if _n_denied > 1:
+                log.info(f"[{ticket_id}] refund denial covers {_n_denied} charges — "
+                         f"all listed in the reply ({rc})")
             # The refunded charge carries `host` (product site) + `provider`.
             _cand_charge = _candidate_charge(nexus_data, decision.candidate_charge_id)
             _charge_host = _cand_charge.get("host") or (nexus_data or {}).get("host") or ""
@@ -1155,8 +1201,13 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     "charge_amount": _amt,
                     "charge_date": _cdate,
                     "refund_window_days": _win,
-                    "charges_list": (f"- {_amt} (charged {_cdate})".rstrip() if _amt else ""),
-                    "it_falls": "it falls",
+                    "charges_list": _charges_list or (
+                        f"- {_amt} (charged {_cdate})".rstrip() if _amt else ""),
+                    # Grammar follows the count — Anna's macro exposes `it_falls`
+                    # exactly so a multi-charge denial doesn't read "charge(s) … as
+                    # it falls outside". One charge → "it falls"; several → "they fall".
+                    "it_falls": "they fall" if _n_denied > 1 else "it falls",
+                    "earlier_charges_list": _earlier_list,
                     "brand_phrase": _BRAND_PHRASE.get(_link_brand),   # None → template default
                     "terms_url": _terms,
                     "subscription_url": _sub,
@@ -1250,7 +1301,15 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         provider=_cand_charge.get("provider"),
                         paypal_order_id=_cand_charge.get("paypal_order_id"),
                         charge_type=decision.charge_type,
-                        country=_country_resolved)
+                        country=_country_resolved,
+                        # How many subscription charges the account has — feeds the
+                        # renewal-vs-first-subscription Topic decision.
+                        charge_count=len([
+                            p for p in str(decision.candidate_charges or "").split(";") if p.strip()
+                        ]))
+                    # Record the Topic we actually set, so the "Sub Renewal Refund"
+                    # report can be verified from BigQuery instead of by hand.
+                    result["refund_topic"] = _fields.get(_ZENDESK_TOPIC_FIELD_ID, "")
                     try:
                         zendesk.reply_solve_and_set_fields(
                             ticket_id, draft, _fields, additional_tags=["bot_handled"])
@@ -1786,7 +1845,7 @@ def _build_refund_fields(
     approved: bool, sum_text: str, currency: str, *,
     host: str = "", host_brand: str = "", cross_sale: bool = False,
     provider: str = "", paypal_order_id=None, charge_type: str = "",
-    country: str = "",
+    country: str = "", charge_count: int = 0,
 ) -> dict:
     """Build the {field_id: value} map for ALL refund topic-screen fields a human
     fills (approval #169738 / denial #169768), from the refunded charge:
@@ -1803,7 +1862,15 @@ def _build_refund_fields(
     human still fills the rest. Returned as a dict for the caller to write in ONE
     atomic PUT with the reply + solved status (separate PUTs raced and the solve
     reverted the fields — live #171024)."""
-    _is_renewal = (charge_type or "").strip().lower() == "renewal"
+    # A refund is a RENEWAL refund when Nexus typed the charge `renewal` — verified as
+    # reliable on 10 days of live data (2026-08-01..10: `subscription` occurs ONLY on
+    # single-charge accounts, `renewal` on 1..14). Second condition is a safety net: a
+    # subscription-flow refund on an account with 2+ subscription charges IS by
+    # definition a 2nd+ payment, so it must not report as a first-subscription refund
+    # even if the charge type were ever mistyped upstream. Cannot mislabel a genuine
+    # single-payment refund (charge_count <= 1 → falls through to plain "refund").
+    _ct = (charge_type or "").strip().lower()
+    _is_renewal = _ct == "renewal" or (_ct == "subscription" and (charge_count or 0) > 1)
     fields = {
         # Renewal refunds report under the "Sub Renewal Refund" Topic (own tag);
         # first-sub / report / one-time refunds stay plain "Refund".

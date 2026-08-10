@@ -128,6 +128,13 @@ class RefundDecision:
     candidate_charge_id: Optional[str] = None
     charge_type: Optional[str] = None
     candidate_charges: Optional[str] = None     # relevant charges "id:amount:date;…"
+    # Charges the DENIAL text must enumerate to the customer ("id:amount:date;…",
+    # newest first). Distinct from candidate_charges, which drives the money move /
+    # Refund Sum: on a LAST_ONLY approve the sum covers the latest charge only, while
+    # the reply must still list the EARLIER charges we are refusing. Empty/None when
+    # nothing is being denied. (Nastya 2026-08-10: the bot never mentioned past
+    # payments — the deny template has a `charges_list` slot but was fed one charge.)
+    denied_charges: Optional[str] = None
     refund_flow: Optional[str] = None           # flow1_subscription / flow2_report / flow3_pending
     source: Optional[str] = None
     engine_version: str = ENGINE_VERSION
@@ -592,11 +599,16 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
             charge_type=target.get("type"),
         )
         if days > window:
+            # The LATEST subscription charge is already out of window, so by definition
+            # every earlier one is too → the denial covers ALL of them and the reply must
+            # list them all (newest first), not just the latest.
+            _denied_all = sorted(subs, key=lambda c: (_charge_date(c) or date.min), reverse=True)
             return _decision(False, RC_OUTSIDE_REFUND_WINDOW,
                              f"Subscription (renewal) is outside the refund window: this charge is "
                              f"{days}d old > {window}d limit ({wsrc}) — only the latest renewal within "
                              f"the window is refundable; earlier months never.",
-                             trail, candidate_charges=_charges_summary(subs), **base, **common)
+                             trail, candidate_charges=_charges_summary(subs),
+                             denied_charges=_charges_summary(_denied_all), **base, **common)
 
         trail.append("would_be")
         # Multi-charge case (Anna's "approved only for last charge"): the LATEST
@@ -621,6 +633,9 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
                 f"refunded (customer told so in the same reply).",
                 trail,
                 candidate_charges=_charges_summary([target]),  # sum = latest only
+                # …but the reply must enumerate the earlier charges we are refusing.
+                denied_charges=_charges_summary(
+                    sorted(earlier_out, key=lambda c: (_charge_date(c) or date.min), reverse=True)),
                 **base, **common)
 
         return _decision(
