@@ -372,6 +372,18 @@ def _master_generic_denied(d: dict) -> str:
 # refund window: we approve + refund the latest, and tell them the earlier
 # charge(s) don't qualify — in a SINGLE reply (was the #172975 gap: the bot
 # replied about the latest only and stayed silent on the earlier charges).
+def _earlier_block(d: dict) -> str:
+    """Tail for the LAST_ONLY denial sentence: itemise the earlier charges we refuse,
+    or just close the sentence when we don't have them (old behaviour).
+
+    Anna's macro only said "your earlier charge(s) … outside the window" without ever
+    naming them, so a customer disputing 5 renewals could not tell WHICH payments were
+    refused (Nastya 2026-08-10). The list is additive — wording is otherwise unchanged.
+    """
+    lst = (d.get("earlier_charges_list") or "").strip()
+    return f":\n\n{lst}\n\n" if lst else ". "
+
+
 def _master_generic_approved_last_only(d: dict) -> str:
     terms, sub = _links(d)
     return (
@@ -384,9 +396,9 @@ def _master_generic_approved_last_only(d: dict) -> str:
         "payment date), so this refund has been approved and processed to your original payment "
         "method. Please allow up to 10 business days for the amount to appear, depending on your "
         "bank or card issuer.\n\n"
-        "However, your earlier charge(s) do not qualify for a refund under our policy, as it falls "
-        "outside the applicable refund window. We understand this may be disappointing and "
-        "apologize for any inconvenience.\n\n"
+        "However, your earlier charge(s) do not qualify for a refund under our policy, as they fall "
+        f"outside the applicable refund window{_earlier_block(d)}We understand this may be "
+        "disappointing and apologize for any inconvenience.\n\n"
         f"You can read more about our refund policy in our Terms and Conditions: {terms} and "
         f"review our Subscription Policies: {sub} for details on billing terms.\n\n"
         "Your subscription has also been canceled, so no further charges will be made. If you'd "
@@ -496,7 +508,8 @@ def _master_generic_approved_last_only_explained(d: dict) -> str:
         "payment method. Please allow up to 10 business days for the refunded amount to appear, "
         "depending on your bank or card issuer.\n\n"
         "However, your earlier charge(s) do not qualify for a refund under our policy, as they fall "
-        "outside the applicable refund window. We regret any inconvenience this may cause.\n\n"
+        f"outside the applicable refund window{_earlier_block(d)}We regret any inconvenience this "
+        "may cause.\n\n"
         f"For further information, please refer to our Terms and Conditions: {terms} and our "
         f"Subscription Policies: {sub}.\n\n"
         "Your subscription has been cancelled, and no further charges will be applied.\n\n"
