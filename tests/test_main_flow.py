@@ -1732,12 +1732,25 @@ def test_amount_guard():
 
 def test_amount_guard_currency_extensible():
     # A currency absent from the default table fails safe (NO)…
-    assert main._amount_guard(149000, "IDR")[0] is False
+    assert main._amount_guard(149000, "MYR")[0] is False
     # …but can be added at load time via REFUND_RENEWAL_PRICE_MAP (simulated by
-    # patching the merged table), after which in-band amounts pass.
-    with patch.dict(main._RENEWAL_PRICE, {"IDR": 149000.0}):
-        assert main._amount_guard(149000, "IDR")[0] is True
-        assert main._amount_guard(300000, "IDR")[0] is False  # >20% high
+    # patching the merged table) — value may be a bare number or a list.
+    with patch.dict(main._RENEWAL_PRICE, {"MYR": 149000.0}):
+        assert main._amount_guard(149000, "MYR")[0] is True
+        assert main._amount_guard(300000, "MYR")[0] is False  # >20% high
+
+
+def test_amount_guard_multi_price_currency():
+    # Live currencies now configured (were escalating as REFUND_AMOUNT_ANOMALY —
+    # "no reference renewal price"): VND / CHF / IDR etc.
+    assert main._amount_guard(799990, "VND")[0] is True        # #175420/175311/173683
+    assert main._amount_guard(29.99, "CHF")[0] is True         # #174777
+    assert main._amount_guard(29.99, "AUD")[0] is True
+    # IDR has SEVERAL valid renewal prices (199k / 299990 / 499990) — each passes,
+    # a value between two tiers (not within band of any) still escalates.
+    assert main._amount_guard(199000, "IDR")[0] is True        # #174300 (Anna's case)
+    assert main._amount_guard(499990, "IDR")[0] is True
+    assert main._amount_guard(380000, "IDR")[0] is False       # between tiers → anomaly
 
 
 def test_amount_anomaly_blocks_refund():

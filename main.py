@@ -486,21 +486,37 @@ def _refund_type_value(charge_type: str, host_brand: str) -> str:
     return ""
 
 
-# ── Amount guard: standard renewal price per currency (from the Pricing sheet).
-# An auto-refund's charge must be a non-zero amount within ±20% of this — anything
-# else (0/null, an unknown currency, or an anomalous amount) is escalated to a
-# human (fail-safe: an unlisted currency can NEVER auto-approve). New brand
-# currencies can be added without a code change via REFUND_RENEWAL_PRICE_MAP
-# (JSON, e.g. {"IDR": 149000, "VND": 199000}) — values merge over these defaults. ── #
+# ── Amount guard: standard renewal price(s) per currency (from the Pricing sheet).
+# An auto-refund's charge must be a non-zero amount within ±20% of ONE of the
+# currency's standard renewal prices — anything else (0/null, an unknown currency,
+# or an anomalous amount) is escalated to a human (fail-safe: an unlisted currency
+# can NEVER auto-approve). A currency may have SEVERAL valid renewal prices (plan
+# tiers / price changes over time — e.g. IDR is charged at 199k / 299k / 499990);
+# the amount passes if it is within band of any one of them. New brand currencies /
+# prices can be added without a code change via REFUND_RENEWAL_PRICE_MAP (JSON —
+# value may be a number or a list, e.g. {"IDR": [199000, 499990], "VND": 799990}),
+# merged over these defaults. Values below are the observed live renewal amounts. ──
 _RENEWAL_PRICE = {
-    "JPY": 5490.0, "EUR": 29.99, "USD": 29.99, "KRW": 39990.0,
-    "TRY": 1290.0, "NOK": 299.0, "SEK": 299.0,
+    "JPY": [5490.0], "EUR": [29.99], "USD": [29.99], "KRW": [39990.0],
+    "TRY": [1290.0], "NOK": [299.0], "SEK": [299.0],
+    # added 2026-08 (were escalating as REFUND_AMOUNT_ANOMALY "no reference price"):
+    "VND": [799990.0], "CHF": [29.99], "AUD": [29.99], "GBP": [29.99],
+    "BRL": [149.0], "IDR": [499990.0, 299990.0, 199000.0],
 }
+
+
+def _coerce_price_list(v) -> "list[float]":
+    """Normalise a config value (number or list of numbers) to a list of floats."""
+    if isinstance(v, (list, tuple)):
+        return [float(x) for x in v]
+    return [float(v)]
+
+
+# Normalise defaults (tolerate a bare number) + merge env overrides.
+_RENEWAL_PRICE = {k: _coerce_price_list(v) for k, v in _RENEWAL_PRICE.items()}
 try:
-    _RENEWAL_PRICE.update({
-        str(k).upper(): float(v)
-        for k, v in json.loads(os.getenv("REFUND_RENEWAL_PRICE_MAP", "") or "{}").items()
-    })
+    for k, v in json.loads(os.getenv("REFUND_RENEWAL_PRICE_MAP", "") or "{}").items():
+        _RENEWAL_PRICE[str(k).upper()] = _coerce_price_list(v)
 except (ValueError, TypeError):
     log.warning("REFUND_RENEWAL_PRICE_MAP is not valid JSON — using defaults")
 _REFUND_AMOUNT_BAND = float(os.getenv("REFUND_AMOUNT_BAND", "0.20"))
@@ -508,7 +524,7 @@ _REFUND_AMOUNT_BAND = float(os.getenv("REFUND_AMOUNT_BAND", "0.20"))
 
 def _amount_guard(amount, currency) -> "tuple[bool, str]":
     """(ok, reason). Reject zero/null, unknown currency, or >band deviation from
-    the standard renewal price."""
+    EVERY standard renewal price configured for the currency."""
     if amount is None:
         return False, "amount missing"
     try:
@@ -517,13 +533,14 @@ def _amount_guard(amount, currency) -> "tuple[bool, str]":
         return False, f"amount not numeric ({amount!r})"
     if a <= 0:
         return False, "zero/negative amount"
-    ref = _RENEWAL_PRICE.get((currency or "").upper())
-    if ref is None:
+    refs = _RENEWAL_PRICE.get((currency or "").upper())
+    if not refs:
         return False, f"no reference renewal price for currency {currency!r}"
-    if abs(a - ref) / ref > _REFUND_AMOUNT_BAND:
-        return False, (f"amount {a} {currency} deviates >"
-                       f"{int(_REFUND_AMOUNT_BAND*100)}% from standard {ref}")
-    return True, ""
+    refs = _coerce_price_list(refs)   # tolerate a bare number (env / patched config)
+    if any(abs(a - ref) / ref <= _REFUND_AMOUNT_BAND for ref in refs):
+        return True, ""
+    return False, (f"amount {a} {currency} deviates >"
+                   f"{int(_REFUND_AMOUNT_BAND*100)}% from standard {refs}")
 
 
 def refunds_enabled_for(brand: str) -> bool:
