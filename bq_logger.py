@@ -114,10 +114,25 @@ def _client():
 
 
 def ensure_log_table():
-    """Create table + dataset if they don't exist. Safe to call multiple times."""
+    """Create the table if it doesn't exist, and auto-migrate its schema forward
+    if it does. Safe to call multiple times (idempotent).
+
+    2026-08-11 incident: a new SchemaField added here (refund_topic,
+    refund_denied_charges, refund_denied_charges_listed) was never applied to the
+    LIVE table — this function was defined but never actually called anywhere.
+    BigQuery's streaming insert (insert_rows_json) rejects the ENTIRE row when it
+    contains a field the live table doesn't have, so every refund ticket's log row
+    (all 50+ columns, not just the 3 new ones) was silently dropped for ~1.5 days
+    (704 rows lost) until someone noticed and ran ALTER TABLE by hand. The row-level
+    failure only ever surfaced as a `log.warning` — nothing paged anyone.
+
+    Fix: call this at import time (below) so schema drift self-heals on every cold
+    start — any field present in SCHEMA but missing from the live table gets added
+    automatically via ALTER TABLE, so a future field addition can never silently
+    drop rows like this again."""
     c = _client()
     try:
-        c.get_table(BQ_TABLE)
+        table = c.get_table(BQ_TABLE)
     except Exception:
         dataset = BQ_TABLE.split(".")[1]
         try:
@@ -126,6 +141,28 @@ def ensure_log_table():
             pass
         c.create_table(bigquery.Table(BQ_TABLE, schema=SCHEMA))
         log.info(f"Created {BQ_TABLE}")
+        return
+
+    existing = {f.name for f in table.schema}
+    missing = [f for f in SCHEMA if f.name not in existing]
+    if missing:
+        table.schema = list(table.schema) + missing
+        c.update_table(table, ["schema"])
+        log.warning(
+            f"BQ schema auto-migrated on {BQ_TABLE} — added columns: "
+            f"{[f.name for f in missing]} (were silently dropping every row "
+            f"that used them until now)"
+        )
+
+
+# Reconcile the live table schema against SCHEMA on every cold start — see the
+# 2026-08-11 incident note in ensure_log_table() above. Fail-soft: logging must
+# never block the bot's actual ticket processing (e.g. missing BQ credentials in
+# a local/test context).
+try:
+    ensure_log_table()
+except Exception as e:  # noqa: BLE001
+    log.warning(f"ensure_log_table() failed at import — schema drift may persist: {e}")
 
 
 def _safe_str(val) -> str:
