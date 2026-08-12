@@ -214,7 +214,16 @@ STEP 3 — SPECIAL CASES:
     "was my cancellation successful?" / "did my cancellation go through?" (EN)
     "취소가 되었나요" / "해지가 잘 되었나요" (KR)
   But "how to cancel" / "解約の方法" / "解約したい" → TRIAL_CANCELLATION (new request, not verification).
-  And verification + billing complaint / "I'm still being charged" → REFUND_REQUEST.
+  And verification + billing complaint ("I cancelled in May but I'm STILL being
+  charged every month") → this is a CANCELLATION that did not take effect:
+    • customer ALSO asks for their money back (返金 / refund / 환불 / …)
+      → REFUND_REQUEST
+    • customer only wants the charges to STOP / the account checked, with NO
+      money-back wording → TRIAL_CANCELLATION.
+  Never infer a refund from repeated charges alone — the customer must ask for
+  the money back. (#175987: "5月に解約を依頼したのに未だに毎月請求がなされて
+  います" carried no refund word, was classified REFUND_REQUEST, and the bot
+  sent a refund DENIAL for a refund nobody requested.)
 - SUB_RENEWAL_CANCELLATION: use ONLY when ALL of these are true:
     (1) customer explicitly mentions "auto-renewal" / "自動更新" / "자동 갱신"
     (2) there is NO cancel word (解約, cancel, kündigen, etc.) anywhere in the message
