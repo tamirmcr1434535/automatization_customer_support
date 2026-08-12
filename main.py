@@ -1106,7 +1106,29 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 m in (decision.guard_trail or [])
                 for m in ("dispute_target_subscription", "llm_disambiguated")
             )
-            if _has_cross_or_first and _soft_routed:
+            if result.get("refund_ask_in_text") is False:
+                # The classifier ALONE called this a refund — the customer's own
+                # words carry ZERO refund signal in any language we know
+                # (_contains_refund_request over subject + body + all customer
+                # comments). Answering it with a refund verdict tells the customer
+                # we refused money they never asked for.
+                #
+                # #175987 (Anna, 2026-08-11): "5月に解約を依頼したのに未だに毎月
+                # 請求がなされています … 再ログインと退会ができませんでした" — a
+                # cancellation + login complaint. The classifier mapped
+                # "already cancelled but still charged" to REFUND_REQUEST (0.82),
+                # the window check said 8 days < charge age, and the bot sent a
+                # refund DENIAL. The customer answered in the satisfaction survey
+                # that they would report us to the authorities/courts.
+                #
+                # Deterministic keyword absence is the safe discriminator here: a
+                # real refund ask virtually always carries one of the ~250
+                # _REFUND_KEYWORDS, while this false-positive class carries none.
+                # Suppress BOTH the approve and the deny (the deny is the one that
+                # burns customers — no money moves, but the letter is wrong) and
+                # hand the ticket to a human, who answers what was actually asked.
+                _refund_suppress = "no_refund_request_in_text"
+            elif _has_cross_or_first and _soft_routed:
                 _refund_suppress = "cross_sale_ambiguous_route"
             elif rc in reply_generator.REFUND_APPROVE_CODES and not _has_explicit_refund_demand(eff_text or ""):
                 # Customer reported an unrecognised charge (身に覚えのない…) but never
@@ -1125,7 +1147,19 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             # mode we record the suppression (BQ/Slack) but never mutate the ticket,
             # so Anna's shadow eval stays non-invasive.
             if refunds_enabled_for(brand):
-                if _refund_suppress == "explanation_only_no_refund_demand":
+                if _refund_suppress == "no_refund_request_in_text":
+                    _note = (
+                        "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
+                        "The customer NEVER asked for a refund: their message contains "
+                        "no refund wording in any language (返金 / refund / 환불 / "
+                        "Rückerstattung / …). Only the AI classifier read it as a refund "
+                        "— typically a 'I cancelled but I'm still being charged' or "
+                        "'what is this charge?' complaint.\n\n"
+                        "The bot did NOT move money and did NOT send a refund verdict. "
+                        "Please answer what the customer actually asked (cancellation / "
+                        "explanation) and offer a refund only if they request one."
+                    )
+                elif _refund_suppress == "explanation_only_no_refund_demand":
                     _note = (
                         "🤖 Refund auto-reply suppressed — please handle manually.\n\n"
                         "The customer reported an unrecognised charge (e.g. sent a "
@@ -3117,7 +3151,13 @@ def _process(ticket_id: str) -> dict:
         intent = "TRIAL_CANCELLATION"  # neutral cancel; _resolve_intent fixes the type from account data
         result["intent"] = intent
 
-    if intent in HANDLED_INTENTS:
+    # Comments are fetched for cancellation intents (the refund-keyword override
+    # below) AND for refund intents — there the full customer text is what the
+    # "did they actually ask for a refund?" guard reads. Live-chat tickets
+    # ("Conversation with …") carry an EMPTY description: the whole conversation
+    # lives in the comments, so subject+body alone would look signal-free and the
+    # guard would suppress a genuine refund ask.
+    if intent in HANDLED_INTENTS or intent in refund_engine.REFUND_INTENTS:
         try:
             all_comments = zendesk.get_all_customer_comments_text(ticket_id)
             if all_comments:
@@ -3294,6 +3334,55 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
+    # ── Customer cannot log in / access their account → human ───────────── #
+    # Anna 2026-08-11 (#175987): "коли юзери пишуть, що у них проблеми з логіном
+    # в акаунт, таке треба переводити на агента, бо клієнт повинен мати доступ
+    # до підписки." The customer's account is unreachable (email unlinked,
+    # password lost, login rejected) — they cannot see or manage their own
+    # subscription. The bot can cancel a sub, but it cannot restore account
+    # access, and a cancellation confirmation leaves the real problem unanswered.
+    # A human must fix the access first. Applies to cancellation AND refund
+    # intents (pure disputes already go to a human below).
+    if (intent in HANDLED_INTENTS or intent in refund_engine.REFUND_INTENTS) \
+            and _contains_login_problem(_customer_text_only):
+        log.info(
+            f"[{ticket_id}] {intent}: customer reports they cannot log in / "
+            f"access their account → escalating to human (account access)"
+        )
+
+        current_tags = zendesk.get_ticket_tags(ticket_id)
+        if "bot_handled" in current_tags:
+            log.info(f"[{ticket_id}] Race condition: bot_handled already set — skip")
+            result["status"] = "skipped_race_condition"
+            return result
+
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        zendesk.add_tag(ticket_id, "login_problem")
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖 Bot: the customer reports they CANNOT LOG IN / access their "
+            f"account, alongside a {intent} request.\n\n"
+            f"The bot did not reply and did not act on the subscription — a "
+            f"customer must be able to reach their own subscription, and only a "
+            f"human can restore account access (re-link the email / reset the "
+            f"login). Please fix the access and handle the request manually.",
+        )
+        # Anna 2026-08-05: the bot sent NO customer reply here (escalation + note
+        # only), so leave the ticket in its current status (NEW for a fresh
+        # ticket) — do NOT move it to Open. Open counts against the agents'
+        # reply-rate and bonus; agents still see NEW tickets in the queue.
+        result.update({
+            "status": "escalated_login_problem",
+            "action": "escalated_to_agent_login_problem",
+            "reason": (
+                "Customer cannot log in / access their account — a human must "
+                "restore access before the request can be handled."
+            ),
+        })
+        log_result(result)
+        return result
+
     # ── REFUND / PAYMENT DISPUTE intents ─────────────────────────────────── #
     #
     # Policy: CANCELLATION IS ALWAYS THE PRIORITY.
@@ -3318,6 +3407,18 @@ def _process(ticket_id: str) -> dict:
         log.info(
             f"[{ticket_id}] {intent} — refund intent, always escalate to human"
         )
+
+        # Did the CUSTOMER ask for a refund, or only the classifier think so?
+        # Deterministic read of subject + body + every customer comment. When
+        # this is False the refund auto-reply (approve AND deny) is suppressed
+        # inside the eval — see "no_refund_request_in_text" (#175987).
+        result["refund_ask_in_text"] = _contains_refund_request(_all_text_for_refund)
+        if not result["refund_ask_in_text"]:
+            log.info(
+                f"[{ticket_id}] {intent}: NO refund wording anywhere in the "
+                f"customer's text — classifier-only refund; auto-reply will be "
+                f"suppressed and a human answers"
+            )
 
         # AN-192 would-be evaluation. STRICTLY ADDITIVE and fully isolated:
         # any failure here must NOT change the escalate-to-human behaviour below.
@@ -5733,3 +5834,69 @@ def _contains_no_results_received_complaint(text: str) -> bool:
     """
     text_lower = text.lower()
     return any(kw in text_lower for kw in _NO_RESULTS_RECEIVED_KEYWORDS)
+
+
+# ── "I cannot log in / access my account" ────────────────────────────────── #
+# Anna 2026-08-11 (#175987): a customer who cannot reach their account cannot
+# see or manage their own subscription. Only a human can restore that access
+# (re-link the email, reset the login), so these tickets go to an agent even
+# when the surface request is a plain cancellation.
+#
+# Deliberately narrow: the phrase must state an INABILITY to log in / get into
+# the account. "I logged in and cancelled" or "how do I log in?" must NOT match
+# — the first is fine, the second is a how-to the normal reply covers.
+_LOGIN_PROBLEM_PATTERNS = [
+    # ── Japanese ── ログイン / サインイン / アカウントにアクセス + a negative
+    # potential form (できない / 出来ません / できず / できなかった). The gap
+    # allows "再ログインと退会ができませんでした" (#175987) while the [^。\n]
+    # class keeps the match inside one sentence.
+    r"(?:再)?(?:ログイン|サインイン|ログオン)[^。\n]{0,24}?(?:でき|出来)(?:ない|ません|ず|なく|なかった|ませんでした)",
+    r"アカウント[^。\n]{0,24}?(?:入れ|アクセス|ログイン)[^。\n]{0,12}?(?:でき|出来)?(?:ない|ません|ず|ませんでした)",
+    r"(?:パスワード|ぱすわーど)[^。\n]{0,20}?(?:忘れ|分からな|わからな|不明)",
+    r"(?:メールアドレス|アカウント)[^。\n]{0,20}?紐付[^。\n]{0,20}?(?:解除|外れ|切れ)",
+    # ── English ──
+    r"(?:can'?t|cannot|can not|couldn'?t|could not|unable to|not able to)\s+"
+    r"(?:log\s?in|login|sign\s?in|signin|access my account|access the account|"
+    r"get into my account|get in to my account)",
+    r"(?:locked out of|no access to)\s+(?:my|the)\s+account",
+    r"(?:log\s?in|login|sign\s?in)\s+(?:is\s+)?(?:not working|doesn'?t work|does not work|fails|failed)",
+    r"(?:forgot|lost)\s+my\s+password",
+    # ── Korean ──
+    r"로그인[^.\n]{0,12}?(?:안\s?(?:되|돼|됩|됨)|할\s?수\s?없|불가|되지\s?않)",
+    r"계정[^.\n]{0,12}?(?:접속|로그인)[^.\n]{0,8}?(?:할\s?수\s?없|안\s?(?:되|돼|됩|됨)|되지\s?않)",
+    r"비밀번호[^.\n]{0,12}?(?:잊|모르|분실)",
+    # ── German ──
+    r"kann\s+mich\s+nicht\s+(?:anmelden|einloggen)",
+    r"(?:komme|komm)\s+nicht\s+(?:in|auf)\s+mein\s+(?:konto|account)",
+    r"kein(?:en)?\s+zugriff\s+auf\s+mein\s+(?:konto|account)",
+    r"passwort\s+vergessen",
+    # ── Spanish / Portuguese ──
+    r"no\s+puedo\s+(?:iniciar\s+sesi|entrar|acceder)",
+    r"n[ãa]o\s+consigo\s+(?:entrar|acessar|fazer\s+login)",
+    r"(?:olvid[ée]|perd[ií])\s+mi\s+contrase",
+    # ── French ──
+    r"(?:je\s+ne\s+peux\s+pas|impossible\s+de)\s+me\s+connecter",
+    r"mot\s+de\s+passe\s+oubli",
+    # ── Dutch ──
+    r"kan\s+niet\s+inloggen",
+    r"geen\s+toegang\s+tot\s+mijn\s+account",
+    # ── Italian ──
+    r"non\s+riesco\s+ad\s+(?:accedere|entrare)",
+    # ── Vietnamese ──
+    r"kh[ôo]ng\s+(?:th[ểe]\s+)?đăng\s+nh[ậa]p\s*(?:được)?",
+]
+
+_LOGIN_PROBLEM_RE = [re.compile(p, re.IGNORECASE) for p in _LOGIN_PROBLEM_PATTERNS]
+
+
+def _contains_login_problem(text: str) -> bool:
+    """
+    Return True if *text* says the customer CANNOT log in / reach their account.
+
+    A customer locked out of their account cannot manage their own subscription,
+    and the bot cannot restore access — an agent must (Anna, #175987). Matching
+    is on an inability phrase only, so "I logged in and cancelled" never trips it.
+    """
+    if not text:
+        return False
+    return any(rx.search(text) for rx in _LOGIN_PROBLEM_RE)
