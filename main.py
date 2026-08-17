@@ -4895,6 +4895,29 @@ _REFUND_KEYWORDS = [
     "가입하지 않았",  # "did not sign up"
     "신청한 적 없",   # "never applied / registered for this"
     "신청한적 없",    # no-space variant
+    # Korean — "I never AGREED / consented" (#179802).
+    # The JP side of this list already carries 同意していません / 承諾しておりません
+    # and the EN side "never agreed to", but the Korean equivalent was missing:
+    # "구독에 동의한적이 없으므로 해당 금액을 취소해주시기 바랍니다" scored ZERO
+    # refund keywords, so the no_refund_request_in_text guard suppressed a refund
+    # the engine had already decided to approve (WOULD_BE_REFUNDED, 0d old).
+    "동의한 적 없",   # "never agreed"
+    "동의한적 없",    # no-space variant
+    "동의한 적이 없", # "never agreed" (subject-particle form)
+    "동의한적이 없",  # no-space variant
+    "동의하지 않았",  # "did not agree"
+    "동의한 기억이 없", # "don't recall agreeing"
+    "동의한 바 없",   # "have not agreed" (formal)
+    # Korean — "cancel that AMOUNT / that billing" = reverse a past charge.
+    # Deliberately narrower than the "결제취소" that was removed above: 결제 취소
+    # ("cancel the payment") is routinely a plain forward-looking subscription
+    # cancel, but an *amount* is always a sum already taken — you cannot cancel
+    # it, only give it back.
+    "금액을 취소",    # "cancel that amount"
+    "금액 취소",      # spaced/noun variant
+    "금액을 환급",    # "refund that amount" (환급 = reimburse)
+    "청구를 취소",    # "cancel the billing"
+    "청구 취소",      # noun variant
     # German — refund + fraud / unauthorized signals
     "rückerstattung", "rückzahlung", "erstattet",
     "widerruf", # legal right of withdrawal (= refund, very common in DE/AT/CH)
@@ -5110,6 +5133,11 @@ _REFUND_DEMAND_WORDS = [
     "返金", "払い戻し", "取り戻し",                # JP: refund / money back
     "refund", "money back", "money-back", "chargeback",
     "환불",                                         # KR
+    # KR — "cancel/return THAT AMOUNT". An amount is money already taken, so
+    # asking to cancel it IS a demand to get it back (#179802). Without this the
+    # explanation_only_no_refund_demand guard would suppress the reply anyway,
+    # even after _REFUND_KEYWORDS starts routing the ticket correctly.
+    "금액을 취소", "금액 취소", "금액을 환급",
     "rückerstattung", "rückzahlung", "erstattet",  # DE
     "remboursement", "rembourser",                 # FR
     "reembolso",                                   # ES/PT
@@ -5269,6 +5297,20 @@ _STRONG_REFUND_SIGNALS = [
     "사기",                 # fraud
     "무단 결제",            # unauthorized payment
     "무단결제",             # no-space
+    # KR — "cancel that AMOUNT" / "never agreed", mirroring the JP
+    # 支払いをキャンセル and 同意していません entries above. Needed here too, not
+    # just in _REFUND_KEYWORDS: the Korean cancel list carries a bare "취소", so
+    # without a strong signal a "동의한적이 없으므로 해당 금액을 취소해주세요"
+    # ticket can be read as a plain cancellation and auto-cancelled with the
+    # charge left in place (#179802 / the #149230 failure shape).
+    "금액을 취소",          # cancel that amount (= reverse the charge)
+    "금액 취소",            # spaced/noun variant
+    "금액을 환급",          # refund that amount
+    "동의한 적 없",         # never agreed
+    "동의한적 없",          # no-space variant
+    "동의한 적이 없",       # subject-particle form
+    "동의한적이 없",        # no-space variant
+    "동의하지 않았",        # did not agree
     # ── German ──
     "betrug",               # fraud
     "betrügerisch",         # fraudulent
