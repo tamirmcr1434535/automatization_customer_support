@@ -3449,7 +3449,21 @@ def _process(ticket_id: str) -> dict:
         # still tells a human to review whether a refund is owed for the
         # already-failed cycle(s). A genuine refund ask (weak or strong) still
         # escalates untouched below — money decisions stay human.
-        if not result["refund_ask_in_text"] and _contains_cancel_signal(_customer_text_only):
+        #
+        # Defense in depth (#180442): _contains_refund_request missed a German
+        # separable-verb demand ("fordere ich die 9,99 EUR ... zurück" — the verb
+        # and its "zurück" prefix are split apart by the sentence), so
+        # refund_ask_in_text was wrongly False and this remap fired, auto-
+        # cancelling and replying with a plain trial-cancellation confirmation
+        # that never addressed the customer's money demand. Fixed the keyword
+        # gap itself (_contains_amount_with_zurueck_demand), but ALSO require NO
+        # stated amount+currency here as a second, independent safety net: a
+        # customer citing a specific charged amount is a strong signal there IS
+        # a money question in play, even if some future phrasing slips past the
+        # keyword list — fail toward escalation, not an incomplete auto-reply.
+        if (not result["refund_ask_in_text"]
+                and not _contains_amount_with_currency(_customer_text_only)
+                and _contains_cancel_signal(_customer_text_only)):
             log.info(
                 f"[{ticket_id}] {intent}: no refund ask, but customer wants the "
                 f"subscription actually stopped (already-cancelled / cancel-now "
@@ -5135,6 +5149,29 @@ def _contains_billing_amount_complaint(text: str) -> bool:
     return True
 
 
+# German (and Dutch, which shares the construction) separable verbs put the
+# prefix "zurück" at the END of the clause, far from the verb stem that
+# carries the actual demand ("fordere", "verlange", "möchte", "bitte") —
+# e.g. "Hiermit fordere ich die 9,99 EUR die per PayPal abgebucht wurde
+# ZURÜCK" (#180442). A plain substring scan for "geld zurück" / "zurückfordern"
+# never matches this because the words are split apart by the sentence. The
+# reliable signal here is simpler than the JP compound pattern above: an
+# amount+currency co-occurring with a standalone "zurück" is, in practice,
+# always a demand for that money back — false positives (e.g. "ich komme
+# zurück" with no amount nearby) don't have the amount, so this stays narrow.
+_ZURUECK_RE = re.compile(r"\bzur(?:ü|u)ck\b", re.IGNORECASE)
+
+
+def _contains_amount_with_zurueck_demand(text: str) -> bool:
+    """DE/NL separable-verb refund demand: an amount+currency together with
+    a standalone "zurück" elsewhere in the text (not necessarily adjacent)."""
+    if not text:
+        return False
+    if not _contains_amount_with_currency(text):
+        return False
+    return bool(_ZURUECK_RE.search(text))
+
+
 def _contains_refund_request(text: str) -> bool:
     """
     Return True if *text* contains refund/repayment/unauthorized-charge keywords
@@ -5149,6 +5186,8 @@ def _contains_refund_request(text: str) -> bool:
     if any(kw in text_lower for kw in _REFUND_KEYWORDS):
         return True
     if _contains_billing_amount_complaint(text):
+        return True
+    if _contains_amount_with_zurueck_demand(text):
         return True
     return False
 

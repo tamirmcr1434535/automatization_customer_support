@@ -77,6 +77,49 @@ def test_real_refund_asks_still_detected():
         assert main._contains_refund_request(text) is True, text
 
 
+# ── German/Dutch separable-verb refund demand (#180442) ──────────────────── #
+# "Hiermit fordere ich die 9,99 EUR die per PayPal abgebucht wurde ZURÜCK" —
+# German splits the verb ("fordere ... zurück" = "demand ... back") across the
+# whole clause, so a substring scan for "geld zurück" never matches. The
+# _180292 cancel-remap fix (which trusts refund_ask_in_text to decide whether
+# to auto-cancel-and-reply) turned this specific false negative into a
+# customer-visible bug: the bot replied with a plain trial-cancellation
+# confirmation and never addressed the customer's explicit money demand.
+_TICKET_180442 = (
+    "First Name: Silke Last Name: Paul Email: silkepaul1@gmx.net Message: "
+    "Sehr geehrte Damen und Herren, ich finde es eine Frechheit unbemerkt mir "
+    "ein Abo unterzuschieben. Ich habe lediglich einen online-IQ Test "
+    "durchgeführt und für den Erhalt des Ergebnisses und das Zertifikat 1,90 "
+    "EUR per paypal gezahlt. Kurz darauf kam die Abbuchung von 9,99 EUR !!! "
+    "Wofür??? und nun muss ich noch kündigen für einen Vertrag, den ich nie "
+    "abgeschlossen habe. Hiermit fordere ich die 9,99 EUR die per paypal "
+    "durch Sie abgebucht wurde zurück , sowie eine Bestätigung über die "
+    "Kündigung dieses merkwürdigen Abos"
+)
+
+
+def test_180442_separable_verb_refund_demand_detected():
+    assert main._contains_refund_request(_TICKET_180442) is True
+    assert main._contains_amount_with_zurueck_demand(_TICKET_180442) is True
+
+
+def test_zurueck_demand_requires_a_stated_amount():
+    """"zurück" alone (no amount) must NOT read as a refund demand — only the
+    amount+zurück co-occurrence is the reliable signal."""
+    for text in (
+        "Ich komme später zurück, danke.",
+        "Bitte schicken Sie mir eine Rückantwort zurück.",
+        "",
+    ):
+        assert main._contains_amount_with_zurueck_demand(text) is False, text
+
+
+def test_zurueck_demand_variant_without_umlaut():
+    # "zuruck" (ASCII, no umlaut) — common in typed/autocorrected email.
+    assert main._contains_amount_with_zurueck_demand(
+        "Ich fordere die 9,99 EUR zuruck") is True
+
+
 # ── Rule 2: cannot log in → agent ────────────────────────────────────────── #
 
 def test_175987_login_problem_detected():

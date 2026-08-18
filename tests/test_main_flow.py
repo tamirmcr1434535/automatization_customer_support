@@ -461,6 +461,44 @@ class TestProcess:
         mock_woo.cancel_subscription.assert_not_called()
         mock_zd.post_reply.assert_not_called()
 
+    # D5f. #180442 (live regression): German separable-verb refund demand
+    # ("fordere ich die 9,99 EUR ... zurück") was missed by the keyword list,
+    # so refund_ask_in_text came back False and the D5d remap fired — the bot
+    # auto-cancelled and sent a plain trial-cancellation reply that never
+    # addressed the customer's explicit demand for their 9.99 EUR back. Two
+    # independent fixes must both hold here: the keyword gap is closed
+    # (_contains_amount_with_zurueck_demand) AND the remap has a second,
+    # independent guard (no stated amount+currency) — either alone would now
+    # stop this ticket from being mishandled.
+    @patch.object(main, "log_result")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(intent="REFUND_REQUEST", language="DE"))
+    @patch.object(main, "zendesk")
+    def test_180442_german_zurueck_demand_still_escalates(
+        self, mock_zd, mock_cls, mock_woo, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject='IQ Booster "Help Form"',
+            body=(
+                "Sehr geehrte Damen und Herren, ich finde es eine Frechheit "
+                "unbemerkt mir ein Abo unterzuschieben. Ich habe lediglich "
+                "einen online-IQ Test durchgeführt und für den Erhalt des "
+                "Ergebnisses und das Zertifikat 1,90 EUR per paypal gezahlt. "
+                "Kurz darauf kam die Abbuchung von 9,99 EUR !!! Wofür??? und "
+                "nun muss ich noch kündigen für einen Vertrag, den ich nie "
+                "abgeschlossen habe. Hiermit fordere ich die 9,99 EUR die "
+                "per paypal durch Sie abgebucht wurde zurück , sowie eine "
+                "Bestätigung über die Kündigung dieses merkwürdigen Abos"
+            ),
+        ))
+        result = main._process("180442")
+        assert result["status"] == "skipped_refund_request"
+        assert result["refund_ask_in_text"] is True
+        assert "cancel_remapped_from" not in result
+        mock_woo.cancel_subscription.assert_not_called()
+        mock_zd.post_reply.assert_not_called()
+
     # D6. Ukrainian "я не отримав результат" → escalate
     @patch.object(main, "log_result")
     @patch.object(main, "classify_ticket", return_value=_classification(language="UK"))
