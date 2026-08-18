@@ -146,7 +146,12 @@ class TestProcess:
     @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
     @patch.object(main, "zendesk")
     def test_unhandled_intent(self, mock_zd, mock_cls, mock_log):
-        _setup_zd(mock_zd)
+        # Explicit refund wording (not the default cancel-only body) — the
+        # 180292 fix now remaps a cancel-only REFUND_REQUEST to a real
+        # cancellation, so a genuine refund ask is needed to test the plain
+        # "REFUND_REQUEST always escalates" path here.
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Refund", body="Please refund my payment."))
         result = main._process("1002")
         assert result["status"] == "skipped_refund_request"
 
@@ -401,6 +406,59 @@ class TestProcess:
         assert result["status"] == "skipped_refund_request"
         assert "active payment dispute" in result["reason"]
         assert "dispute_remapped_from" not in result
+        mock_zd.post_reply.assert_not_called()
+
+    # D5d. #180292/#175987: classifier picks REFUND_REQUEST on an "I already
+    # cancelled but you're still charging me" complaint, but the customer's own
+    # text carries NO refund wording — only a cancel signal. Old behaviour left
+    # the subscription running (escalate-and-return, no WC call at all); the
+    # fix re-runs the real cancellation so it actually stops, while the AN-192
+    # refund note above still flags the money question for a human.
+    @patch.object(main, "log_result")
+    @patch.object(main, "validate_reply", return_value=(True, ""))
+    @patch.object(main, "generate_reply", return_value="Your subscription has been cancelled.")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(intent="REFUND_REQUEST", language="JA"))
+    @patch.object(main, "zendesk")
+    def test_refund_intent_with_cancel_only_text_is_remapped_to_cancellation(
+        self, mock_zd, mock_cls, mock_woo, mock_reply, mock_validate, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Re: charge",
+            body="7月21日に解約依頼しているのに何故本日利用料金の請求が来ているのか？",
+        ))
+        mock_woo.cancel_subscription.return_value = _woo_trial()
+        result = main._process("180292")
+        assert result["status"] == "success"
+        assert result["cancel_remapped_from"] == "REFUND_REQUEST"
+        assert result["intent"] == "TRIAL_CANCELLATION"
+        # The subscription must have actually been cancelled, not just noted.
+        mock_woo.cancel_subscription.assert_called_once()
+        # The refund/money question is still flagged for a human via a note —
+        # the fix does not silently drop it.
+        notes = [c.args[1] for c in mock_zd.add_internal_note.call_args_list]
+        assert any("re-running the cancellation" in n for n in notes), notes
+
+    # D5e. A GENUINE refund ask on a REFUND_REQUEST ticket must still escalate
+    # untouched — the remap only fires when there is NO refund wording at all.
+    @patch.object(main, "log_result")
+    @patch.object(main, "woo")
+    @patch.object(main, "classify_ticket",
+                  return_value=_classification(intent="REFUND_REQUEST", language="EN"))
+    @patch.object(main, "zendesk")
+    def test_refund_intent_with_real_refund_ask_still_escalates(
+        self, mock_zd, mock_cls, mock_woo, mock_log
+    ):
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Refund",
+            body="I cancelled my subscription in May but was still charged. "
+                 "Please refund the charge.",
+        ))
+        result = main._process("180293")
+        assert result["status"] == "skipped_refund_request"
+        assert "cancel_remapped_from" not in result
+        mock_woo.cancel_subscription.assert_not_called()
         mock_zd.post_reply.assert_not_called()
 
     # D6. Ukrainian "я не отримав результат" → escalate
@@ -1294,7 +1352,10 @@ class TestRefundWouldBe:
     @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
     @patch.object(main, "zendesk")
     def test_refund_intent_records_decision_and_still_skips(self, mock_zd, mock_cls, mock_log):
-        _setup_zd(mock_zd)
+        # Explicit refund wording — a cancel-only body now remaps to a real
+        # cancellation (see #180292 fix); this test targets the genuine-ask path.
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Refund", body="Please refund my payment."))
         result = main._process("an192_1")
         assert result["status"] == "skipped_refund_request"       # unchanged behaviour
         assert "refund_decision" in result                         # new signal recorded
@@ -1306,7 +1367,9 @@ class TestRefundWouldBe:
     @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
     @patch.object(main, "zendesk")
     def test_refunds_enabled_true_still_never_executes(self, mock_zd, mock_cls, mock_log):
-        _setup_zd(mock_zd)
+        # Explicit refund wording — see note in test_refund_intent_records_decision_and_still_skips.
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Refund", body="Please refund my payment."))
         with patch.object(main, "REFUNDS_ENABLED", True), \
              patch.object(main, "refund_client") as mock_refund_client:
             result = main._process("an192_2")
@@ -1319,7 +1382,9 @@ class TestRefundWouldBe:
     @patch.object(main, "classify_ticket", return_value=_classification(intent="REFUND_REQUEST"))
     @patch.object(main, "zendesk")
     def test_eval_exception_is_non_blocking(self, mock_zd, mock_cls, mock_log):
-        _setup_zd(mock_zd)
+        # Explicit refund wording — see note in test_refund_intent_records_decision_and_still_skips.
+        _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+            subject="Refund", body="Please refund my payment."))
         with patch.object(main, "_refund_would_be_eval", side_effect=RuntimeError("boom")):
             result = main._process("an192_3")
         assert result["status"] == "skipped_refund_request"        # unchanged despite error

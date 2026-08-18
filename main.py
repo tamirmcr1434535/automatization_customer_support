@@ -3435,14 +3435,46 @@ def _process(ticket_id: str) -> dict:
         except Exception as e:  # noqa: BLE001 — non-blocking, fail to the safe path
             log.warning(f"[{ticket_id}] refund would-be eval failed (non-blocking): {e}")
 
-        result["status"] = _refund_outcome_status(result)
-        result["reason"] = f"{intent} — refund intents always go to a human"
-        # Live-resolved refund already tagged atomically (see above) — a separate
-        # add_tag here races the atomic PUT's field-tags and can wipe them (#171200).
-        if not result.get("refund_reply_sent"):
-            zendesk.add_tag(ticket_id, "bot_handled")
-        log_result(result)
-        return result
+        # #180292: "I already asked to cancel on <date>, why was I charged again?"
+        # — the classifier reads this money-adjacent complaint as REFUND_REQUEST,
+        # but the customer never actually asked for a refund (no refund wording
+        # anywhere in their text) and the subscription is STILL RUNNING because a
+        # PRIOR cancel attempt silently failed. Escalating this straight to a
+        # human (the old behaviour) left the subscription active and charging
+        # every cycle until someone noticed — two more renewal charges landed
+        # before a human found and fixed it manually. When there's a genuine
+        # cancel signal and NO refund ask in the text, run the REAL cancellation
+        # now (same remap trick as _dispute_is_really_cancellation below) — the
+        # subscription stops charging immediately, and the AN-192 note above
+        # still tells a human to review whether a refund is owed for the
+        # already-failed cycle(s). A genuine refund ask (weak or strong) still
+        # escalates untouched below — money decisions stay human.
+        if not result["refund_ask_in_text"] and _contains_cancel_signal(_customer_text_only):
+            log.info(
+                f"[{ticket_id}] {intent}: no refund ask, but customer wants the "
+                f"subscription actually stopped (already-cancelled / cancel-now "
+                f"wording) — running a real cancellation instead of only escalating"
+            )
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: customer says they already asked to cancel and is still "
+                f"being charged — re-running the cancellation now so the "
+                f"subscription actually stops. See the note above for the refund "
+                f"side (still needs a human decision).",
+            )
+            result["cancel_remapped_from"] = intent
+            intent = "TRIAL_CANCELLATION"  # neutral cancel; _resolve_intent fixes the type
+            result["intent"] = intent
+            # fall through to the normal cancellation flow below — do NOT return
+        else:
+            result["status"] = _refund_outcome_status(result)
+            result["reason"] = f"{intent} — refund intents always go to a human"
+            # Live-resolved refund already tagged atomically (see above) — a separate
+            # add_tag here races the atomic PUT's field-tags and can wipe them (#171200).
+            if not result.get("refund_reply_sent"):
+                zendesk.add_tag(ticket_id, "bot_handled")
+            log_result(result)
+            return result
 
     # ── LEGACY CARD DIGITS CLEANUP ──────────────────────────────────── #
     # ── Legacy card-digits tickets — hard escalate, NO customer reply ──── #
