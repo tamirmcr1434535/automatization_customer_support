@@ -99,6 +99,14 @@ SCHEMA = [
     bigquery.SchemaField("refund_sum",       "STRING"),   # Refund Sum field: "5490" or multi "199+1990" (approved only)
     bigquery.SchemaField("country",          "STRING"),   # Country field value we set (best-effort)
 
+    # Payment-gateway desync (#147892): WooCommerce said the subscription was
+    # cancelled but Stripe was still going to bill it. Logged so we can measure
+    # how often WC and the gateway disagree — the incident was found by hand,
+    # two months and two wrong charges late.
+    bigquery.SchemaField("stripe_leftover_cancelled", "BOOLEAN"),   # desync found + Stripe sub cancelled
+    bigquery.SchemaField("stripe_leftover_subscription_id", "STRING"),
+    bigquery.SchemaField("stripe_leftover_cancel_failed", "BOOLEAN"),  # desync found but cancel FAILED → human
+
     # Error info
     bigquery.SchemaField("error",            "STRING"),
 
@@ -262,6 +270,11 @@ def log_result(result: dict):
             "refund_status":      result.get("refund_status") or "",
             "refund_sum":         result.get("refund_sum") or "",
             "country":            result.get("country") or "",
+
+            # Payment-gateway desync (#147892)
+            "stripe_leftover_cancelled": bool(result.get("stripe_leftover_cancelled", False)),
+            "stripe_leftover_subscription_id": result.get("stripe_leftover_subscription_id") or "",
+            "stripe_leftover_cancel_failed": bool(result.get("stripe_leftover_cancel_failed", False)),
 
             # Error
             "error":              result.get("error") or "",
