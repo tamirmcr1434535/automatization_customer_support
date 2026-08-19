@@ -4160,6 +4160,32 @@ def _process(ticket_id: str) -> dict:
         result["intent"] = intent
         log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
 
+    # ── Payment-gateway safety net (#147892) ──────────────────────────── #
+    # WooCommerce reporting "cancelled" does NOT prove the money actually
+    # stopped: the WC subscription record and the Stripe subscription object
+    # can desync — WC cancels locally (and answers our PUT with
+    # status=cancelled, so the sanity check in _cancel_sub_by_id passes) while
+    # the Stripe subscription keeps renewing on its own schedule.
+    #
+    # Live incident #147892: bot cancelled WC sub #3522734 on 2026-06-23 and
+    # told the customer "no further charges will be made"; Stripe then charged
+    # 5490 JPY on 2026-07-12 AND again on 2026-08-09 (provider=Stripe, host
+    # jap.wwiqtest.com). A human found it two months later and had to refund
+    # both cycles. The bot never looked at Stripe because that lookup only runs
+    # as a FALLBACK when WC finds nothing.
+    #
+    # The reply we are about to send promises no further charges, so verify
+    # that promise before making it: if Stripe still has an active/trialing
+    # subscription for this customer, cancel it too (same graceful
+    # cancel_at_period_end the Stripe path already uses, which matches the
+    # reply's "you keep access until the paid period ends" wording).
+    #
+    # Strictly additive and fail-open: any error here is logged and ignored,
+    # leaving the pre-existing behaviour exactly as it was.
+    _cancel_leftover_stripe_sub(
+        ticket_id, cancel_result.get("email") or email, cancel_result, result
+    )
+
     # 9. Found → generate reply, tag, solve
     # (order count gate is inside _finish_cancellation — covers all paths)
     return _finish_cancellation(ticket_id, name, language, intent, cancel_result, result)
@@ -4338,6 +4364,97 @@ def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
         return "SUB_CANCELLATION"
     # Fallback: use whatever the text classifier said
     return text_intent
+
+
+def _cancel_leftover_stripe_sub(
+    ticket_id: str, email: str, cancel_result: dict, result: dict
+) -> None:
+    """After WooCommerce reports the subscription cancelled, make sure Stripe
+    isn't still billing it (#147892 — see the call site for the incident).
+
+    WC and the gateway can desync, and the customer is about to be told "no
+    further charges will be made". If Stripe still holds an active/trialing
+    subscription for this customer, cancel it too and record what happened on
+    the ticket + in `result` (BQ) so a human can audit it — a customer with a
+    genuinely separate second subscription would show up here too, and the note
+    is what lets support spot that case.
+
+    Never raises: on any error the WC cancellation stands exactly as before."""
+    if not email:
+        return
+    try:
+        found = stripe_cli.find_active_subscription(email)   # READ-ONLY
+    except Exception as e:  # noqa: BLE001 — safety net must never break the flow
+        log.warning(f"[{ticket_id}] Stripe leftover check failed (non-blocking): {e}")
+        return
+
+    status = (found or {}).get("status", "")
+    # Healthy cases — the gateway agrees with WooCommerce:
+    #   not_found      → no Stripe customer at all
+    #   no_active_sub  → nothing live, or everything live is already scheduled
+    #                    to end (cancel_at_period_end — a gracefully cancelled
+    #                    Stripe sub STAYS status=active until the period ends,
+    #                    which is exactly why we check that flag and not status)
+    if status in ("not_found", "no_active_sub"):
+        return
+    if status == "error":
+        log.warning(
+            f"[{ticket_id}] Stripe leftover check errored for {email}: "
+            f"{str((found or {}).get('error', ''))[:200]}"
+        )
+        return
+
+    # status == "billing": a subscription that will KEEP renewing, even though
+    # WooCommerce just said the customer is cancelled. Cancel that exact one.
+    stripe_sub_id = (found or {}).get("subscription_id", "")
+    try:
+        cancelled = stripe_cli.cancel_subscription_by_id(stripe_sub_id)
+    except Exception as e:  # noqa: BLE001
+        log.warning(f"[{ticket_id}] Stripe leftover cancel failed (non-blocking): {e}")
+        return
+    if (cancelled or {}).get("status") == "error":
+        log.error(
+            f"[{ticket_id}] GATEWAY DESYNC but Stripe cancel FAILED for "
+            f"{stripe_sub_id} — customer may keep being charged"
+        )
+        try:
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖🚨 WooCommerce reported the subscription cancelled, but Stripe "
+                f"still has an ACTIVE subscription ({stripe_sub_id}) for {email} "
+                f"that will keep charging — and the bot could NOT cancel it "
+                f"({str((cancelled or {}).get('error', ''))[:200]}). The customer "
+                f"has been told there will be no further charges. Please cancel it "
+                f"in Stripe manually.",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        result["stripe_leftover_cancel_failed"] = True
+        return
+
+    result["stripe_leftover_cancelled"] = True
+    result["stripe_leftover_subscription_id"] = stripe_sub_id
+    log.warning(
+        f"[{ticket_id}] GATEWAY DESYNC: WC reported the subscription cancelled "
+        f"(#{cancel_result.get('subscription_id')}) but Stripe still had an "
+        f"active/trialing subscription ({stripe_sub_id}) for {email} — "
+        f"cancelled it too so the 'no further charges' promise holds"
+    )
+    try:
+        zendesk.add_internal_note(
+            ticket_id,
+            f"🤖⚠️ Gateway desync caught: WooCommerce reported subscription "
+            f"#{cancel_result.get('subscription_id')} as cancelled, but Stripe "
+            f"still had an ACTIVE subscription ({stripe_sub_id}) for {email}. "
+            f"The bot cancelled the Stripe one as well, so billing really stops "
+            f"(this is the #147892 failure mode: WC cancelled, Stripe kept "
+            f"charging for two more months).\n\n"
+            f"If this customer intentionally had a SECOND, separate "
+            f"subscription, please re-activate it — the bot cannot tell the two "
+            f"cases apart.",
+        )
+    except Exception as e:  # noqa: BLE001 — note is best-effort
+        log.warning(f"[{ticket_id}] gateway-desync note failed: {e}")
 
 
 def _finish_cancellation(

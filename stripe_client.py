@@ -31,6 +31,80 @@ class StripeClient:
         customer = customers.data[0]
         return self._cancel_customer_sub(customer.id, email)
 
+    def find_active_subscription(self, email: str) -> dict:
+        """READ-ONLY: is this customer still on the hook for future charges?
+
+        Distinct from cancel_subscription() in that it cancels nothing AND it
+        reports `cancel_at_period_end`. That flag is the whole point: a Stripe
+        subscription that has been cancelled gracefully stays status="active"
+        until the period actually ends, so "status == active" alone does NOT
+        mean billing will continue — only `cancel_at_period_end is False` does.
+
+        Returns:
+          {"status": "billing", subscription_id, subscription_status, plan}
+              — a live sub that WILL renew (no cancellation scheduled)
+          {"status": "cancel_scheduled", ...}  — live but already set to end
+          {"status": "no_active_sub"}          — nothing active/trialing
+          {"status": "not_found"}              — no such Stripe customer
+          {"status": "error", "error": ...}    — lookup failed
+        """
+        try:
+            customers = stripe_lib.Customer.list(email=email, limit=1)
+        except stripe_lib.error.StripeError as e:
+            log.warning(f"Stripe find_active_subscription({email}) failed: {e}")
+            return {"status": "error", "email": email, "error": str(e)}
+
+        if not customers.data:
+            return {"status": "not_found", "email": email}
+
+        customer_id = customers.data[0].id
+        for status in ("trialing", "active"):
+            try:
+                subs = stripe_lib.Subscription.list(
+                    customer=customer_id, status=status, limit=5
+                )
+            except stripe_lib.error.StripeError as e:
+                log.warning(f"Stripe subscription list failed for {customer_id}: {e}")
+                return {"status": "error", "email": email, "error": str(e)}
+
+            for sub in subs.data:
+                if sub.get("cancel_at_period_end"):
+                    continue  # already winding down — gateway agrees with WC
+                plan = ""
+                if sub.items and sub.items.data:
+                    plan = sub.items.data[0].price.nickname or ""
+                return {
+                    "status": "billing",
+                    "email": email,
+                    "customer_id": customer_id,
+                    "subscription_id": sub.id,
+                    "subscription_status": status,
+                    "plan": plan,
+                }
+
+        # Everything live is already scheduled to end (or there is nothing live).
+        return {"status": "no_active_sub", "email": email, "customer_id": customer_id}
+
+    def cancel_subscription_by_id(self, subscription_id: str) -> dict:
+        """Cancel one specific Stripe subscription (graceful — at period end).
+
+        Targeted counterpart to cancel_subscription(email): the caller has
+        already identified WHICH subscription is still billing, so we do not
+        re-run an email lookup that could pick a different one."""
+        if self.dry_run:
+            log.info(f"[DRY] Would cancel Stripe subscription {subscription_id}")
+            return {"status": "dry_run", "subscription_id": subscription_id,
+                    "cancelled": True}
+        try:
+            stripe_lib.Subscription.modify(subscription_id, cancel_at_period_end=True)
+        except stripe_lib.error.StripeError as e:
+            log.error(f"Stripe cancel_subscription_by_id({subscription_id}) failed: {e}")
+            return {"status": "error", "subscription_id": subscription_id,
+                    "cancelled": False, "error": str(e)}
+        log.info(f"Stripe: cancelled subscription {subscription_id} (at period end)")
+        return {"status": "cancelled", "subscription_id": subscription_id,
+                "cancelled": True}
+
     def find_email_by_last4(self, last4: str) -> str | None:
         """
         Look up the customer email associated with a card ending in last4.
