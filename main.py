@@ -2458,6 +2458,7 @@ _SHADOW_STATUS_TO_TAG = {
     "escalated_delete_account":     "shadow_would_escalate",
     "escalated_explanation_question":"shadow_would_escalate",
     "escalated_no_results_received":"shadow_would_escalate",
+    "escalated_charged_after_cancelling": "shadow_would_escalate",
     "skipped_refund_request":       "shadow_would_skip_refund",
     "success_refund_approved":      "shadow_would_refund_approve",
     "success_refund_denied":        "shadow_would_refund_deny",
@@ -2794,9 +2795,24 @@ def _process(ticket_id: str) -> dict:
         "regarding my previous request",
     ]
     body_lower_early = body.lower()
-    if any(sig in body_lower_early for sig in _FOLLOWUP_SIGNALS):
+    # The phrase list above only matches ENGLISH — Zendesk localises the
+    # "follow-up to your previous request" preamble, so a JP/NL/DE/KR customer
+    # replying to a closed ticket slipped straight past it (#182034: the JP
+    # preamble is 「…に対する補足コメントです」). Zendesk already tells us
+    # structurally via `via_followup_source_id` / `via.source.rel`, which is
+    # language-independent — `is_followup` (computed above) is that check.
+    #
+    # Until now that flag was used ONLY to bypass the inherited-tag idempotency
+    # guards, i.e. to make the bot process follow-ups — the exact opposite of
+    # the agreed policy (Anna: follow-ups are an agent's, not the bot's). On
+    # #182034 the customer asked "when does my cancellation take effect and why
+    # was August charged?"; the bot cancelled again and sent a generic
+    # confirmation that answered neither question, and the satisfaction survey
+    # came back negative.
+    if is_followup or any(sig in body_lower_early for sig in _FOLLOWUP_SIGNALS):
         log.info(
-            f"[{ticket_id}] Follow-up ticket detected (references previous request) "
+            f"[{ticket_id}] Follow-up ticket detected "
+            f"({'zendesk follow-up flag' if is_followup else 'references previous request'}) "
             "→ skipping, sending Slack alert for manual review"
         )
         zendesk.add_tag(ticket_id, "bot_handled")  # block parallel webhook
@@ -3383,6 +3399,21 @@ def _process(ticket_id: str) -> dict:
         log_result(result)
         return result
 
+    # ── "I already cancelled and you are STILL charging me" ──────────────── #
+    # Flagged here (where the full customer text is assembled) and acted on
+    # after the cancellation succeeds — see _finish_cancellation. The bot still
+    # cancels, because leaving the subscription live is how #147892 turned into
+    # two months of wrong charges; what changes is that the customer does NOT
+    # get the stock "cancelled, no further charges" note, which answers neither
+    # "why was I charged after I cancelled?" nor "do I get that money back?".
+    # (Anna on #181704/#182034: a payment question belongs to an agent.)
+    if _is_charged_after_cancelling(_customer_text_only):
+        result["charged_after_cancelling"] = True
+        log.info(
+            f"[{ticket_id}] customer reports charges AFTER a previous "
+            f"cancellation — will cancel, then hand the billing question to a human"
+        )
+
     # ── REFUND / PAYMENT DISPUTE intents ─────────────────────────────────── #
     #
     # Policy: CANCELLATION IS ALWAYS THE PRIORITY.
@@ -3880,7 +3911,13 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, f"wc_{error_kind}")
         if intent == "SUB_RENEWAL_CANCELLATION":
             zendesk.add_tag(ticket_id, "sub_renewal_cancellation")
-        _set_country_for_ticket(ticket_id, cancel_result.get("country", ""))
+        # Same language fallback + BQ recording as the success path (#181924).
+        _country_for_ticket = (
+            cancel_result.get("country") or _country_from_lang(language)
+        )
+        _set_country_for_ticket(ticket_id, _country_for_ticket)
+        if _country_for_ticket:
+            result["country"] = _country_field_value(_country_for_ticket)
 
         sub_info_human = ""
         if wc_sub_id is not None or wc_sub_type or wc_order_count is not None:
@@ -4481,6 +4518,57 @@ def _finish_cancellation(
     result["subscription_type"] = cancel_result.get("subscription_type", "")
     result["order_count"] = cancel_result.get("order_count")
 
+    # ── Charged after a previous cancellation → agent answers, not the bot ─ #
+    # The subscription HAS been cancelled by now (that part is not negotiable —
+    # see #147892), but the customer's actual question is about money already
+    # taken. The stock confirmation would say "no further charges will be made"
+    # and stop there, which is why #182034's satisfaction survey came back
+    # negative. Hand it to a human with the cancellation already done.
+    if result.get("charged_after_cancelling"):
+        log.info(
+            f"[{ticket_id}] cancelled, but the customer reports charges after a "
+            f"previous cancellation → escalating the billing question (no auto-reply)"
+        )
+        zendesk.add_tag(ticket_id, "bot_handled")
+        zendesk.add_tag(ticket_id, "needs_manual_review")
+        _set_topic_for_intent(ticket_id, intent)
+        _country_for_ticket = (
+            cancel_result.get("country") or _country_from_lang(language)
+        )
+        _set_country_for_ticket(ticket_id, _country_for_ticket)
+        if _country_for_ticket:
+            result["country"] = _country_field_value(_country_for_ticket)
+        try:
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Subscription CANCELLED "
+                f"(#{cancel_result.get('subscription_id')}, "
+                f"{cancel_result.get('subscription_type') or 'unknown type'}, "
+                f"source={cancel_result.get('source') or 'woocommerce'}) — but the "
+                f"bot did NOT reply.\n\n"
+                f"The customer says they had ALREADY cancelled and were charged "
+                f"anyway, so the real question is about money already taken "
+                f"(refund / explanation), which the standard cancellation "
+                f"confirmation does not answer. Billing is stopped; please answer "
+                f"the payment question and decide on a refund.",
+            )
+            result["cancel_note_added"] = True
+        except Exception as e:  # noqa: BLE001 — note is best-effort
+            log.warning(f"[{ticket_id}] charged-after-cancel note failed: {e}")
+        # No customer reply → leave the ticket NEW so it stays in the agent
+        # queue and does not count against reply-rate (Anna 2026-08-05).
+        result.update({
+            "status": "escalated_charged_after_cancelling",
+            "action": "cancelled_then_escalated_billing_question",
+            "cancel_outcome": "success",
+            "reason": (
+                "Subscription cancelled, but the customer reports being charged "
+                "after a previous cancellation — the billing question needs a human."
+            ),
+        })
+        log_result(result)
+        return result
+
     reply_text = generate_reply(
         intent=intent,
         language=language,
@@ -4584,7 +4672,22 @@ def _finish_cancellation(
         zendesk_step = "set_topic"
         _set_topic_for_intent(ticket_id, intent)
         zendesk_step = "set_country"
-        _set_country_for_ticket(ticket_id, cancel_result.get("country", ""))
+        # WooCommerce is the primary source, but plenty of accounts have no
+        # country on file at all (#181924: a Korean customer, WC country empty,
+        # so the field stayed blank and Anna filled it by hand). Fall back to
+        # the customer's language the same way the refund path already does —
+        # `_country_from_lang` only maps unambiguous languages (KR→kr, JP→jp…)
+        # and deliberately returns "" for EN, so this never guesses.
+        _country_for_ticket = (
+            cancel_result.get("country") or _country_from_lang(language)
+        )
+        _set_country_for_ticket(ticket_id, _country_for_ticket)
+        # Record it for BigQuery too. Until now only the refund path did this,
+        # so every cancellation logged country="" even when the Zendesk field
+        # was set correctly — the report could not see cancellation countries
+        # at all.
+        if _country_for_ticket:
+            result["country"] = _country_field_value(_country_for_ticket)
         # Audit note BEFORE solve so it shows up on the closed ticket.
         zendesk_step = "add_internal_note"
         zendesk.add_internal_note(ticket_id, audit_note)
@@ -6130,3 +6233,76 @@ def _contains_login_problem(text: str) -> bool:
     if not text:
         return False
     return any(rx.search(text) for rx in _LOGIN_PROBLEM_RE)
+
+
+# ── "I already cancelled and you are STILL charging me" ──────────────────── #
+# A cancellation-intent ticket that is really a billing complaint: money was
+# taken AFTER the customer believes they cancelled. The bot used to answer it
+# with the standard "your subscription is cancelled, no further charges" note —
+# which is not what was asked and leaves the money already taken unaddressed
+# (#181704 NL: "Ik heb direct mijn abonnement beëindigd, maar er wordt nog
+# steeds geld afgeschreven"; #182034 JP, whose satisfaction survey came back
+# negative about exactly this).
+#
+# Deliberately requires BOTH halves — a past cancellation AND an ongoing//past
+# charge complaint. A plain "please cancel my subscription" has neither, so
+# ordinary cancellations keep their instant confirmation.
+_ALREADY_CANCELLED_PHRASES = [
+    # EN
+    "already cancel", "already canceled", "already cancelled",
+    "i cancelled", "i canceled", "i have cancelled", "i have canceled",
+    "cancelled my subscription", "canceled my subscription",
+    "cancelled it", "canceled it",
+    # NL (#181704)
+    "abonnement beëindigd", "abonnement beeindigd", "al opgezegd",
+    "heb opgezegd", "heb geannuleerd", "al geannuleerd",
+    # DE
+    "bereits gekündigt", "schon gekündigt", "habe gekündigt",
+    # JP
+    "解約したはず", "解約済み", "解約手続き", "解約依頼", "解約したのに",
+    "キャンセルしたのに", "解約しました",
+    # KR
+    "해지했", "해지 했", "취소했", "구독을 해지",
+    # FR / ES / PT / IT
+    "déjà annulé", "deja annule", "j'ai annulé",
+    "ya cancelé", "ya cancele", "he cancelado",
+    "já cancelei", "ja cancelei", "cancelei a assinatura",
+    "ho già annullato", "ho gia annullato",
+]
+
+_STILL_CHARGED_PHRASES = [
+    # EN
+    "still being charged", "still charged", "still charging",
+    "still taking money", "still taking payment", "keep charging",
+    "keeps charging", "charged again", "charged me again",
+    "money is still", "another charge", "still debited",
+    # NL (#181704)
+    "nog steeds geld afgeschreven", "nog steeds afgeschreven",
+    "wordt nog steeds geld", "blijft afschrijven", "toch afgeschreven",
+    # DE
+    "trotzdem abgebucht", "weiter abgebucht", "wird immer noch abgebucht",
+    "erneut abgebucht",
+    # JP
+    "引き落とされ", "引き落としがされ", "請求されて", "課金され",
+    "引き落としが続", "まだ請求",
+    # KR
+    "계속 결제", "또 결제", "여전히 결제", "결제가 되었",
+    # FR / ES / PT / IT
+    "toujours prélevé", "encore prélevé", "continue à prélever",
+    "sigue cobrando", "siguen cobrando", "me siguen cobrando",
+    "ainda cobrando", "continuam a cobrar",
+    "continua ad addebitare", "ancora addebitato",
+]
+
+
+def _is_charged_after_cancelling(text: str) -> bool:
+    """True when the customer says they ALREADY cancelled AND are STILL being
+    charged — a billing complaint wearing a cancellation's clothes.
+
+    Both halves are required, so an ordinary "please cancel my subscription"
+    (or a plain "I was charged, what is this?") does not match."""
+    if not text:
+        return False
+    t = text.lower()
+    return (any(p in t for p in _ALREADY_CANCELLED_PHRASES)
+            and any(p in t for p in _STILL_CHARGED_PHRASES))
