@@ -2313,6 +2313,12 @@ def zendesk_webhook(request):
 
     log.info(f"[{ticket_id}] Webhook received")
 
+    # Stamp the arrival time so the public-reply pacing delay
+    # (PUBLIC_REPLY_DELAY_SEC) can be measured as "N seconds since the
+    # customer wrote" rather than "N seconds on top of however long the
+    # classifier took". See ZendeskClient._hold_public_reply.
+    zendesk.begin_request()
+
     # ── Webhook deduplication (ALL modes) ─────────────────────────────── #
     # Zendesk fires 5-15 webhooks per ticket (creation, agent reply, tag
     # change, status change — EACH triggers a new webhook).

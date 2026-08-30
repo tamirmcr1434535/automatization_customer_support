@@ -1,8 +1,58 @@
 import logging
+import os
+import random
+import threading
 import time
 import requests
 
 log = logging.getLogger("zendesk")
+
+# ── Human-pacing delay before PUBLIC replies ──────────────────────────── #
+# Anna, 2026-08-27: the bot answers inside the same minute the customer
+# writes. That reads as a machine, and an instant auto-reply is a known
+# spam-filter signal — customers report "you never answered" while the
+# reply sits in their spam folder.
+#
+# Only what the CUSTOMER sees is held back. Internal notes, tags, status
+# changes, the Slack card and — crucially — the WooCommerce cancellation
+# and the Stripe refund all still happen immediately. We delay the letter,
+# never the action.
+#
+# The knob is a DEADLINE, not a raw sleep. The bot already spends 30-120s
+# classifying (plus MESSAGING_CLASSIFY_DELAY_SEC=45s on messaging tickets),
+# so we sleep only the REMAINDER of PUBLIC_REPLY_DELAY_SEC counted from the
+# moment the webhook arrived. Raising the knob from 60 to 180 therefore
+# means "answer ~3 min after the customer wrote", not "add 3 min on top of
+# whatever we already spent".
+#
+# Default 0 = today's behaviour, so shipping this code alone changes
+# nothing until the env var is set on the Cloud Run service.
+_DELAY_ENV = "PUBLIC_REPLY_DELAY_SEC"
+_JITTER_ENV = "PUBLIC_REPLY_DELAY_JITTER_SEC"
+
+# The ZendeskClient is a module-level singleton shared by up to 80
+# concurrent requests per Cloud Run instance, so the per-request clock must
+# NOT live on the instance. functions-framework serves each request on its
+# own thread, so thread-local is the right scope.
+_request_clock = threading.local()
+
+
+def _delay_env_seconds(name: str) -> float:
+    """Read one delay knob from the environment, clamped to >= 0.
+
+    Read at call time rather than import time so tests can monkeypatch it
+    and so operators can retune the pacing with a plain
+    `gcloud run services update --set-env-vars` — no code change, no
+    redeploy of the image.
+    """
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        log.warning(f"{name}={raw!r} is not a number — ignoring, no delay applied")
+        return 0.0
 
 # Retry config for 429 rate-limit responses
 _MAX_RETRIES = 3
@@ -52,6 +102,49 @@ class ZendeskClient:
             log.info("ZendeskClient: SHADOW_MODE — tags allowed, replies/status blocked")
         elif dry_run:
             log.info("ZendeskClient: DRY_RUN — no writes")
+
+    @staticmethod
+    def begin_request() -> None:
+        """Stamp the arrival time of the current webhook.
+
+        Called once at the top of the HTTP handler. `_hold_public_reply`
+        measures the customer-visible response time from this stamp, so
+        time already spent classifying counts toward the delay instead of
+        stacking on top of it.
+        """
+        _request_clock.t0 = time.monotonic()
+
+    def _hold_public_reply(self, ticket_id: str) -> float:
+        """Sleep until the ticket is PUBLIC_REPLY_DELAY_SEC old, then return.
+
+        Returns the number of seconds actually slept (0 when the knob is
+        unset or the pipeline already took longer than the target).
+        """
+        target = _delay_env_seconds(_DELAY_ENV)
+        if target <= 0:
+            return 0.0
+
+        jitter = _delay_env_seconds(_JITTER_ENV)
+        if jitter > 0:
+            # A constant 180s on every single ticket is its own tell.
+            target += random.uniform(0.0, jitter)
+
+        t0 = getattr(_request_clock, "t0", None)
+        elapsed = (time.monotonic() - t0) if t0 is not None else 0.0
+        wait = target - elapsed
+        if wait <= 0:
+            log.info(
+                f"[{ticket_id}] Public-reply pacing: already {elapsed:.0f}s since "
+                f"webhook (target {target:.0f}s) — replying now"
+            )
+            return 0.0
+
+        log.info(
+            f"[{ticket_id}] Public-reply pacing: holding {wait:.0f}s "
+            f"({elapsed:.0f}s already spent, target {target:.0f}s since webhook)"
+        )
+        time.sleep(wait)
+        return wait
 
     def _request_with_retry(
         self, method: str, url: str, accept_statuses: set[int] | None = None, **kwargs
@@ -282,6 +375,8 @@ class ZendeskClient:
         if self.dry_run:
             log.info(f"[DRY] reply → #{ticket_id}: {body[:120]}...")
             return
+        self._hold_public_reply(ticket_id)
+
         self._request_with_retry(
             "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {"comment": {"body": body, "public": True}}},
@@ -299,6 +394,8 @@ class ZendeskClient:
         if self.dry_run:
             log.info(f"[DRY] reply+pending → #{ticket_id}: {body[:120]}...")
             return
+        self._hold_public_reply(ticket_id)
+
         self._request_with_retry(
             "PUT", f"{self.base}/tickets/{ticket_id}.json",
             json={"ticket": {
@@ -430,6 +527,8 @@ class ZendeskClient:
         if self.dry_run:
             log.info(f"[DRY] reply+solve+fields → #{ticket_id}: fields={entries} tags={tags}")
             return
+        self._hold_public_reply(ticket_id)
+
         ticket = {"status": "solved", "comment": {"body": body, "public": True}}
         if entries:
             ticket["custom_fields"] = entries
