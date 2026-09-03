@@ -822,7 +822,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
     Never moves money. Caller wraps this in try/except (strictly additive).
 
-    `ticket_text` = subject + body (informational amount logging).
+    `ticket_text` = subject + body from the caller; widened here with every public
+    customer comment before the engine sees it (see below).
     `country` = billing country if known (else engine uses language as proxy).
     `as_of_date` = ISO date the refund window is measured from (ticket created)."""
     nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
@@ -836,6 +837,34 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
 
     def _has_charges(d):
         return bool(d and isinstance(d.get("charges"), list) and d.get("charges"))
+
+    # ── The engine has to read everything the customer wrote ────────────── #
+    # All three call sites hand us `subject + body`. `body` is the Zendesk
+    # description — the FIRST comment, which never changes — so anything the
+    # customer said afterwards was invisible to the engine: `parse_stated_amounts`,
+    # `_route_by_date` and `_route_by_type_keyword` all ran on an opening line
+    # only. On a live-chat / messaging ticket the description is empty by design,
+    # so routing ran on a subject alone.
+    #
+    # Meanwhile `refund_ask_in_text` in _process was already computed over subject
+    # + body + every customer comment, and the suppression guards compare against
+    # it — so the flow could suppress a reply for a demand it had read while the
+    # engine had routed without it. Same text for both, now.
+    #
+    # A ticket that says nothing useful up front and names the charge in the
+    # second comment is exactly the population that falls through to the
+    # heuristic/LLM route and is then suppressed for having been routed by
+    # heuristic. One fetch, reused by the alt-email retry below; best-effort, so
+    # a Zendesk hiccup leaves the old subject+body behaviour untouched.
+    _customer_comments = ""
+    try:
+        _cc = zendesk.get_all_customer_comments_text(ticket_id)
+        if isinstance(_cc, str) and _cc.strip():
+            _customer_comments = _cc
+    except Exception as e:  # noqa: BLE001 — additive widening; never blocks the eval
+        log.warning(f"[{ticket_id}] refund eval: comment widening failed (non-blocking): {e}")
+    if _customer_comments:
+        ticket_text = f"{ticket_text or ''}\n{_customer_comments}".strip()
 
     if nexus_available:
         try:
@@ -863,14 +892,9 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             # existed under that email. (3-day audit 2026-07-27: 7 of 25 genuine
             # NOT_FOUND misses had the charge under an email present only in a
             # comment.) Same source the cancel flow already searches; best-effort.
-            _alt_text = ticket_text or ""
-            try:
-                _cc = zendesk.get_all_customer_comments_text(ticket_id)
-                if isinstance(_cc, str) and _cc:
-                    _alt_text = f"{_alt_text}\n{_cc}"
-            except Exception:  # noqa: BLE001 — best-effort widening; never blocks
-                pass
-            for alt in _extract_emails(_alt_text, exclude=email)[:3]:
+            # `ticket_text` already carries every customer comment (widened at the
+            # top of this function), which is where the paying email usually is.
+            for alt in _extract_emails(ticket_text or "", exclude=email)[:3]:
                 try:
                     alt_data = nexus_client.search_subscription(alt)
                 except Exception as e:  # noqa: BLE001
