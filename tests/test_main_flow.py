@@ -2205,6 +2205,13 @@ def test_llm_disambiguated_refund_not_auto_executed():
     assert "refund_draft_reply" not in result                      # suppressed → no draft
     rcm.create_refund.assert_not_called()                          # no auto money move
     zd.post_reply.assert_not_called()                              # no auto approve reply
+    # TRIPWIRE. Guard 2b runs before any draft is built, so the OLDER execution
+    # gate (`skipped_llm_disambiguated`) is dead code — it has never fired in
+    # production, and that string does not appear once in the log's history.
+    # If this assertion starts failing, Guard 2b was relaxed and that gate just
+    # became the only thing between an LLM-resolved route and real money, with
+    # its precision still unmeasured. Relax the two together, on purpose.
+    assert "refund_execution_status" not in result
 
 
 def test_refund_explanation_question_uses_explained_template():

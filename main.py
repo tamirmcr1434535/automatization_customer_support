@@ -1298,14 +1298,49 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         log.warning(f"[{ticket_id}] refund NOT executed — no x-host resolved "
                                     f"for brand={brand!r}; leaving to a human")
                     elif _routed_by_llm:
-                        # The flow was only resolvable by the LLM disambiguator on an
-                        # AMBIGUOUS residual (no clear amount/date/type signal). This is
-                        # the lowest-confidence routing path and must NOT auto-move money:
-                        # in the 2026-07-28 backtest every llm-disambiguated approve was a
-                        # false positive (human did not refund). Draft + leave to a human.
+                        # UNREACHABLE TODAY — and the tripwire for the decision that
+                        # would make it reachable. Read this before relaxing Guard 2b.
+                        #
+                        # Written 2026-07-28 (9f528e2) citing a same-day backtest in
+                        # which "every llm-disambiguated approve was a false positive".
+                        # That justification does not survive checking:
+                        #
+                        #  • The backtest left no artifact — no script, no sample frame,
+                        #    no n, no labels anywhere in the repo or its history. Human
+                        #    refund outcomes live in Zendesk tags and have never been
+                        #    joined to the bot log, so the claim is not reproducible.
+                        #  • Guard 2b landed ONE DAY later (bbd713e, 2026-07-29) and
+                        #    suppresses before any draft is built, so this branch has
+                        #    never run in production: `skipped_llm_disambiguated` does
+                        #    not appear once in the log's history, and of 649
+                        #    llm_disambiguated rows the 38 that reached a draft are all
+                        #    from 2026-07-27..29, with zero executions.
+                        #    It is unreachable structurally, not by luck: the marker is
+                        #    only set on the AMBIGUOUS_FLOW re-run, AMBIGUOUS_FLOW needs
+                        #    two charge-type groups present with a subscription among
+                        #    them, so a cross_sale/first_sale always exists and
+                        #    _has_cross_or_first is always True.
+                        #  • "Lowest-confidence routing path" describes a risk the code
+                        #    does not take. The disambiguator's pick selects the TYPE
+                        #    GROUP only (refund_engine route E0); the charge is then
+                        #    re-derived as max(date) over subscriptions — the same
+                        #    selector every hard route uses. Measured agreement between
+                        #    the LLM's pick and the charge actually targeted: 291/293.
+                        #  • dispute_target_subscription carries the identical routing
+                        #    risk with no LLM at all, and is NOT gated here.
+                        #
+                        # Kept anyway, because deleting it would ship an unearned
+                        # change: the moment Guard 2b is relaxed this becomes the only
+                        # thing standing between an LLM-resolved route and real money,
+                        # and its precision has still never been measured. So relax
+                        # Guard 2b and this branch together, deliberately, after the
+                        # labelling study — not one by accident.
                         result["refund_execution_status"] = "skipped_llm_disambiguated"
                         log.warning(f"[{ticket_id}] refund NOT executed — flow resolved via "
-                                    f"LLM disambiguation (low confidence); leaving to a human")
+                                    f"LLM disambiguation; leaving to a human. NOTE: this "
+                                    f"branch was unreachable behind Guard 2b — if you are "
+                                    f"seeing it, Guard 2b changed and its precision is "
+                                    f"still unmeasured")
                     else:
                         # Abuse / velocity guard — protects against VOLUME (mass in-window
                         # refund farming, repeat-customer abuse, runaway execution). Checks
@@ -1411,8 +1446,13 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         _guard_note = ("🤖 Auto-refund not processed — brand/x-host could not be "
                                        "resolved for the refund API. Please handle manually.")
                     elif _exec == "skipped_llm_disambiguated":
-                        _guard_note = ("🤖 Auto-refund not processed — refund target was low-confidence "
-                                       "(LLM-resolved). Please review and handle manually.")
+                        # Not "low-confidence target" — the charge is picked by the same
+                        # max(date) rule as every other route. What was heuristic is
+                        # which CHARGE TYPE the customer meant.
+                        _guard_note = ("🤖 Auto-refund not processed — which charge type the "
+                                       "customer is disputing was resolved by heuristic, not "
+                                       "by a stated amount, date or type word. Please confirm "
+                                       "the customer means the subscription and handle manually.")
                     else:
                         _guard_note = f"🤖 Auto-refund not processed ({_exec}). Please handle manually."
                     result["refund_internal_note"] = _guard_note
