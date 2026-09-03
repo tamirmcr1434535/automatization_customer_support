@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v13"  # v13: currency-aware, tolerant amount matching in route A + the mismatch guard
+ENGINE_VERSION = "wb-flow12-v14"  # v14: type keywords filled out per language; "bericht" gated to DE (v13: tolerant, currency-aware amount matching)
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -439,12 +439,48 @@ _TYPE_KEYWORDS = {
         "abonnement", "abonelik", "abonament", "suscrip", "assinatura", "mensual",
         "mensal", "maandelijks", "terugkerend", "abbonamento",
         "подписк", "підписк", "サブスク", "定期", "月額", "毎月", "구독", "정기", "langganan",
+        # Same asymmetry as the report list had: these languages appear in the
+        # soft-routed cohort with no way to name a subscription at all.
+        "đăng ký", "dang ky", "hàng tháng",                # VI
+        "สมัครสมาชิก", "รายเดือน",                          # TH
+        "订阅", "訂閱", "每月",                              # ZH
+        "اشتراك",                                          # AR
     ),
     "report": (
+        # EN is phrase-anchored on purpose. A bare "report" is what a customer
+        # writes when they threaten to report US — "I will report this to my
+        # bank", "報告します" — which is a refund dispute, not a charge type.
         "full report", "results report", "the report", "my report", "test report",
-        "レポート", "診断結果", "検査結果", "informe", "relatório", "rapport", "bericht",
-        "отчёт", "отчет", "звіт", "보고서",
+        "iq report", "personality report", "detailed report", "premium report",
+        "レポート", "診断結果", "検査結果",                 # JP
+        "보고서",                                          # KR
+        "informe",                                         # ES
+        "relatório", "relatorio",                          # PT
+        "rapport", "verslag",                              # FR / NL
+        "rapporto", "relazione",                           # IT
+        "raport",                                          # PL / RO
+        "rapor",                                           # TR
+        "laporan",                                         # ID / MS
+        "báo cáo", "bao cao",                              # VI
+        "รายงาน",                                          # TH
+        "报告", "報告書",                                   # ZH
+        "تقرير",                                           # AR
+        "отчёт", "отчет",                                  # RU
+        "звіт",                                            # UA
     ),
+}
+
+# Words that name a charge type in ONE language and something mundane in
+# another. Matching is plain substring over the whole ticket, so a word like
+# this cannot live in the shared list above.
+#
+# "bericht": German for report — and Dutch for MESSAGE. Every NL customer who
+# writes "dit bericht" / "uw bericht" was being routed to the report group, and
+# NL is 16 of the soft-routed cohort. Applied only when the classifier says the
+# ticket is German; a misdetected language loses the hit and falls through to
+# the next route, which is the safe direction.
+_TYPE_KEYWORDS_BY_LANG = {
+    "DE": {"report": ("bericht", "auswertung")},
 }
 
 
@@ -456,8 +492,10 @@ def _route_by_type_keyword(ctx: "RefundContext", groups) -> Optional[str]:
     if not text:
         return None
     present = {t for t, chs in groups if chs}
+    extra = _TYPE_KEYWORDS_BY_LANG.get((ctx.language or "").strip().upper(), {})
     hit = [t for t, kws in _TYPE_KEYWORDS.items()
-           if t in present and any(k in text for k in kws)]
+           if t in present and any(k in text
+                                   for k in tuple(kws) + tuple(extra.get(t, ())))]
     return hit[0] if len(hit) == 1 else None
 
 
