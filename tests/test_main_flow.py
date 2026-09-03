@@ -2205,12 +2205,14 @@ def test_llm_disambiguated_refund_not_auto_executed():
     assert "refund_draft_reply" not in result                      # suppressed → no draft
     rcm.create_refund.assert_not_called()                          # no auto money move
     zd.post_reply.assert_not_called()                              # no auto approve reply
-    # TRIPWIRE. Guard 2b runs before any draft is built, so the OLDER execution
-    # gate (`skipped_llm_disambiguated`) is dead code — it has never fired in
-    # production, and that string does not appear once in the log's history.
-    # If this assertion starts failing, Guard 2b was relaxed and that gate just
-    # became the only thing between an LLM-resolved route and real money, with
-    # its precision still unmeasured. Relax the two together, on purpose.
+    # TRIPWIRE on the DEFAULT. Guard 2b runs before any draft is built, so with
+    # REFUND_SOFT_ROUTE_APPROVE_LANGS empty — which is the shipped default, and
+    # what this test runs under — nothing reaches the execution gate at all.
+    # Both gates now key off the same `_soft_route_ok` predicate, so a language
+    # added to that allowlist opens them together and deliberately (see
+    # tests/test_soft_route_approve_relaxation.py). If this assertion fails, the
+    # DEFAULT changed: the cohort would be auto-answered everywhere, including
+    # the JP/DE slice measured at 17/26, without anyone choosing that.
     assert "refund_execution_status" not in result
 
 

@@ -99,6 +99,7 @@ SCHEMA = [
     bigquery.SchemaField("refund_ask_in_text",      "BOOLEAN"),   # did the customer's OWN words carry a refund ask (NULL = never evaluated)
     bigquery.SchemaField("refund_has_cross_or_first","BOOLEAN"),  # account also holds a cross_sale / first_sale charge — input to the cross-sale guard
     bigquery.SchemaField("refund_soft_routed",      "BOOLEAN"),   # charge type resolved only by heuristic / LLM, not by amount, date or type word
+    bigquery.SchemaField("refund_soft_route_relaxed","BOOLEAN"),  # this ticket fell in the language slice where Guard 2b is relaxed — the live experiment's arm marker
 
     # Zendesk "topic screen" values written on a LIVE-resolved refund — mirror
     # the fields an agent fills in the Zendesk UI so the report shows refunds
@@ -279,6 +280,7 @@ def log_result(result: dict):
             "refund_ask_in_text":       result.get("refund_ask_in_text"),
             "refund_has_cross_or_first": result.get("refund_has_cross_or_first"),
             "refund_soft_routed":       result.get("refund_soft_routed"),
+            "refund_soft_route_relaxed": result.get("refund_soft_route_relaxed"),
 
             # Zendesk topic-screen values (live-resolved refund)
             "refund_topic":       result.get("refund_topic") or "",

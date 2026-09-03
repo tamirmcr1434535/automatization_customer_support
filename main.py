@@ -158,6 +158,35 @@ REFUNDS_ENABLED       = os.getenv("REFUNDS_ENABLED", "false").lower() == "true"
 REFUNDS_ENABLED_BRANDS = {
     b.strip().lower() for b in os.getenv("REFUNDS_ENABLED_BRANDS", "").split(",") if b.strip()
 }
+# SOFT-ROUTED APPROVE relaxation (Guard 2b) — the measured slice only.
+# Guard 2b suppresses every ticket whose charge TYPE was resolved by heuristic
+# (unauthorized-recurring, or the LLM disambiguator) rather than by a stated
+# amount, a date or a type word — 421 tickets per 20 days, of which not one has
+# ever been auto-answered.
+#
+# The 2026-09-03 study measured whether the human refunded the charge the engine
+# targeted: 40 tickets from 2026-08-15..27, stratified by brand x language,
+# ground truth = Nexus charge-detail `refunded_at` cross-checked against the
+# Zendesk refund tags (the two agreed on 39 of 40; 39 of 40 tickets closed with
+# an agent reply, so a "no" is a human decision, not an unopened ticket).
+#   llm_disambiguated          16/20 = 80.0%  [58.4-91.9]
+#   dispute_target_subscription 15/20 = 75.0%  [53.1-88.8]   (no LLM at all)
+#   overall                     31/40 = 77.5%  [62.5-87.7]
+# So the standing claim that these are all false positives is dead — but 77.5%
+# is not the >=90% that would justify opening the gate wholesale.
+#
+# Precision split hard by language: 14/14 for EN/NL/KR/VI/ZH against 17/26 for
+# JP+DE. That split was NOT pre-registered and 14/14 means [78%, 100%], not
+# zero errors — so this is a hypothesis being tested on live traffic, one
+# language set at a time, not a finding being rolled out.
+#
+# An ALLOWLIST and not a JP/DE denylist: a denylist would silently open every
+# language nobody has measured. Empty default = inert on deploy, and the knob is
+# `gcloud run services update --set-env-vars`, an operator action.
+REFUND_SOFT_ROUTE_APPROVE_LANGS = {
+    l.strip().upper()
+    for l in os.getenv("REFUND_SOFT_ROUTE_APPROVE_LANGS", "").split(",") if l.strip()
+}
 REFUND_MIN_CONFIDENCE = float(os.getenv("REFUND_MIN_CONFIDENCE", "0.90"))
 REFUND_CONFIG = refund_engine.RefundConfig(
     min_confidence=REFUND_MIN_CONFIDENCE,
@@ -551,6 +580,22 @@ def refunds_enabled_for(brand: str) -> bool:
     if not REFUNDS_ENABLED_BRANDS:
         return True
     return (brand or "").lower() in REFUNDS_ENABLED_BRANDS
+
+
+def _soft_route_approve_allowed(language: str, reason_code: str) -> bool:
+    """May a heuristically-routed ticket be auto-answered for this language?
+
+    APPROVE codes only, permanently. Bot denials score 18.5% good against 46-50%
+    for a human on the same population (p~2e-05), so auto-denying this cohort is
+    a bad trade at ANY precision — the relaxation is not symmetric and must not
+    be made symmetric later.
+
+    Language, not brand: the brand dimension is already gated by
+    `refunds_enabled_for`, and the measured signal was linguistic.
+    """
+    if reason_code not in reply_generator.REFUND_APPROVE_CODES:
+        return False
+    return (language or "").strip().upper() in REFUND_SOFT_ROUTE_APPROVE_LANGS
 
 
 def _refund_outcome_status(result: dict) -> str:
@@ -1135,6 +1180,12 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         )
         result["refund_has_cross_or_first"] = _has_cross_or_first
         result["refund_soft_routed"] = _soft_routed
+        # Whether THIS ticket falls in the slice where Guard 2b is relaxed. Logged
+        # for every refund ticket so the rollout can be read off the log: the same
+        # cohort, split by whether the relaxation applied, is the live experiment.
+        _soft_route_ok = _soft_route_approve_allowed(
+            classification.get("language", ""), rc)
+        result["refund_soft_route_relaxed"] = _soft_route_ok
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
             _explain_charge = _contains_explanation_question(eff_text or "")
             if result.get("refund_ask_in_text") is False:
@@ -1159,7 +1210,15 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # burns customers — no money moves, but the letter is wrong) and
                 # hand the ticket to a human, who answers what was actually asked.
                 _refund_suppress = "no_refund_request_in_text"
-            elif _has_cross_or_first and _soft_routed:
+            elif _has_cross_or_first and _soft_routed and not _soft_route_ok:
+                # Guard 2b. Relaxed ONLY for the language set in
+                # REFUND_SOFT_ROUTE_APPROVE_LANGS, and only on APPROVE codes.
+                # Note what is NOT bypassed: rule (a) above still catches a ticket
+                # whose text carries no refund ask at all, and rule (c) below still
+                # requires an explicit demand for money back — the elif chain falls
+                # through to it. Downstream, the dispute guard, the double-refund
+                # check, the amount guard, x-host and the abuse/velocity cap are all
+                # untouched. What opens here is routing confidence, not a money guard.
                 _refund_suppress = "cross_sale_ambiguous_route"
             elif rc in reply_generator.REFUND_APPROVE_CODES and not _has_explicit_refund_demand(eff_text or ""):
                 # Customer reported an unrecognised charge (身に覚えのない…) but never
@@ -1321,7 +1380,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         result["refund_execution_status"] = "skipped_no_xhost"
                         log.warning(f"[{ticket_id}] refund NOT executed — no x-host resolved "
                                     f"for brand={brand!r}; leaving to a human")
-                    elif _routed_by_llm:
+                    elif _routed_by_llm and not _soft_route_ok:
                         # UNREACHABLE TODAY — and the tripwire for the decision that
                         # would make it reachable. Read this before relaxing Guard 2b.
                         #
@@ -1353,12 +1412,14 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         #  • dispute_target_subscription carries the identical routing
                         #    risk with no LLM at all, and is NOT gated here.
                         #
-                        # Kept anyway, because deleting it would ship an unearned
-                        # change: the moment Guard 2b is relaxed this becomes the only
-                        # thing standing between an LLM-resolved route and real money,
-                        # and its precision has still never been measured. So relax
-                        # Guard 2b and this branch together, deliberately, after the
-                        # labelling study — not one by accident.
+                        # 2026-09-03: the study happened, and this branch is now
+                        # opened for exactly the slice Guard 2b is relaxed for —
+                        # `_soft_route_ok` above. Measured precision on the
+                        # llm_disambiguated arm was 16/20 = 80% [58.4-91.9], versus
+                        # 15/20 for the purely deterministic arm: indistinguishable,
+                        # so the LLM was never the thing worth gating. Outside that
+                        # slice the gate stands, because 77.5% overall is short of the
+                        # >=90% a wholesale opening would need.
                         result["refund_execution_status"] = "skipped_llm_disambiguated"
                         log.warning(f"[{ticket_id}] refund NOT executed — flow resolved via "
                                     f"LLM disambiguation; leaving to a human. NOTE: this "

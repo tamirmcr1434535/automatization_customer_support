@@ -29,6 +29,7 @@ _NEW_FIELDS = {
     "refund_ask_in_text":        "BOOLEAN",
     "refund_has_cross_or_first": "BOOLEAN",
     "refund_soft_routed":        "BOOLEAN",
+    "refund_soft_route_relaxed": "BOOLEAN",
 }
 
 
@@ -84,6 +85,7 @@ def test_not_evaluated_stays_null_not_false():
     assert row["refund_ask_in_text"] is None
     assert row["refund_has_cross_or_first"] is None
     assert row["refund_soft_routed"] is None
+    assert row["refund_soft_route_relaxed"] is None
     assert row["refund_reply_suppressed"] == ""
 
 
