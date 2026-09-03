@@ -1096,16 +1096,23 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         #    "report" keyword / date) are unaffected.
         _refund_suppress = None
         _explain_charge = False
+        # Both guard inputs are computed for EVERY reason code, not only the three
+        # we auto-answer, and recorded in `result` so BigQuery can measure them.
+        # The cross-sale guard's premise — "a soft-routed ticket may really be
+        # disputing the cross-sale" — has never been checked against data; until
+        # these two land in the log it can only be argued from reading the code.
+        _has_cross_or_first = any(
+            str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
+            for c in ((nexus_data or {}).get("charges") or [])
+        )
+        _soft_routed = any(
+            m in (decision.guard_trail or [])
+            for m in ("dispute_target_subscription", "llm_disambiguated")
+        )
+        result["refund_has_cross_or_first"] = _has_cross_or_first
+        result["refund_soft_routed"] = _soft_routed
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
             _explain_charge = _contains_explanation_question(eff_text or "")
-            _has_cross_or_first = any(
-                str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
-                for c in ((nexus_data or {}).get("charges") or [])
-            )
-            _soft_routed = any(
-                m in (decision.guard_trail or [])
-                for m in ("dispute_target_subscription", "llm_disambiguated")
-            )
             if result.get("refund_ask_in_text") is False:
                 # The classifier ALONE called this a refund — the customer's own
                 # words carry ZERO refund signal in any language we know

@@ -2198,6 +2198,10 @@ def test_llm_disambiguated_refund_not_auto_executed():
     assert result["refund_decision"] == "YES"                      # engine still says would-refund
     assert result["refund_disambig_charge"] == "ch_sub"
     assert result.get("refund_reply_suppressed") == "cross_sale_ambiguous_route"
+    # The two inputs the guard fired on are recorded, so the log can be asked
+    # whether the guard's premise holds instead of only whether it fired.
+    assert result.get("refund_has_cross_or_first") is True
+    assert result.get("refund_soft_routed") is True
     assert "refund_draft_reply" not in result                      # suppressed → no draft
     rcm.create_refund.assert_not_called()                          # no auto money move
     zd.post_reply.assert_not_called()                              # no auto approve reply
@@ -2226,6 +2230,10 @@ def test_refund_explanation_question_uses_explained_template():
             as_of_date="2026-07-24T00:00:00Z")
     assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"  # engine unchanged
     assert "refund_reply_suppressed" not in result                  # NOT suppressed — explained instead
+    # Recorded even when nothing is suppressed — a guard input is only useful as
+    # a measurement if the negative case is in the log too.
+    assert result.get("refund_soft_routed") is False
+    assert result.get("refund_has_cross_or_first") is False
     assert result.get("refund_draft_reply") == "DRAFT"              # explained draft generated
     # the explained variant was requested (explain_charge flag passed through)
     _rc, _lang, _data = gen.call_args.args

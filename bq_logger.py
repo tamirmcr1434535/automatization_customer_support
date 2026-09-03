@@ -89,6 +89,17 @@ SCHEMA = [
     bigquery.SchemaField("refund_charge_refundable","BOOLEAN"),# dispute guard: charge-detail `refundable`
     bigquery.SchemaField("refund_execution_status","STRING"),  # refund API status (refunded / rejected / would_refund)
 
+    # Why the customer-facing refund reply was WITHHELD (2026-09-03). main.py has
+    # computed `refund_reply_suppressed` since the guards were written but never
+    # logged it, so the single largest source of refund escalations was invisible
+    # here: which of the three suppression rules fired could only be inferred from
+    # the absence of a draft. The three inputs are logged alongside it so the
+    # premise of each guard can be checked against data instead of read off code.
+    bigquery.SchemaField("refund_reply_suppressed", "STRING"),    # no_refund_request_in_text / cross_sale_ambiguous_route / explanation_only_no_refund_demand / opened_dispute / followup_existing_refund
+    bigquery.SchemaField("refund_ask_in_text",      "BOOLEAN"),   # did the customer's OWN words carry a refund ask (NULL = never evaluated)
+    bigquery.SchemaField("refund_has_cross_or_first","BOOLEAN"),  # account also holds a cross_sale / first_sale charge — input to the cross-sale guard
+    bigquery.SchemaField("refund_soft_routed",      "BOOLEAN"),   # charge type resolved only by heuristic / LLM, not by amount, date or type word
+
     # Zendesk "topic screen" values written on a LIVE-resolved refund — mirror
     # the fields an agent fills in the Zendesk UI so the report shows refunds
     # the same way (2026-07-30).
@@ -262,6 +273,12 @@ def log_result(result: dict):
             "refund_charge_disputed":   result.get("refund_charge_disputed"),
             "refund_charge_refundable": result.get("refund_charge_refundable"),
             "refund_execution_status":  result.get("refund_execution_status") or "",
+            "refund_reply_suppressed":  result.get("refund_reply_suppressed") or "",
+            # Deliberately NOT bool()-wrapped: None means "never evaluated", which
+            # is a different fact from False and must stay NULL in BigQuery.
+            "refund_ask_in_text":       result.get("refund_ask_in_text"),
+            "refund_has_cross_or_first": result.get("refund_has_cross_or_first"),
+            "refund_soft_routed":       result.get("refund_soft_routed"),
 
             # Zendesk topic-screen values (live-resolved refund)
             "refund_topic":       result.get("refund_topic") or "",
