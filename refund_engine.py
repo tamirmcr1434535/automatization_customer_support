@@ -33,7 +33,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-ENGINE_VERSION = "wb-flow12-v12"  # v12: honor LLM-disambiguated preferred_charge_id on AMBIGUOUS residual
+ENGINE_VERSION = "wb-flow12-v13"  # v13: currency-aware, tolerant amount matching in route A + the mismatch guard
 
 REFUND_INTENTS = ("REFUND_REQUEST", "SUB_RENEWAL_REFUND")
 
@@ -177,18 +177,119 @@ _CUR = (
     r"dollars?|yen|won|lira|евро|долл?|грн)"
 )
 _NUM = r"\d[\d.,]*\d|\d"
-_STATED_RE = re.compile(rf"(?:{_CUR}\s*({_NUM}))|(?:({_NUM})\s*{_CUR})", re.IGNORECASE)
+_STATED_RE = re.compile(
+    rf"(?:(?P<cur1>{_CUR})\s*(?P<num1>{_NUM}))|(?:(?P<num2>{_NUM})\s*(?P<cur2>{_CUR}))",
+    re.IGNORECASE)
+
+# ── Which currency did the customer's anchor actually mean? ──────────────── #
+# The anchor was matched and then thrown away, so "$11" and "5490 JPY" compared
+# as bare numbers. Each token maps to the SET of ISO codes it can denote —
+# ambiguous symbols keep every candidate ("$" is a dollar of some kind, never a
+# yen), so two amounts are comparable iff their sets intersect. An unrecognised
+# or absent anchor means "unknown", which stays comparable with everything: this
+# must never become a way to silently skip a check.
+_CUR_CODES: dict[str, frozenset] = {}
 
 
-def parse_stated_amounts(text: str) -> list[Decimal]:
-    """Distinct amounts the customer states (currency-anchored). INFORMATIONAL only."""
+def _reg(codes: str, *tokens: str) -> None:
+    fs = frozenset(codes.split())
+    for t in tokens:
+        _CUR_CODES[t.lower()] = fs
+
+
+_reg("JPY CNY", "¥", "￥")
+_reg("JPY", "円", "jpy", "yen")
+_reg("CNY", "元", "圆")
+# "$" is any dollar-ish currency; the point is only that it is NOT yen/won/euro.
+_reg("USD CAD AUD NZD SGD HKD MXN BRL ARS CLP COP", "$")
+_reg("USD", "usd", "dollar", "dollars", "долл", "долла")
+_reg("EUR", "€", "eur", "евро")
+_reg("GBP", "£", "gbp")
+_reg("KRW", "₩", "원", "krw", "won")
+_reg("TRY", "₺", "try", "tl", "lira")
+_reg("INR", "₹", "inr")
+_reg("UAH", "₴", "uah", "грн")
+_reg("ILS", "₪", "ils")
+_reg("RUB", "₽", "rub")
+_reg("PLN", "zł", "pln")
+_reg("CZK", "kč")
+for _c in ("IDR", "THB", "VND", "PHP", "MXN", "BRL", "CHF"):
+    _reg(_c, _c)
+
+
+def _currency_codes(token: Optional[str]) -> Optional[frozenset]:
+    """ISO codes an anchor token can denote; None when unknown."""
+    if not token:
+        return None
+    return _CUR_CODES.get(unicodedata.normalize("NFKC", token).strip().lower())
+
+
+def _charge_currency_codes(charge: dict) -> Optional[frozenset]:
+    cur = str(charge.get("currency") or "").strip().upper()
+    return frozenset([cur]) if cur else None
+
+
+def _currencies_comparable(a: Optional[frozenset], b: Optional[frozenset]) -> bool:
+    """Unknown on either side → comparable. Otherwise they must overlap."""
+    if not a or not b:
+        return True
+    return bool(a & b)
+
+
+# Customers quote the figure their BANK showed, which carries an FX markup of
+# roughly 3-8% on a foreign card, and they round and mistype: 39,900 for 39,990,
+# 29.90 for 29.99, 30 for 29.99, 5,900 and 5,940 for 5,490. Exact equality read
+# every one of those as "this customer means a charge we never found".
+#
+# 10% and not 5% because the real JP cases sit at +7.5% and +8.2% — the markup
+# band, not rounding. The width is not what protects against matching the wrong
+# charge; two things do. Route A requires EXACTLY ONE type group to hit, so an
+# amount that reaches two groups yields no route rather than a wrong one. And
+# measured across the 240 logged accounts that hold two or more distinct
+# refundable amounts, the nearest pair is 45% apart at the 1st percentile and
+# 100% apart at the 5th; widening 5% to 10% moves the number of accounts whose
+# own prices fall inside the band from one to one.
+_AMOUNT_TOLERANCE = Decimal("0.10")
+
+# Major/minor unit confusion, both directions: a customer writing 299.990 for a
+# 299990 charge (a thousands separator read as a decimal point), or 29.99 for a
+# 2999 charge. Not x1000 — that band starts producing false matches between the
+# real prices on one account.
+_AMOUNT_SCALES = (Decimal(1), Decimal(100), Decimal("0.01"))
+
+
+def _amount_matches(stated: Optional[Decimal], stated_cur: Optional[frozenset],
+                    charge: dict) -> bool:
+    """Does a customer-stated amount refer to THIS charge?"""
+    amt = _charge_amount(charge)
+    if amt is None or amt <= 0 or stated is None or stated <= 0:
+        return False
+    if not _currencies_comparable(stated_cur, _charge_currency_codes(charge)):
+        return False
+    return any(abs(stated * s - amt) / amt <= _AMOUNT_TOLERANCE for s in _AMOUNT_SCALES)
+
+
+def parse_stated_amounts_with_currency(text: str) -> list[tuple[Decimal, Optional[frozenset]]]:
+    """Distinct (amount, currency-codes) the customer states, currency-anchored."""
     if not text:
         return []
     text = unicodedata.normalize("NFKC", text)
     out, seen = [], set()
     for m in _STATED_RE.finditer(text):
-        d = _to_decimal(m.group(1) or m.group(2))
-        if d is not None and d > 0 and d not in seen:
+        d = _to_decimal(m.group("num1") or m.group("num2"))
+        cur = _currency_codes(m.group("cur1") or m.group("cur2"))
+        key = (d, cur)
+        if d is not None and d > 0 and key not in seen:
+            seen.add(key)
+            out.append((d, cur))
+    return out
+
+
+def parse_stated_amounts(text: str) -> list[Decimal]:
+    """Distinct amounts the customer states (currency-anchored). INFORMATIONAL only."""
+    out, seen = [], set()
+    for d, _cur in parse_stated_amounts_with_currency(text):
+        if d not in seen:
             seen.add(d)
             out.append(d)
     return out
@@ -507,12 +608,24 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
         reports = [c for c in refundable if str(c.get("type", "")).lower() == "cross_sale"]
         firsts  = [c for c in refundable if str(c.get("type", "")).lower() == "first_sale"]
 
-        stated_set = set(parse_stated_amounts(ctx.ticket_text))
+        stated_pairs = parse_stated_amounts_with_currency(ctx.ticket_text)
         _groups = (("subscription", subs), ("report", reports), ("first_sale", firsts))
         present = [t for t, chs in _groups if chs]
-        by_amount = [t for t, chs in _groups if chs and any(_charge_amount(c) in stated_set for c in chs)]
+        by_amount = [t for t, chs in _groups
+                     if chs and any(_amount_matches(a, cur, c)
+                                    for c in chs for a, cur in stated_pairs)]
 
-        if stated_set and not by_amount and len(refundable) > 1:
+        # Only amounts in a currency this account could actually have been charged
+        # in are evidence about WHICH charge the customer means. A customer reading
+        # "$11" off a US card statement against a ¥5,490 charge is quoting the same
+        # money in another unit, not naming a charge we never found — measured, that
+        # class was 53 of the 71 amounts this guard could not match. Such an amount
+        # is dropped from the check rather than counted against it.
+        _comparable = [(a, cur) for (a, cur) in stated_pairs
+                       if any(_currencies_comparable(cur, _charge_currency_codes(c))
+                              for c in refundable)]
+
+        if _comparable and not by_amount and len(refundable) > 1:
             # The customer named specific amount(s) and NONE of them match any refundable
             # charge we found — do not let a weaker signal (date/keyword/heuristic, below)
             # paper over that mismatch and confidently answer about the WRONG charge. Checked
@@ -527,7 +640,7 @@ def decide(ctx: RefundContext, cfg: RefundConfig) -> RefundDecision:
             # had two unrelated 5490 renewals from a different site — the bot answered about
             # them anyway and had to be corrected by a human after upsetting the customer).
             return _decision(False, RC_STATED_AMOUNT_MISMATCH,
-                             f"Customer named amount(s) {[str(a) for a in sorted(stated_set)]} that "
+                             f"Customer named amount(s) {[str(a) for a, _ in sorted(_comparable)]} that "
                              f"match none of the {len(refundable)} refundable charge(s) found on "
                              f"this account — likely a different account/email, or a charge on "
                              f"another site the lookup didn't surface. A human must verify.",
