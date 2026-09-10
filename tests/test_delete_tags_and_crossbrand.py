@@ -251,7 +251,7 @@ def test_unknown_plan_falls_back_to_the_contacted_brand():
 @patch.object(main, "validate_reply", return_value=(True, ""))
 @patch.object(main, "generate_reply", return_value="Cancelled.")
 @patch.object(main, "zendesk")
-def test_191696_reply_gets_the_right_product_and_the_agent_gets_a_note(
+def test_191696_reply_gets_the_right_product(
     mock_zd, mock_reply, mock_validate, mock_log
 ):
     cancel_result = {
@@ -270,10 +270,11 @@ def test_191696_reply_gets_the_right_product_and_the_agent_gets_a_note(
     assert mock_reply.call_args.kwargs["cancel_result"]["brand_phrase"] == \
         "16 Types Growth Plan"
 
-    # Anna's ask: the agent must see the customer has nothing on the brand
-    # they wrote to.
+    # No cross-brand warning note: the reply is correct, so there is nothing
+    # for an agent to do. The warning is reserved for the case where we could
+    # NOT name the product — see tests/test_startup_alert_and_note_noise.py.
     note = " ".join(str(c.args[1]) for c in mock_zd.add_internal_note.call_args_list)
-    assert "iqpro" in note and "16types" in note
+    assert "no confirmed product name" not in note
 
 
 @patch.object(main, "log_result")

@@ -385,18 +385,48 @@ class SlackClient:
         service: str,
         error_kind: str,
         error_detail: str,
+        fatal: bool = True,
     ) -> bool:
-        """Alert: bot failed startup health check — deploy is broken, no tickets
-        will be processed until ops fixes credentials / connectivity.
+        """Alert: the startup health check failed.
+
+        `fatal` says whether the bot is actually going to exit. Only an
+        auth_error is fatal; a timeout or api_error means the dependency is
+        degraded and the bot keeps serving tickets.
+
+        Until 2026-09-10 this alert claimed "Deploy is broken. Bot will exit
+        and no tickets will be processed" unconditionally — including in the
+        very message whose Detail block said "Bot continued startup (non-auth
+        errors are not fatal)". A single WooCommerce read timeout therefore
+        paged the team with a self-contradicting alarm about an outage that
+        was not happening, which is the fastest way to teach people that this
+        channel can be ignored.
         """
-        text = (
-            f"🚨 *Startup health check FAILED* — `{service}` `{error_kind}`. "
-            "Bot is NOT processing tickets."
-        )
+        if fatal:
+            headline = f"🚨 Startup health check FAILED — {service}"
+            text = (
+                f"🚨 *Startup health check FAILED* — `{service}` `{error_kind}`. "
+                "Bot is NOT processing tickets."
+            )
+            verdict = (
+                "Deploy is broken. Bot will exit and no tickets will be "
+                "processed. Check credentials and redeploy."
+            )
+        else:
+            headline = f"⚠️ Startup health check degraded — {service}"
+            text = (
+                f"⚠️ *Startup health check degraded* — `{service}` `{error_kind}`. "
+                "Bot IS processing tickets."
+            )
+            verdict = (
+                f"The bot started normally and is answering tickets. "
+                f"{service} was unreachable at startup, so lookups against it "
+                f"may return timeout_error / api_error until it recovers. "
+                f"No redeploy needed."
+            )
         blocks = [
             {
                 "type": "header",
-                "text": {"type": "plain_text", "text": f"🚨 Startup health check FAILED — {service}"},
+                "text": {"type": "plain_text", "text": headline},
             },
             {
                 "type": "section",
@@ -416,17 +446,15 @@ class SlackClient:
                 "type": "section",
                 "text": {
                     "type": "mrkdwn",
-                    "text": (
-                        "Deploy is broken. Bot will exit and no tickets will be "
-                        "processed. Check credentials and redeploy."
-                    ),
+                    "text": verdict,
                 },
             },
             {"type": "divider"},
         ]
         sent = self._post(text, blocks)
+        _label = "startup failure" if fatal else "startup degraded"
         if sent:
-            log.info(f"Slack: startup failure alert SENT ({service}/{error_kind})")
+            log.info(f"Slack: {_label} alert SENT ({service}/{error_kind})")
         else:
-            log.error(f"Slack: startup failure alert FAILED ({service}/{error_kind})")
+            log.error(f"Slack: {_label} alert FAILED ({service}/{error_kind})")
         return sent
