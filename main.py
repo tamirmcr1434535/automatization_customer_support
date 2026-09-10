@@ -539,6 +539,30 @@ _REGISTERED_BY_BRAND = {
 }
 
 
+def _charge_types(nexus_data) -> list:
+    """The `type` of every charge Nexus knows for this account."""
+    return [c.get("type") for c in ((nexus_data or {}).get("charges") or [])]
+
+
+def _has_cross_sale(charge_types) -> bool:
+    """Did the customer buy the add-on / Report alongside the main product?
+
+    This is what the Zendesk "Registered" field's "+Cross" variant means
+    (AN-219): brand + Cross when a cross-sale is on the account.
+
+    Read from the charge list, the same way refund_engine picks the Report out
+    of `charges` — NOT from a top-level `cross_sale` key. `_build_refund_fields`
+    used `nexus_data.get("cross_sale")` from 2026-07 until 2026-09-10, and that
+    key does not exist in the search-subscription response (see
+    docs/nexus_refund_api_spec.md): 386 live field writes in the 14 days to
+    2026-09-10 produced the base value every single time and "+Cross" never
+    once, while 478 cross_sale charges went through the engine in the same
+    window. So the flag was silently always False and no refund was ever
+    tagged +Cross.
+    """
+    return any((t or "").strip().lower() == "cross_sale" for t in (charge_types or []))
+
+
 def _registered_value(host_brand: str, cross_sale: bool) -> str:
     pair = _REGISTERED_BY_BRAND.get(host_brand)
     if not pair:
@@ -1533,7 +1557,7 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     _fields = _build_refund_fields(
                         _approved, _sum_text, (decision.currency or ""),
                         host=_charge_host, host_brand=_link_brand,
-                        cross_sale=bool((nexus_data or {}).get("cross_sale")),
+                        cross_sale=_has_cross_sale(_charge_types(nexus_data)),
                         provider=_cand_charge.get("provider"),
                         paypal_order_id=_cand_charge.get("paypal_order_id"),
                         charge_type=decision.charge_type,
@@ -1974,6 +1998,47 @@ def _load_country_name_to_tag() -> dict[str, str]:
         log.warning(f"Failed to load Country field options: {e}")
         _COUNTRY_NAME_TO_TAG = {}
     return _COUNTRY_NAME_TO_TAG
+
+
+def _set_registered_for_ticket(
+    ticket_id: str, host_brand: str, cross_sale: bool
+) -> None:
+    """Set the Zendesk "Registered" field on a cancellation (AN-219).
+
+    Registered records WHICH product the customer signed up for, and whether
+    they also bought the add-on: "brand" or "brand + Cross". Until now only
+    live-resolved refunds filled it, so every cancellation — the large majority
+    of what the bot handles — left it blank for an agent.
+
+    `host_brand` is the product the subscription actually belongs to (resolved
+    from the Nexus host, then the plan name), NOT the inbox the customer wrote
+    to: the lookup is cross-brand, and Anna's example is explicit that the tag
+    names the site the customer registered on.
+
+    Skipped silently when the brand has no Registered option (iqbooster is the
+    subscription funnel, not a front-end test, and has none) — a blank field an
+    agent fills beats a wrong one. Never raises: this is a reporting aid, not
+    part of the cancellation guarantee.
+    """
+    if not _ZENDESK_REGISTERED_FIELD_ID:
+        return
+    value = _registered_value(host_brand, cross_sale)
+    if not value:
+        log.info(
+            f"[{ticket_id}] Registered not set — no field option for brand "
+            f"{host_brand!r} (left to the agent)"
+        )
+        return
+    try:
+        zendesk.set_custom_field(
+            ticket_id, int(_ZENDESK_REGISTERED_FIELD_ID), value,
+        )
+        log.info(
+            f"[{ticket_id}] Registered set to '{value}' "
+            f"(brand={host_brand!r}, cross_sale={cross_sale})"
+        )
+    except Exception as e:  # noqa: BLE001 — reporting aid, never blocks
+        log.warning(f"[{ticket_id}] Failed to set Registered: {e}")
 
 
 def _set_country_for_ticket(ticket_id: str, country: str) -> None:
@@ -4871,6 +4936,15 @@ def _finish_cancellation(
         zendesk.add_tag(ticket_id, "ai_bot_success")
         zendesk_step = "set_topic"
         _set_topic_for_intent(ticket_id, intent)
+        # AN-219: Registered — the product they signed up for, +Cross when the
+        # account also holds an add-on. Written here, after the tags: a tag POST
+        # after a tagger-field write races Zendesk's read-modify-write on the tag
+        # set and can revert the field (#171200).
+        zendesk_step = "set_registered"
+        _set_registered_for_ticket(
+            ticket_id, _product_brand,
+            _has_cross_sale(cancel_result.get("nexus_charge_types")),
+        )
         zendesk_step = "set_country"
         # WooCommerce is the primary source, but plenty of accounts have no
         # country on file at all (#181924: a Korean customer, WC country empty,
