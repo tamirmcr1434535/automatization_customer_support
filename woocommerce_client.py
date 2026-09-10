@@ -1433,6 +1433,13 @@ class WooCommerceClient:
             # records; main.py falls back to the plan name, then to the Zendesk
             # brand.
             "nexus_host": (nexus_data.get("host") or ""),
+            # Charge TYPES only (first_sale / cross_sale / subscription /
+            # renewal) — never the charge objects themselves, which carry
+            # card_last4. main.py needs them to decide the Zendesk "Registered"
+            # field's +Cross variant on a cancellation (AN-219).
+            "nexus_charge_types": [
+                c.get("type") for c in (nexus_data.get("charges") or [])
+            ],
         }
 
         # `order_count` for downstream code mirrors legacy WC semantics:
