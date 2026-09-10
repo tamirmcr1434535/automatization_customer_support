@@ -183,3 +183,34 @@ def test_a_failed_registered_write_never_breaks_the_cancellation(
         "1", "T", "EN", "TRIAL_CANCELLATION",
         _cancel_result(["cross_sale"]), {}, zendesk_brand="wwiqtest")
     mock_zd.solve_ticket.assert_called_once()
+
+
+@patch.object(main, "log_result")
+@patch.object(main, "validate_reply", return_value=(True, ""))
+@patch.object(main, "generate_reply", return_value="Cancelled.")
+@patch.object(main, "zendesk")
+def test_unknown_cross_sale_writes_nothing(
+    mock_zd, mock_reply, mock_validate, mock_log
+):
+    """The legacy WooCommerce lookup returns no charge list — and that path is
+    what a USE_NEXUS_FOR_LOOKUP=false rollback switches to. Guessing "no
+    add-on" would write a base value that is wrong for every cross-sale
+    customer, and nobody re-checks a field that is already filled in."""
+    cr = _cancel_result([])
+    del cr["nexus_charge_types"]          # key absent = we never looked
+    main._finish_cancellation("1", "T", "EN", "TRIAL_CANCELLATION", cr, {},
+                              zendesk_brand="wwiqtest")
+    assert _registered_writes(mock_zd) == []
+
+
+@patch.object(main, "log_result")
+@patch.object(main, "validate_reply", return_value=(True, ""))
+@patch.object(main, "generate_reply", return_value="Cancelled.")
+@patch.object(main, "zendesk")
+def test_empty_charge_list_is_a_fact_and_does_write(
+    mock_zd, mock_reply, mock_validate, mock_log
+):
+    """Present-but-empty means we looked and there is no add-on."""
+    main._finish_cancellation("1", "T", "EN", "TRIAL_CANCELLATION",
+                              _cancel_result([]), {}, zendesk_brand="wwiqtest")
+    assert _registered_writes(mock_zd) == ["iq_test"]
