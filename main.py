@@ -3851,11 +3851,17 @@ def _process(ticket_id: str) -> dict:
     # — nothing reads it as a lock.
     if intent not in HANDLED_INTENTS:
         log.info(f"[{ticket_id}] Skip — not a cancellation ({intent})")
-        try:
-            zendesk.add_tag(ticket_id, "bot_skipped")
-        except Exception as e:  # noqa: BLE001 — a missing marker must never
-            # turn a clean skip into a failed run
-            log.warning(f"[{ticket_id}] bot_skipped tag failed: {e}")
+        # Write it only when it is not already there. Every add_tag fires
+        # another Zendesk webhook (see the note at the top of _process), and
+        # unlike `bot_handled` this marker does not short-circuit the next run
+        # — so an unconditional write would re-tag on every re-fire. The tags
+        # are already on the ticket we fetched; no extra API read.
+        if "bot_skipped" not in tags:
+            try:
+                zendesk.add_tag(ticket_id, "bot_skipped")
+            except Exception as e:  # noqa: BLE001 — a missing marker must never
+                # turn a clean skip into a failed run
+                log.warning(f"[{ticket_id}] bot_skipped tag failed: {e}")
         result["status"] = "skipped_not_handled"
         log_result(result)
         return result

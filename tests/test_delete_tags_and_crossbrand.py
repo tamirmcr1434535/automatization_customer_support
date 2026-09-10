@@ -118,6 +118,23 @@ def test_193082_skipped_ticket_is_marked(mock_zd, mock_cls, mock_log):
 @patch.object(main, "classify_ticket",
               return_value=_classification(intent="GENERAL_QUESTION"))
 @patch.object(main, "zendesk")
+def test_skip_marker_is_written_once(mock_zd, mock_cls, mock_log):
+    """Every add_tag fires another Zendesk webhook, and this marker does not
+    short-circuit the next run — so a ticket that already carries it must not
+    be written again, or the re-fires never stop."""
+    _setup_zd(mock_zd, ticket=make_zendesk_ticket(
+        tags=["automation_test", "bot_skipped"]))
+    result = main._process("193082")
+
+    assert result["status"] == "skipped_not_handled"
+    assert [c for c in mock_zd.add_tag.call_args_list
+            if c.args[1] == "bot_skipped"] == []
+
+
+@patch.object(main, "log_result")
+@patch.object(main, "classify_ticket",
+              return_value=_classification(intent="GENERAL_QUESTION"))
+@patch.object(main, "zendesk")
 def test_skip_marker_is_not_the_idempotency_lock(mock_zd, mock_cls, mock_log):
     """`bot_handled` blocks all re-processing AND arms the 24h per-requester
     spam guard. A skip must never set it, or a customer whose question was
