@@ -1972,10 +1972,15 @@ def test_abuse_guard_blocks_execution():
     zd.add_internal_note.assert_called_once()                       # note posted to the agent
 
 
-def test_refund_not_executed_when_xhost_unresolved():
-    # Clean WOULD_BE on a configured+enabled API, but the brand is unknown/unmapped
-    # → no x-host resolves → we must NOT fire the money move against a wrong/default
-    # scope; leave it to a human. No execution, no reply.
+def test_refund_not_executed_when_the_brand_is_unknown():
+    # Clean WOULD_BE on a configured+enabled API, but the bot cannot tell which
+    # brand the ticket belongs to. The per-brand price band, the legal links and
+    # the brand allowlist would all be running blind → leave it to a human. No
+    # execution, no reply.
+    #
+    # This used to be gated on x-host instead. That premise was retired on
+    # 2026-09-10 (the refund API ignores the header), but the case itself still
+    # deserves a stop — note `_brand_key` says "unknown", a truthy string.
     cls = _classification(intent="REFUND_REQUEST", confidence=0.95, language="EN")
     result = {}
     nexus = _refund_reply_ctx(_SUB_CHARGE)
@@ -1996,10 +2001,10 @@ def test_refund_not_executed_when_xhost_unresolved():
         main._refund_would_be_eval(
             "9505", "x@e.com", "REFUND_REQUEST", cls, result,
             ticket_text="refund my subscription", as_of_date="2026-07-24T00:00:00Z",
-            brand="unknown")  # unmapped → _refund_xhost("unknown") == ""
+            brand="unknown")  # the sentinel _brand_key returns on no match
     assert result["refund_decision"] == "YES"          # engine still says would-refund
-    assert result.get("refund_execution_status") == "skipped_no_xhost"
-    rcm.create_refund.assert_not_called()              # but no money move without x-host
+    assert result.get("refund_execution_status") == "skipped_unknown_brand"
+    rcm.create_refund.assert_not_called()              # no money move on an unknown brand
     zd.post_reply.assert_not_called()                  # and no auto reply
 
 
