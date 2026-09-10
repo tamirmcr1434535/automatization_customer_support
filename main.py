@@ -703,12 +703,52 @@ try:
         _RENEWAL_PRICE[str(k).upper()] = _coerce_price_list(v)
 except (ValueError, TypeError):
     log.warning("REFUND_RENEWAL_PRICE_MAP is not valid JSON — using defaults")
+# ── Extra renewal prices that belong to ONE brand ───────────────────────── #
+# The table above is keyed by currency alone, which is right while every brand
+# charges the same: one price per currency, shared. iqtest.jp broke that — it
+# is the only brand of the 37 rows in Anna's pricing sheet with a yearly plan
+# (¥29,990 / $199 alongside the usual ¥5,490 / $29.99).
+#
+# Putting those into _RENEWAL_PRICE would widen the band for EVERY brand on
+# those currencies: any USD charge from 159 to 239 would start passing the
+# guard that exists to catch anomalous amounts before an auto-approval. So
+# they live here instead, keyed by brand, and are ADDED to the currency
+# defaults rather than replacing them — a brand can only ever gain a valid
+# price, never lose one, so this cannot tighten the guard for anyone.
+#
+# Same env-override shape as the currency table:
+#   REFUND_RENEWAL_PRICE_BY_BRAND_MAP={"iqtestjp": {"JPY": [29990], "USD": [199]}}
+_RENEWAL_PRICE_BY_BRAND = {
+    "iqtestjp": {"JPY": [29990.0], "USD": [199.0]},
+}
+_RENEWAL_PRICE_BY_BRAND = {
+    str(b).lower(): {str(c).upper(): _coerce_price_list(v) for c, v in (m or {}).items()}
+    for b, m in _RENEWAL_PRICE_BY_BRAND.items()
+}
+try:
+    for b, m in json.loads(
+            os.getenv("REFUND_RENEWAL_PRICE_BY_BRAND_MAP", "") or "{}").items():
+        _RENEWAL_PRICE_BY_BRAND[str(b).lower()] = {
+            str(c).upper(): _coerce_price_list(v) for c, v in (m or {}).items()}
+except (ValueError, TypeError, AttributeError):
+    log.warning("REFUND_RENEWAL_PRICE_BY_BRAND_MAP is not valid JSON — using defaults")
+
 _REFUND_AMOUNT_BAND = float(os.getenv("REFUND_AMOUNT_BAND", "0.20"))
 
 
-def _amount_guard(amount, currency) -> "tuple[bool, str]":
+def _renewal_prices(currency: str, brand: str = "") -> "list[float]":
+    """Valid renewal prices for this currency, plus any that belong only to
+    `brand`. Additive on purpose — see _RENEWAL_PRICE_BY_BRAND."""
+    cur = (currency or "").upper()
+    refs = _coerce_price_list(_RENEWAL_PRICE.get(cur) or [])
+    refs += _RENEWAL_PRICE_BY_BRAND.get((brand or "").lower(), {}).get(cur, [])
+    return refs
+
+
+def _amount_guard(amount, currency, brand: str = "") -> "tuple[bool, str]":
     """(ok, reason). Reject zero/null, unknown currency, or >band deviation from
-    EVERY standard renewal price configured for the currency."""
+    EVERY standard renewal price valid for the currency — and for `brand`, when
+    that brand sells a plan the shared currency table does not carry."""
     if amount is None:
         return False, "amount missing"
     try:
@@ -717,10 +757,9 @@ def _amount_guard(amount, currency) -> "tuple[bool, str]":
         return False, f"amount not numeric ({amount!r})"
     if a <= 0:
         return False, "zero/negative amount"
-    refs = _RENEWAL_PRICE.get((currency or "").upper())
+    refs = _renewal_prices(currency, brand)
     if not refs:
         return False, f"no reference renewal price for currency {currency!r}"
-    refs = _coerce_price_list(refs)   # tolerate a bare number (env / patched config)
     if any(abs(a - ref) / ref <= _REFUND_AMOUNT_BAND for ref in refs):
         return True, ""
     return False, (f"amount {a} {currency} deviates >"
@@ -1205,7 +1244,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                     _override = ("REFUND_NOT_REFUNDABLE",
                                  "The charge is not refundable (already refunded / blocked) — a human must handle.")
                 elif decision.reason_code in reply_generator.REFUND_APPROVE_CODES:
-                    _ok, _why = _amount_guard(_det.get("amount"), _det.get("currency"))
+                    _ok, _why = _amount_guard(
+                        _det.get("amount"), _det.get("currency"), _brand)
                     if not _ok:
                         _override = ("REFUND_AMOUNT_ANOMALY",
                                      f"Refund amount guard: {_why} — a human must handle.")
