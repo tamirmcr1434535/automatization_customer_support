@@ -298,3 +298,51 @@ def test_same_brand_cancellation_is_untouched(
     assert "brand_phrase" not in cancel_result
     notes = " ".join(str(c.args[1]) for c in mock_zd.add_internal_note.call_args_list)
     assert "wrote to" not in notes
+
+
+# ── The trial template names the product too ────────────────────────────── #
+# Both cancellation templates were made brand-aware together, but only the
+# subscription one was ever asserted — so "does the trial reply say the brand?"
+# could only be answered by reading the source. It can now be answered by the
+# suite.
+
+def test_trial_reply_names_the_product():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("rg_real", "reply_generator.py")
+    rg = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rg)
+
+    trial = rg._master_trial_cancel("16 Types Growth Plan")
+    assert "16 Types Growth Plan 7-day free trial" in trial
+    assert "IQ Booster" not in trial
+
+    # No confirmed phrase → the deployment default, wording unchanged.
+    assert "IQ Booster 7-day free trial" in rg._master_trial_cancel()
+
+    # And the subscription template still does its half.
+    assert "16 Types Growth Plan subscription" in \
+        rg._master_sub_cancel("16 Types Growth Plan")
+
+
+@patch.object(main, "log_result")
+@patch.object(main, "validate_reply", return_value=(True, ""))
+@patch.object(main, "generate_reply", return_value="Cancelled.")
+@patch.object(main, "zendesk")
+def test_trial_cancellation_passes_the_phrase_through(
+    mock_zd, mock_reply, mock_validate, mock_log
+):
+    """End of the same wire, from the cancel result to generate_reply: a TRIAL
+    cancellation must carry brand_phrase, not just a subscription one."""
+    cancel_result = {
+        "status": "trial_cancelled", "cancelled": True,
+        "subscription_type": "trial", "subscription_id": 1,
+        "plan": "16 Types Growth Plan", "source": "woocommerce",
+        "nexus_host": "16types.ai", "order_count": 1,
+        "nexus_charge_types": ["subscription"],
+    }
+    main._finish_cancellation(
+        "1", "T", "JA", "TRIAL_CANCELLATION", cancel_result, {},
+        zendesk_brand="16types")
+    assert mock_reply.call_args.kwargs["cancel_result"]["brand_phrase"] == \
+        "16 Types Growth Plan"
+    assert mock_reply.call_args.kwargs["intent"] == "TRIAL_CANCELLATION"
