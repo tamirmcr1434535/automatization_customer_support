@@ -197,6 +197,11 @@ refund_client = RefundClient(provider="nexus", enabled=REFUNDS_ENABLED)
 # Brand key ← unambiguous domain marker in the contact-form footer / body.
 # Order: most specific first. "unknown" → never in an allowlist → stays OFF (safe).
 _BRAND_MARKERS = (
+    # iqtest.jp first: it is the most specific marker here, and the domain also
+    # appears as the funnel subdomain (funnel.iqtest.jp) where the purchases
+    # actually happen. No overlap with wwiqtest.com — that string contains
+    # "iqtest" but never "iqtest.jp".
+    ("iqtestjp",          ("iqtest.jp",)),
     ("16types",           ("16types.ai",)),
     ("16personas",        ("16persons.com", "16personas.com")),
     ("iqbooster",         ("iqbooster.org",)),
@@ -275,6 +280,7 @@ def _refund_xhost(brand: str) -> str:
 # reply's legal links + product name follow the CHARGE, not the inbox. Matched
 # by root-domain substring (tolerates language subdomains / path locales).
 _HOST_BRAND_MARKERS = [
+    ("iqtest.jp",         "iqtestjp"),
     ("wwpersonalitytest", "wwpersonalitytest"),
     ("16types.ai",        "16types"),
     ("16persons.com",     "16personas"),

@@ -4,6 +4,12 @@ Legal Policy Links sheet). Generated data — keys are (brand_key, LANG)."""
 REFUND_LEGAL_LINKS = {
     ('16personas', 'EN'): ('https://16persons.com/wp-content/uploads/2025/10/terms-conditions-en-2025-10-30.pdf', 'https://16persons.com/wp-content/uploads/2025/10/subscription-policy-en-2025-10-30.pdf'),
     ('16personas', 'JP'): ('https://16persons.com/wp-content/uploads/2025/10/terms-conditions-ja-2025-10-31.pdf', 'https://16persons.com/wp-content/uploads/2025/10/subscription-policy-ja-2025-10-31.pdf'),
+    # iqtest.jp — from Anna's Legal Policy Links sheet, 2026-09-10. Only EN and
+    # JA exist; `links_for` falls back brand+EN before it would reach another
+    # brand, so a third language gets iqtest.jp's English docs rather than
+    # WW IQ Test's.
+    ('iqtestjp', 'EN'): ('https://iqtest.jp/en/terms', 'https://iqtest.jp/en/subscription-policy'),
+    ('iqtestjp', 'JP'): ('https://iqtest.jp/terms', 'https://iqtest.jp/subscription-policy'),
     ('16types', 'DE'): ('https://16types.ai/de/terms', 'https://16types.ai/de/subscription-policy'),
     ('16types', 'EN'): ('https://16types.ai/terms-conditions', 'https://16types.ai/subscription-policy'),
     ('16types', 'JP'): ('https://16types.ai/ja/terms', 'https://16types.ai/ja/subscription-policy'),
