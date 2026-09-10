@@ -2504,6 +2504,7 @@ def _run_wc_healthcheck_once() -> None:
                 service="WooCommerce",
                 error_kind=kind,
                 error_detail=f"{detail}\n\nBot continued startup (non-auth errors are not fatal).",
+                fatal=False,
             )
         except Exception:
             log.exception("WC health check: failed to send Slack alert (non-fatal)")
@@ -4744,30 +4745,29 @@ def _finish_cancellation(
     _brand_phrase = _BRAND_PHRASE.get(_product_brand)
     if _brand_phrase:
         cancel_result["brand_phrase"] = _brand_phrase
-    if _product_brand and zendesk_brand and _product_brand != zendesk_brand:
-        # Anna 2026-09-10 (#191696): the agent must see that the customer wrote
-        # to one brand and owns a subscription on another — that mismatch is
-        # exactly what made the old reply read as nonsense to the customer.
+    _cross_brand = bool(_product_brand and zendesk_brand
+                        and _product_brand != zendesk_brand)
+    if _cross_brand:
+        # Always logged: this is the measurement that tells us which brand
+        # pairs actually occur and which of them still need a product name.
         log.info(
             f"[{ticket_id}] cross-brand cancellation: contacted "
             f"{zendesk_brand!r}, subscription belongs to {_product_brand!r} "
             f"(via {_brand_via}, plan={cancel_result.get('plan')!r}) — "
             f"reply names {_brand_phrase or 'the deployment default'}"
         )
-        try:
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: the customer wrote to {zendesk_brand}, but the "
-                f"subscription found and cancelled belongs to {_product_brand} "
-                f"(plan: {cancel_result.get('plan') or 'unknown'}). They have no "
-                f"subscription on {zendesk_brand}. The reply names the product "
-                f"they actually own."
-                + ("" if _brand_phrase else
-                   f" NOTE: no confirmed product name for {_product_brand} yet, "
-                   f"so the reply used the default wording — worth confirming.")
-            )
-        except Exception as e:  # noqa: BLE001 — visibility must not block the reply
-            log.warning(f"[{ticket_id}] cross-brand note failed: {e}")
+
+    # No note, no escalation, no special routing: a cross-brand cancellation
+    # is an ordinary cancellation — cancel, reply, close (Yaroslav,
+    # 2026-09-10). It is deliberately not surfaced per-ticket. The first ten
+    # minutes of live traffic showed 3 of 5 cancellations were cross-brand and
+    # all three were the same pair (contacted iqbooster, owns wwiqtest), so a
+    # note here would land on most tickets. Since we are not adding product
+    # names for the remaining brands either, that note could never be actioned
+    # or retired — it would just teach agents to skip notes, which is how the
+    # original defect stayed invisible. The routine audit note below already
+    # carries the plan name for anyone who wants the detail, and the log line
+    # above keeps the measurement.
 
     reply_text = generate_reply(
         intent=intent,
