@@ -3885,7 +3885,27 @@ def _process(ticket_id: str) -> dict:
     # access, and a cancellation confirmation leaves the real problem unanswered.
     # A human must fix the access first. Applies to cancellation AND refund
     # intents (pure disputes already go to a human below).
-    if (intent in HANDLED_INTENTS or intent in refund_engine.REFUND_INTENTS) \
+    #
+    # 2026-09-10 — SPLIT by intent (Anna, on #193481). Cancelling needs no
+    # login at all: the bot does it server-side, and the customer's inability
+    # to log in is WHY they wrote to support instead of doing it themselves.
+    # Escalating without acting left the subscription billing until an agent
+    # got to it — 103 trial cancellations in 30 days. On #193481 the agent
+    # cancelled it by hand 13 minutes later and sent the very confirmation the
+    # bot would have sent. So a CANCELLATION is now carried out and the access
+    # problem handed over afterwards ("хай бот відміняє, а агенти потім
+    # допоможуть з доступами, навіть після відміни"), which is the same
+    # cancel-first shape as charged-after-cancel above.
+    #
+    # REFUND intents keep the old behaviour: there the customer did not ask for
+    # anything the bot may safely do on its own.
+    if intent in HANDLED_INTENTS and _contains_login_problem(_customer_text_only):
+        result["login_problem"] = True
+        log.info(
+            f"[{ticket_id}] {intent}: customer cannot log in — cancelling anyway "
+            f"(no login needed for that), then handing the access problem to a human"
+        )
+    elif intent in refund_engine.REFUND_INTENTS \
             and _contains_login_problem(_customer_text_only):
         log.info(
             f"[{ticket_id}] {intent}: customer reports they cannot log in / "
@@ -5110,8 +5130,33 @@ def _finish_cancellation(
         # Audit note BEFORE solve so it shows up on the closed ticket.
         zendesk_step = "add_internal_note"
         zendesk.add_internal_note(ticket_id, audit_note)
-        zendesk_step = "solve_ticket"
-        zendesk.solve_ticket(ticket_id)
+        if result.get("login_problem"):
+            # The customer asked to cancel AND said they cannot log in. The
+            # cancellation is done and confirmed — that is what they asked for
+            # — but the account is still unreachable, and only a human can
+            # re-link the email or reset the login. So this one ticket is NOT
+            # solved: it stays in the queue with the access problem flagged.
+            zendesk_step = "login_problem_handover"
+            zendesk.add_tag(ticket_id, "login_problem")
+            zendesk.add_tag(ticket_id, "needs_manual_review")
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Subscription CANCELLED "
+                f"(#{cancel_result.get('subscription_id')}, "
+                f"{cancel_result.get('subscription_type') or 'unknown type'}) and "
+                f"confirmed to the customer — billing is stopped.\n\n"
+                f"They ALSO reported they cannot log in / access their account. "
+                f"The bot cannot restore access; please re-link the email or "
+                f"reset the login and follow up. Ticket deliberately left open.",
+            )
+            result["login_problem_handover"] = True
+            log.info(
+                f"[{ticket_id}] cancelled + confirmed; ticket left open for the "
+                f"account-access problem"
+            )
+        else:
+            zendesk_step = "solve_ticket"
+            zendesk.solve_ticket(ticket_id)
     except TicketNotWritableError as e:
         # Ticket got merged/closed by an agent in the middle of our writes.
         # The cancel has already happened in WC — preserve that fact so the
