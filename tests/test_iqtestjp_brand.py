@@ -92,3 +92,20 @@ def test_no_xhost_means_refunds_cannot_execute():
     """A resolved-but-wrong x-host would refund against another brand's scope
     and main.py cannot detect that. No mapping → skipped_no_xhost → human."""
     assert main._refund_xhost("iqtestjp") == ""
+
+
+# ── Zendesk identity, read from the API on 2026-09-10 ───────────────────── #
+
+def test_brand_id_is_mapped():
+    """29833389342108 — read from GET /api/v2/brands.json. Hard-coded so the
+    resolution needs no API call, while _load_zendesk_brand_ids stays the
+    safety net for the next brand nobody pastes."""
+    assert main._ZENDESK_BRAND_TO_KEY[29833389342108] == "iqtestjp"
+    assert main._zendesk_brand_key({"brand_id": 29833389342108}) == "iqtestjp"
+
+
+def test_registered_options_match_the_zendesk_field():
+    """Values read from ticket field 18169677598364. The dotted form is real —
+    every other option is underscored, this one is not."""
+    assert main._registered_value("iqtestjp", False) == "iqtest.jp"
+    assert main._registered_value("iqtestjp", True) == "iqtest.jp_cross"

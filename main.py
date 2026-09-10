@@ -234,6 +234,7 @@ _ZENDESK_BRAND_TO_KEY = {
     27151310564636: "16types",
     18445895176860: "iqbooster",
     23720105185436: "iqpro",
+    29833389342108: "iqtestjp",
     18446370704284: "quickiqtest",
     16656108529948: "wwiqtest",
     18445181123996: "wwpersonalitytest",
@@ -603,6 +604,11 @@ _REGISTERED_BY_BRAND = {
     "16personas":        ("16_persons_test", "16_persons_cross"),
     "iqpro":             ("iq_pro_test", "iq_pro_test__cross"),
     "16types":           ("16_types_test", "16_types_test_cross"),
+    # Options already existed in Zendesk (read from the field, 2026-09-10).
+    # NB the value really is dotted, unlike every other option here. iqtest.jp
+    # sells no add-on (Anna's pricing sheet: "Add-on: None"), so the +Cross
+    # variant should never fire — mapped anyway so it is right if that changes.
+    "iqtestjp":          ("iqtest.jp", "iqtest.jp_cross"),
 }
 
 
