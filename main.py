@@ -1565,16 +1565,30 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # On dev (REFUND_API_* set + REFUNDS_ENABLED=true) it really refunds.
                 if rc in reply_generator.REFUND_APPROVE_CODES and refunds_enabled_for(brand):
                     _routed_by_llm = "llm_disambiguated" in (decision.guard_trail or [])
-                    # x-host safety: PROD enforces x-host per brand. If we could not
-                    # resolve one (unknown / unmapped brand), we do NOT know which
-                    # brand scope the money move would hit — so refuse to auto-execute
-                    # and leave it to a human instead of refunding against a wrong /
-                    # default scope. (A resolved-but-wrong x-host is a backend config
-                    # question, not detectable here.)
-                    if not _refund_xhost(brand):
-                        result["refund_execution_status"] = "skipped_no_xhost"
-                        log.warning(f"[{ticket_id}] refund NOT executed — no x-host resolved "
-                                    f"for brand={brand!r}; leaving to a human")
+                    # This used to require a resolvable x-host, on the premise that
+                    # "PROD enforces x-host per brand" and an unmapped brand meant an
+                    # unknown money scope. The premise is false: probed against a live
+                    # charge on 2026-09-10, charge-detail returns the same 200 and the
+                    # same charge with the correct x-host, another brand's x-host, a
+                    # made-up one, and no header at all — and the backend confirms the
+                    # refund endpoint ignores it too (Yaroslav). The scope comes from
+                    # the charge_id, which is globally unique. The guard never fired in
+                    # 90 days (0 of 51,248) and would have first fired on iqtest.jp, a
+                    # brand whose only sin was that nobody had pasted a header value.
+                    #
+                    # What IS still worth stopping for is the case the x-host check was
+                    # standing in for: we could not tell which brand this ticket belongs
+                    # to at all. Then the per-brand price band, the legal links and the
+                    # brand allowlist are all running blind, so a human decides. That
+                    # has not happened either (brand resolved on all 4,933 refund
+                    # tickets in the last 30 days), which is the point of a tripwire.
+                    # NB `_brand_key` returns the literal string "unknown", not "",
+                    # when no domain marker matches — a truthy value. Checking only
+                    # `not brand` would wave exactly the case this guard is for.
+                    if not brand or brand == "unknown":
+                        result["refund_execution_status"] = "skipped_unknown_brand"
+                        log.warning(f"[{ticket_id}] refund NOT executed — could not "
+                                    f"resolve the brand for this ticket; leaving to a human")
                     elif _routed_by_llm and not _soft_route_ok:
                         # UNREACHABLE TODAY — and the tripwire for the decision that
                         # would make it reachable. Read this before relaxing Guard 2b.
@@ -1722,9 +1736,11 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                             "auto-refunds stay routed to a human until they are manually re-enabled. "
                             "Please review the spike and handle this refund manually."
                         )
-                    elif _exec == "skipped_no_xhost":
-                        _guard_note = ("🤖 Auto-refund not processed — brand/x-host could not be "
-                                       "resolved for the refund API. Please handle manually.")
+                    elif _exec == "skipped_unknown_brand":
+                        _guard_note = ("🤖 Auto-refund not processed — the bot could not tell "
+                                       "which brand this ticket belongs to, so the price check "
+                                       "and the legal links in the reply would both be wrong. "
+                                       "Please handle manually.")
                     elif _exec == "skipped_llm_disambiguated":
                         # Not "low-confidence target" — the charge is picked by the same
                         # max(date) rule as every other route. What was heuristic is

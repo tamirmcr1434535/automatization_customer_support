@@ -1,9 +1,6 @@
 """iqtest.jp — brand resolution and legal links.
 
-Groundwork only. The brand is NOT wired for refund execution on purpose: no
-x-host is mapped, so `_refund_xhost` returns "" and main.py's guard refuses to
-move money for it (skipped_no_xhost → a human decides). Cancellations need
-nothing brand-specific — Nexus `search-subscription` posts only {"email": ...}
+Cancellations need nothing brand-specific — Nexus `search-subscription` posts only {"email": ...}
 and searches across every migrated brand, and iqtest.jp is migrated (34
 subscriptions / 24 emails / 17 active as of 2026-09-10, site_url
 https://funnel.iqtest.jp, every row carrying an email).
@@ -86,12 +83,17 @@ def test_a_third_language_falls_back_within_the_brand():
     assert "iqtest.jp" in sub
 
 
-# ── Money stays blocked until the backend confirms the scope ─────────────── #
+# ── x-host is not a scope selector ──────────────────────────────────────── #
 
-def test_no_xhost_means_refunds_cannot_execute():
-    """A resolved-but-wrong x-host would refund against another brand's scope
-    and main.py cannot detect that. No mapping → skipped_no_xhost → human."""
+def test_no_xhost_mapping_no_longer_blocks_refunds():
+    """iqtest.jp has no x-host and does not need one. Probed against a live
+    charge on 2026-09-10: charge-detail returns the same 200 and the same
+    charge with the right header, another brand's header, a made-up one, and
+    none at all; the backend confirms refund ignores it too. The scope is the
+    charge_id. What still stops a refund is not knowing the brand at all —
+    see test_main_flow.test_refund_not_executed_when_the_brand_is_unknown."""
     assert main._refund_xhost("iqtestjp") == ""
+    assert main._zendesk_brand_key({"brand_id": 29833389342108}) == "iqtestjp"
 
 
 # ── Zendesk identity, read from the API on 2026-09-10 ───────────────────── #
