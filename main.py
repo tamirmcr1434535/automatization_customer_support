@@ -2185,6 +2185,36 @@ _DEDUP_TTL = 7200 if SHADOW_MODE else 300
 # Layer 2: Firestore (distributed across all Cloud Run instances)
 _firestore_db = None
 
+# ── Layer-2 health ───────────────────────────────────────────────────── #
+# This layer was DEAD in production from the day it was written until
+# 2026-09-02: the project had no Firestore database at all, so every single
+# request logged
+#     404 The database (default) does not exist for project …
+# and fell back to the per-instance dict — which does not dedup across
+# instances, i.e. exactly the case Layer 2 exists for. It stayed invisible
+# because a per-request WARNING that never stops is indistinguishable from
+# noise, and because the `bot_handled` tag masks most of the damage.
+#
+# It masks most, not all: measured over Aug-2026, 5 tickets still got 2+ bot
+# replies (worst: #181910, four cancellation emails), with the duplicates
+# 0-5 seconds apart — sub-second races that beat the tag write, because
+# add_tag is a separate POST and the tag read is eventually consistent.
+#
+# So: a MISSING database is a permanent misconfiguration, not a blip. Say so
+# once, loudly, and stop repeating it — then a transient Firestore error is
+# still visible instead of being buried under thousands of identical lines.
+_FS_PERMANENT_MARKERS = (
+    "does not exist",          # no database created for the project
+    "permission denied",       # SA lacks datastore.user
+    "403",
+    "has not been used",       # API disabled
+    "is disabled",
+)
+_fs_degraded_reported = False
+_fs_transient_reported_at = 0.0
+_fs_health_lock = _threading.Lock()
+
+
 def _get_firestore_db():
     """Lazy-init Firestore client (reused across requests in same instance)."""
     global _firestore_db
@@ -2192,6 +2222,64 @@ def _get_firestore_db():
         from google.cloud import firestore as _fs
         _firestore_db = _fs.Client()
     return _firestore_db
+
+
+def _report_firestore_degraded(ticket_id: str, err: Exception) -> None:
+    """Report loss of the distributed lock at a volume that stays readable.
+
+    Permanent cause  → ONE log.error + ONE Slack alert per instance.
+    Transient cause  → at most one WARNING per 5 minutes.
+    """
+    global _fs_degraded_reported, _fs_transient_reported_at
+    msg = str(err)
+    permanent = any(m in msg.lower() for m in _FS_PERMANENT_MARKERS)
+
+    if permanent:
+        with _fs_health_lock:
+            if _fs_degraded_reported:
+                return
+            _fs_degraded_reported = True
+        log.error(
+            f"[{ticket_id}] Webhook dedup DEGRADED — the Firestore distributed "
+            f"lock is unavailable and only the per-instance in-memory lock is "
+            f"active. Concurrent Cloud Run instances can now double-reply to "
+            f"the same ticket. Cause: {msg}"
+        )
+        try:
+            _alert_slack._post(
+                "🚨 *Webhook dedup degraded* — Firestore lock unavailable, "
+                "duplicate customer replies are possible.",
+                blocks=[
+                    {"type": "header",
+                     "text": {"type": "plain_text",
+                              "text": "🚨 Webhook dedup degraded"}},
+                    {"type": "section",
+                     "text": {"type": "mrkdwn", "text": f"```{msg[:600]}```"}},
+                    {"type": "section",
+                     "text": {"type": "mrkdwn", "text": (
+                         "Only the *per-instance* in-memory lock is active. Zendesk "
+                         "fires 5-15 webhooks per ticket, so two Cloud Run instances "
+                         "can both claim the same one and the customer gets the same "
+                         "email twice.\n\nFix: `gcloud firestore databases create "
+                         "--database='(default)' --location=europe-west1 "
+                         "--type=firestore-native`")}},
+                    {"type": "divider"},
+                ],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    # Transient — keep it visible but throttled.
+    now = _time.time()
+    with _fs_health_lock:
+        if now - _fs_transient_reported_at < 300:
+            return
+        _fs_transient_reported_at = now
+    log.warning(
+        f"[{ticket_id}] Firestore dedup error, falling back to in-memory "
+        f"(throttled to 1/5min): {err}"
+    )
 
 
 def _webhook_dedup(ticket_id: str) -> bool:
@@ -2258,8 +2346,10 @@ def _webhook_dedup(ticket_id: str) -> bool:
             with _dedup_lock:
                 _dedup_seen[tid] = now  # cache for future fast-path
             return True
-        # Firestore error (network, permissions, etc.) — fail open with in-memory only
-        log.warning(f"[{tid}] Firestore dedup error, falling back to in-memory: {e}")
+        # Firestore error (network, permissions, etc.) — fail open with in-memory
+        # only. Fail-open is deliberate: a dedup outage must not stop the bot
+        # answering tickets. But it is NOT free — see _report_firestore_degraded.
+        _report_firestore_degraded(tid, e)
         with _dedup_lock:
             if tid in _dedup_seen and (now - _dedup_seen[tid]) < _DEDUP_TTL:
                 return True
