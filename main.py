@@ -46,7 +46,6 @@ from refund_client import RefundClient
 from nexus_client import NexusLookupError
 from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
-from stripe_client import StripeClient
 from slack_client import SlackClient
 import ticket_merger
 import reply_generator
@@ -158,6 +157,35 @@ REFUNDS_ENABLED       = os.getenv("REFUNDS_ENABLED", "false").lower() == "true"
 REFUNDS_ENABLED_BRANDS = {
     b.strip().lower() for b in os.getenv("REFUNDS_ENABLED_BRANDS", "").split(",") if b.strip()
 }
+# SOFT-ROUTED APPROVE relaxation (Guard 2b) — the measured slice only.
+# Guard 2b suppresses every ticket whose charge TYPE was resolved by heuristic
+# (unauthorized-recurring, or the LLM disambiguator) rather than by a stated
+# amount, a date or a type word — 421 tickets per 20 days, of which not one has
+# ever been auto-answered.
+#
+# The 2026-09-03 study measured whether the human refunded the charge the engine
+# targeted: 40 tickets from 2026-08-15..27, stratified by brand x language,
+# ground truth = Nexus charge-detail `refunded_at` cross-checked against the
+# Zendesk refund tags (the two agreed on 39 of 40; 39 of 40 tickets closed with
+# an agent reply, so a "no" is a human decision, not an unopened ticket).
+#   llm_disambiguated          16/20 = 80.0%  [58.4-91.9]
+#   dispute_target_subscription 15/20 = 75.0%  [53.1-88.8]   (no LLM at all)
+#   overall                     31/40 = 77.5%  [62.5-87.7]
+# So the standing claim that these are all false positives is dead — but 77.5%
+# is not the >=90% that would justify opening the gate wholesale.
+#
+# Precision split hard by language: 14/14 for EN/NL/KR/VI/ZH against 17/26 for
+# JP+DE. That split was NOT pre-registered and 14/14 means [78%, 100%], not
+# zero errors — so this is a hypothesis being tested on live traffic, one
+# language set at a time, not a finding being rolled out.
+#
+# An ALLOWLIST and not a JP/DE denylist: a denylist would silently open every
+# language nobody has measured. Empty default = inert on deploy, and the knob is
+# `gcloud run services update --set-env-vars`, an operator action.
+REFUND_SOFT_ROUTE_APPROVE_LANGS = {
+    l.strip().upper()
+    for l in os.getenv("REFUND_SOFT_ROUTE_APPROVE_LANGS", "").split(",") if l.strip()
+}
 REFUND_MIN_CONFIDENCE = float(os.getenv("REFUND_MIN_CONFIDENCE", "0.90"))
 REFUND_CONFIG = refund_engine.RefundConfig(
     min_confidence=REFUND_MIN_CONFIDENCE,
@@ -264,6 +292,65 @@ def _host_to_brand(host: str) -> str:
         if marker in h:
             return brand
     return ""
+
+
+# ── Subscription plan name → brand_key (cancellation product resolution) ── #
+# Fallback for the cancel path when Nexus returns no `host` (older WooCommerce /
+# PayPal records). The WC line-item name IS the product the customer bought,
+# e.g. "16 Types Growth Plan", so it identifies the brand even when the host is
+# missing. Matched on a marker substring, never shown to the customer verbatim —
+# an unrecognised plan name resolves to "" and the reply keeps its default
+# wording rather than quoting an internal SKU at the customer.
+_PLAN_BRAND_MARKERS = [
+    ("16 types",     "16types"),
+    ("16types",      "16types"),
+    ("16 person",    "16personas"),
+    ("16personas",   "16personas"),
+    ("16 persons",   "16personas"),
+    ("personality",  "wwpersonalitytest"),
+    ("iq pro",       "iqpro"),
+    ("iqpro",        "iqpro"),
+    ("iq booster",   "iqbooster"),
+    ("iqbooster",    "iqbooster"),
+]
+
+
+def _plan_to_brand(plan: str) -> str:
+    """Map a WooCommerce subscription plan name to our brand_key, or ""."""
+    p = (plan or "").lower()
+    for marker, brand in _PLAN_BRAND_MARKERS:
+        if marker in p:
+            return brand
+    return ""
+
+
+def _cancelled_product_brand(cancel_result: dict, zendesk_brand: str) -> tuple[str, str]:
+    """Brand_key of the subscription that was actually cancelled, and where it
+    came from.
+
+    Nexus `search-subscription` looks an email up across EVERY brand, so the
+    subscription the bot cancels is not necessarily on the site the customer
+    wrote to. Until 2026-09-10 the cancellation reply ignored that completely:
+    the product name came from the module-level BRAND_NAME env var, one value
+    for the whole deployment. #191696 — customer emailed IQ Pro, had no IQ Pro
+    registration at all, owned a 16 Types Growth Plan, and was told their
+    "IQ Booster subscription" had been cancelled: three different brands in one
+    exchange.
+
+    Resolution order mirrors the refund path (`_host_to_brand` on the charge
+    host), with the plan name as the fallback the refund path doesn't need:
+      1. Nexus `host`   — authoritative product site, absent on old records
+      2. WC plan name   — the product the customer actually bought
+      3. Zendesk brand  — the inbox they wrote to (previous behaviour)
+    """
+    host = (cancel_result or {}).get("nexus_host") or ""
+    brand = _host_to_brand(host)
+    if brand:
+        return brand, "nexus_host"
+    brand = _plan_to_brand((cancel_result or {}).get("plan") or "")
+    if brand:
+        return brand, "plan_name"
+    return (zendesk_brand or ""), "zendesk_brand"
 
 
 def _charge_host_brand(nexus_data, candidate_charge_id: str) -> str:
@@ -553,6 +640,22 @@ def refunds_enabled_for(brand: str) -> bool:
     return (brand or "").lower() in REFUNDS_ENABLED_BRANDS
 
 
+def _soft_route_approve_allowed(language: str, reason_code: str) -> bool:
+    """May a heuristically-routed ticket be auto-answered for this language?
+
+    APPROVE codes only, permanently. Bot denials score 18.5% good against 46-50%
+    for a human on the same population (p~2e-05), so auto-denying this cohort is
+    a bad trade at ANY precision — the relaxation is not symmetric and must not
+    be made symmetric later.
+
+    Language, not brand: the brand dimension is already gated by
+    `refunds_enabled_for`, and the measured signal was linguistic.
+    """
+    if reason_code not in reply_generator.REFUND_APPROVE_CODES:
+        return False
+    return (language or "").strip().upper() in REFUND_SOFT_ROUTE_APPROVE_LANGS
+
+
 def _refund_outcome_status(result: dict) -> str:
     """Final `status` for a refund ticket after `_refund_would_be_eval`.
 
@@ -822,7 +925,8 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
     `result` for BQ + Slack. PURE-ish: read-only Nexus lookup + pure engine.
     Never moves money. Caller wraps this in try/except (strictly additive).
 
-    `ticket_text` = subject + body (informational amount logging).
+    `ticket_text` = subject + body from the caller; widened here with every public
+    customer comment before the engine sees it (see below).
     `country` = billing country if known (else engine uses language as proxy).
     `as_of_date` = ISO date the refund window is measured from (ticket created)."""
     nexus_available = bool(USE_NEXUS_FOR_LOOKUP and nexus_client is not None)
@@ -836,6 +940,34 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
 
     def _has_charges(d):
         return bool(d and isinstance(d.get("charges"), list) and d.get("charges"))
+
+    # ── The engine has to read everything the customer wrote ────────────── #
+    # All three call sites hand us `subject + body`. `body` is the Zendesk
+    # description — the FIRST comment, which never changes — so anything the
+    # customer said afterwards was invisible to the engine: `parse_stated_amounts`,
+    # `_route_by_date` and `_route_by_type_keyword` all ran on an opening line
+    # only. On a live-chat / messaging ticket the description is empty by design,
+    # so routing ran on a subject alone.
+    #
+    # Meanwhile `refund_ask_in_text` in _process was already computed over subject
+    # + body + every customer comment, and the suppression guards compare against
+    # it — so the flow could suppress a reply for a demand it had read while the
+    # engine had routed without it. Same text for both, now.
+    #
+    # A ticket that says nothing useful up front and names the charge in the
+    # second comment is exactly the population that falls through to the
+    # heuristic/LLM route and is then suppressed for having been routed by
+    # heuristic. One fetch, reused by the alt-email retry below; best-effort, so
+    # a Zendesk hiccup leaves the old subject+body behaviour untouched.
+    _customer_comments = ""
+    try:
+        _cc = zendesk.get_all_customer_comments_text(ticket_id)
+        if isinstance(_cc, str) and _cc.strip():
+            _customer_comments = _cc
+    except Exception as e:  # noqa: BLE001 — additive widening; never blocks the eval
+        log.warning(f"[{ticket_id}] refund eval: comment widening failed (non-blocking): {e}")
+    if _customer_comments:
+        ticket_text = f"{ticket_text or ''}\n{_customer_comments}".strip()
 
     if nexus_available:
         try:
@@ -863,14 +995,9 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
             # existed under that email. (3-day audit 2026-07-27: 7 of 25 genuine
             # NOT_FOUND misses had the charge under an email present only in a
             # comment.) Same source the cancel flow already searches; best-effort.
-            _alt_text = ticket_text or ""
-            try:
-                _cc = zendesk.get_all_customer_comments_text(ticket_id)
-                if isinstance(_cc, str) and _cc:
-                    _alt_text = f"{_alt_text}\n{_cc}"
-            except Exception:  # noqa: BLE001 — best-effort widening; never blocks
-                pass
-            for alt in _extract_emails(_alt_text, exclude=email)[:3]:
+            # `ticket_text` already carries every customer comment (widened at the
+            # top of this function), which is where the paying email usually is.
+            for alt in _extract_emails(ticket_text or "", exclude=email)[:3]:
                 try:
                     alt_data = nexus_client.search_subscription(alt)
                 except Exception as e:  # noqa: BLE001
@@ -1096,16 +1223,29 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
         #    "report" keyword / date) are unaffected.
         _refund_suppress = None
         _explain_charge = False
+        # Both guard inputs are computed for EVERY reason code, not only the three
+        # we auto-answer, and recorded in `result` so BigQuery can measure them.
+        # The cross-sale guard's premise — "a soft-routed ticket may really be
+        # disputing the cross-sale" — has never been checked against data; until
+        # these two land in the log it can only be argued from reading the code.
+        _has_cross_or_first = any(
+            str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
+            for c in ((nexus_data or {}).get("charges") or [])
+        )
+        _soft_routed = any(
+            m in (decision.guard_trail or [])
+            for m in ("dispute_target_subscription", "llm_disambiguated")
+        )
+        result["refund_has_cross_or_first"] = _has_cross_or_first
+        result["refund_soft_routed"] = _soft_routed
+        # Whether THIS ticket falls in the slice where Guard 2b is relaxed. Logged
+        # for every refund ticket so the rollout can be read off the log: the same
+        # cohort, split by whether the relaxation applied, is the live experiment.
+        _soft_route_ok = _soft_route_approve_allowed(
+            classification.get("language", ""), rc)
+        result["refund_soft_route_relaxed"] = _soft_route_ok
         if rc in reply_generator.REFUND_AUTOREPLY_CODES:
             _explain_charge = _contains_explanation_question(eff_text or "")
-            _has_cross_or_first = any(
-                str(c.get("type", "")).lower() in ("cross_sale", "first_sale")
-                for c in ((nexus_data or {}).get("charges") or [])
-            )
-            _soft_routed = any(
-                m in (decision.guard_trail or [])
-                for m in ("dispute_target_subscription", "llm_disambiguated")
-            )
             if result.get("refund_ask_in_text") is False:
                 # The classifier ALONE called this a refund — the customer's own
                 # words carry ZERO refund signal in any language we know
@@ -1128,7 +1268,15 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                 # burns customers — no money moves, but the letter is wrong) and
                 # hand the ticket to a human, who answers what was actually asked.
                 _refund_suppress = "no_refund_request_in_text"
-            elif _has_cross_or_first and _soft_routed:
+            elif _has_cross_or_first and _soft_routed and not _soft_route_ok:
+                # Guard 2b. Relaxed ONLY for the language set in
+                # REFUND_SOFT_ROUTE_APPROVE_LANGS, and only on APPROVE codes.
+                # Note what is NOT bypassed: rule (a) above still catches a ticket
+                # whose text carries no refund ask at all, and rule (c) below still
+                # requires an explicit demand for money back — the elif chain falls
+                # through to it. Downstream, the dispute guard, the double-refund
+                # check, the amount guard, x-host and the abuse/velocity cap are all
+                # untouched. What opens here is routing confidence, not a money guard.
                 _refund_suppress = "cross_sale_ambiguous_route"
             elif rc in reply_generator.REFUND_APPROVE_CODES and not _has_explicit_refund_demand(eff_text or ""):
                 # Customer reported an unrecognised charge (身に覚えのない…) but never
@@ -1290,15 +1438,52 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         result["refund_execution_status"] = "skipped_no_xhost"
                         log.warning(f"[{ticket_id}] refund NOT executed — no x-host resolved "
                                     f"for brand={brand!r}; leaving to a human")
-                    elif _routed_by_llm:
-                        # The flow was only resolvable by the LLM disambiguator on an
-                        # AMBIGUOUS residual (no clear amount/date/type signal). This is
-                        # the lowest-confidence routing path and must NOT auto-move money:
-                        # in the 2026-07-28 backtest every llm-disambiguated approve was a
-                        # false positive (human did not refund). Draft + leave to a human.
+                    elif _routed_by_llm and not _soft_route_ok:
+                        # UNREACHABLE TODAY — and the tripwire for the decision that
+                        # would make it reachable. Read this before relaxing Guard 2b.
+                        #
+                        # Written 2026-07-28 (9f528e2) citing a same-day backtest in
+                        # which "every llm-disambiguated approve was a false positive".
+                        # That justification does not survive checking:
+                        #
+                        #  • The backtest left no artifact — no script, no sample frame,
+                        #    no n, no labels anywhere in the repo or its history. Human
+                        #    refund outcomes live in Zendesk tags and have never been
+                        #    joined to the bot log, so the claim is not reproducible.
+                        #  • Guard 2b landed ONE DAY later (bbd713e, 2026-07-29) and
+                        #    suppresses before any draft is built, so this branch has
+                        #    never run in production: `skipped_llm_disambiguated` does
+                        #    not appear once in the log's history, and of 649
+                        #    llm_disambiguated rows the 38 that reached a draft are all
+                        #    from 2026-07-27..29, with zero executions.
+                        #    It is unreachable structurally, not by luck: the marker is
+                        #    only set on the AMBIGUOUS_FLOW re-run, AMBIGUOUS_FLOW needs
+                        #    two charge-type groups present with a subscription among
+                        #    them, so a cross_sale/first_sale always exists and
+                        #    _has_cross_or_first is always True.
+                        #  • "Lowest-confidence routing path" describes a risk the code
+                        #    does not take. The disambiguator's pick selects the TYPE
+                        #    GROUP only (refund_engine route E0); the charge is then
+                        #    re-derived as max(date) over subscriptions — the same
+                        #    selector every hard route uses. Measured agreement between
+                        #    the LLM's pick and the charge actually targeted: 291/293.
+                        #  • dispute_target_subscription carries the identical routing
+                        #    risk with no LLM at all, and is NOT gated here.
+                        #
+                        # 2026-09-03: the study happened, and this branch is now
+                        # opened for exactly the slice Guard 2b is relaxed for —
+                        # `_soft_route_ok` above. Measured precision on the
+                        # llm_disambiguated arm was 16/20 = 80% [58.4-91.9], versus
+                        # 15/20 for the purely deterministic arm: indistinguishable,
+                        # so the LLM was never the thing worth gating. Outside that
+                        # slice the gate stands, because 77.5% overall is short of the
+                        # >=90% a wholesale opening would need.
                         result["refund_execution_status"] = "skipped_llm_disambiguated"
                         log.warning(f"[{ticket_id}] refund NOT executed — flow resolved via "
-                                    f"LLM disambiguation (low confidence); leaving to a human")
+                                    f"LLM disambiguation; leaving to a human. NOTE: this "
+                                    f"branch was unreachable behind Guard 2b — if you are "
+                                    f"seeing it, Guard 2b changed and its precision is "
+                                    f"still unmeasured")
                     else:
                         # Abuse / velocity guard — protects against VOLUME (mass in-window
                         # refund farming, repeat-customer abuse, runaway execution). Checks
@@ -1404,8 +1589,13 @@ def _refund_would_be_eval(ticket_id, email, intent, classification, result,
                         _guard_note = ("🤖 Auto-refund not processed — brand/x-host could not be "
                                        "resolved for the refund API. Please handle manually.")
                     elif _exec == "skipped_llm_disambiguated":
-                        _guard_note = ("🤖 Auto-refund not processed — refund target was low-confidence "
-                                       "(LLM-resolved). Please review and handle manually.")
+                        # Not "low-confidence target" — the charge is picked by the same
+                        # max(date) rule as every other route. What was heuristic is
+                        # which CHARGE TYPE the customer meant.
+                        _guard_note = ("🤖 Auto-refund not processed — which charge type the "
+                                       "customer is disputing was resolved by heuristic, not "
+                                       "by a stated amount, date or type word. Please confirm "
+                                       "the customer means the subscription and handle manually.")
                     else:
                         _guard_note = f"🤖 Auto-refund not processed ({_exec}). Please handle manually."
                     result["refund_internal_note"] = _guard_note
@@ -1463,6 +1653,22 @@ HANDLED_INTENTS = {
 _PURE_DISPUTE_INTENTS = {
     "CHARGEBACK_THREAT",  # customer threatening / filing chargeback, or legal threat
     "PAYPAL_DISPUTE",     # PayPal dispute already opened
+}
+
+# Account/data-deletion intents (GDPR). The classifier emits DELETE_ALL_DATA
+# (see classifier.py "ALWAYS → DELETE_ALL_DATA"); the UNKNOWN safety net below
+# emits DELETE_ACCOUNT. Both mean the same thing and both must reach the
+# escalation branch.
+#
+# 2026-09-10 (#193095): only DELETE_ACCOUNT was ever checked, so every
+# classifier-produced DELETE_ALL_DATA fell through to the "not a cancellation"
+# silent skip — no tag, no note, no escalation. Over the 90 days to 2026-09-10
+# that was 1107 data-deletion requests handled by nobody, against 57 that
+# reached this branch via the safety net. Matching on a SET rather than a single
+# literal is what keeps a future third spelling from re-opening the same hole.
+_DELETE_INTENTS = {
+    "DELETE_ACCOUNT",
+    "DELETE_ALL_DATA",
 }
 
 # Tags set by the retired card-digits flow. A ticket carrying any of these
@@ -1979,6 +2185,36 @@ _DEDUP_TTL = 7200 if SHADOW_MODE else 300
 # Layer 2: Firestore (distributed across all Cloud Run instances)
 _firestore_db = None
 
+# ── Layer-2 health ───────────────────────────────────────────────────── #
+# This layer was DEAD in production from the day it was written until
+# 2026-09-02: the project had no Firestore database at all, so every single
+# request logged
+#     404 The database (default) does not exist for project …
+# and fell back to the per-instance dict — which does not dedup across
+# instances, i.e. exactly the case Layer 2 exists for. It stayed invisible
+# because a per-request WARNING that never stops is indistinguishable from
+# noise, and because the `bot_handled` tag masks most of the damage.
+#
+# It masks most, not all: measured over Aug-2026, 5 tickets still got 2+ bot
+# replies (worst: #181910, four cancellation emails), with the duplicates
+# 0-5 seconds apart — sub-second races that beat the tag write, because
+# add_tag is a separate POST and the tag read is eventually consistent.
+#
+# So: a MISSING database is a permanent misconfiguration, not a blip. Say so
+# once, loudly, and stop repeating it — then a transient Firestore error is
+# still visible instead of being buried under thousands of identical lines.
+_FS_PERMANENT_MARKERS = (
+    "does not exist",          # no database created for the project
+    "permission denied",       # SA lacks datastore.user
+    "403",
+    "has not been used",       # API disabled
+    "is disabled",
+)
+_fs_degraded_reported = False
+_fs_transient_reported_at = 0.0
+_fs_health_lock = _threading.Lock()
+
+
 def _get_firestore_db():
     """Lazy-init Firestore client (reused across requests in same instance)."""
     global _firestore_db
@@ -1986,6 +2222,64 @@ def _get_firestore_db():
         from google.cloud import firestore as _fs
         _firestore_db = _fs.Client()
     return _firestore_db
+
+
+def _report_firestore_degraded(ticket_id: str, err: Exception) -> None:
+    """Report loss of the distributed lock at a volume that stays readable.
+
+    Permanent cause  → ONE log.error + ONE Slack alert per instance.
+    Transient cause  → at most one WARNING per 5 minutes.
+    """
+    global _fs_degraded_reported, _fs_transient_reported_at
+    msg = str(err)
+    permanent = any(m in msg.lower() for m in _FS_PERMANENT_MARKERS)
+
+    if permanent:
+        with _fs_health_lock:
+            if _fs_degraded_reported:
+                return
+            _fs_degraded_reported = True
+        log.error(
+            f"[{ticket_id}] Webhook dedup DEGRADED — the Firestore distributed "
+            f"lock is unavailable and only the per-instance in-memory lock is "
+            f"active. Concurrent Cloud Run instances can now double-reply to "
+            f"the same ticket. Cause: {msg}"
+        )
+        try:
+            _alert_slack._post(
+                "🚨 *Webhook dedup degraded* — Firestore lock unavailable, "
+                "duplicate customer replies are possible.",
+                blocks=[
+                    {"type": "header",
+                     "text": {"type": "plain_text",
+                              "text": "🚨 Webhook dedup degraded"}},
+                    {"type": "section",
+                     "text": {"type": "mrkdwn", "text": f"```{msg[:600]}```"}},
+                    {"type": "section",
+                     "text": {"type": "mrkdwn", "text": (
+                         "Only the *per-instance* in-memory lock is active. Zendesk "
+                         "fires 5-15 webhooks per ticket, so two Cloud Run instances "
+                         "can both claim the same one and the customer gets the same "
+                         "email twice.\n\nFix: `gcloud firestore databases create "
+                         "--database='(default)' --location=europe-west1 "
+                         "--type=firestore-native`")}},
+                    {"type": "divider"},
+                ],
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    # Transient — keep it visible but throttled.
+    now = _time.time()
+    with _fs_health_lock:
+        if now - _fs_transient_reported_at < 300:
+            return
+        _fs_transient_reported_at = now
+    log.warning(
+        f"[{ticket_id}] Firestore dedup error, falling back to in-memory "
+        f"(throttled to 1/5min): {err}"
+    )
 
 
 def _webhook_dedup(ticket_id: str) -> bool:
@@ -2052,8 +2346,10 @@ def _webhook_dedup(ticket_id: str) -> bool:
             with _dedup_lock:
                 _dedup_seen[tid] = now  # cache for future fast-path
             return True
-        # Firestore error (network, permissions, etc.) — fail open with in-memory only
-        log.warning(f"[{tid}] Firestore dedup error, falling back to in-memory: {e}")
+        # Firestore error (network, permissions, etc.) — fail open with in-memory
+        # only. Fail-open is deliberate: a dedup outage must not stop the bot
+        # answering tickets. But it is NOT free — see _report_firestore_degraded.
+        _report_firestore_degraded(tid, e)
         with _dedup_lock:
             if tid in _dedup_seen and (now - _dedup_seen[tid]) < _DEDUP_TTL:
                 return True
@@ -2118,10 +2414,6 @@ if USE_NEXUS_FOR_LOOKUP:
         USE_NEXUS_FOR_LOOKUP = False
     else:
         log.info("Nexus lookup enabled — using apinexus.cellon.ai for subscription search")
-stripe_cli = StripeClient(
-    api_key=os.getenv("STRIPE_SECRET_KEY"),
-    dry_run=DRY_RUN,
-)
 slack = SlackClient(
     bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
     target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
@@ -3187,6 +3479,27 @@ def _process(ticket_id: str) -> dict:
                 _customer_text_only += " " + all_comments
         except Exception:
             log.warning(f"[{ticket_id}] Failed to fetch comments for refund check")
+
+    # Text the money-disqualifier guards scan: EVERYTHING the customer wrote,
+    # subject included.
+    #
+    # `_customer_text_only` deliberately drops the subject, because the cancel-
+    # signal checks would over-fire on contact-form subjects ("IQ Booster
+    # Help Form"). But the amount+currency check is a DISQUALIFIER — the more
+    # of the customer's text it reads, the more conservative the bot gets — and
+    # running it on the body alone made it blind to the one place customers most
+    # often name a charge.
+    #
+    # #192984 (2026-09-09): subject "1990원 결제했는데 14990은 뭐죠?" — paid 1,990
+    # KRW, charged 14,990, "what is this?". Body carried only the cancel demand.
+    # The classifier read it correctly as REFUND_REQUEST (88%), but the
+    # already-cancelled remap below saw no refund word (the customer never wrote
+    # 환불) and no amount (it was in the subject this guard never received), so
+    # it auto-cancelled and sent a plain trial-cancellation confirmation that
+    # said nothing about the 14,990 the customer was asking about. `원` was in
+    # the currency list all along — the text just never reached the regex.
+    _money_scan_text = subject + " " + _customer_text_only
+
     _has_refund_kw = intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund)
 
     # ── Carve-out (#169289): unauthorized-signup, STOP-FUTURE-ONLY cancellation ──
@@ -3499,7 +3812,7 @@ def _process(ticket_id: str) -> dict:
         # a money question in play, even if some future phrasing slips past the
         # keyword list — fail toward escalation, not an incomplete auto-reply.
         if (not result["refund_ask_in_text"]
-                and not _contains_amount_with_currency(_customer_text_only)
+                and not _contains_amount_with_currency(_money_scan_text)
                 and _contains_cancel_signal(_customer_text_only)):
             log.info(
                 f"[{ticket_id}] {intent}: no refund ask, but customer wants the "
@@ -3549,10 +3862,11 @@ def _process(ticket_id: str) -> dict:
 
     # ── NORMAL CANCELLATION FLOW ──────────────────────────────────────── #
 
-    # 3d. DELETE_ACCOUNT — customer wants account/data deletion (GDPR/privacy).
-    # Bot cannot handle this automatically — escalate to human agent.
-    if intent == "DELETE_ACCOUNT":
-        log.info(f"[{ticket_id}] DELETE_ACCOUNT — escalating to agent for data deletion")
+    # 3d. Account/data deletion (GDPR/privacy) — DELETE_ACCOUNT from the safety
+    # net, DELETE_ALL_DATA from the classifier. Bot cannot handle this
+    # automatically — escalate to human agent.
+    if intent in _DELETE_INTENTS:
+        log.info(f"[{ticket_id}] {intent} — escalating to agent for data deletion")
 
         current_tags = zendesk.get_ticket_tags(ticket_id)
         if "bot_handled" in current_tags:
@@ -3565,7 +3879,7 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: customer requests account deletion (DELETE_ACCOUNT, "
+            f"🤖 Bot: customer requests account deletion ({intent}, "
             f"confidence {confidence:.0%}). Requires manual handling — "
             f"data deletion per privacy policy.",
         )
@@ -3611,8 +3925,33 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 4b. Skip other unhandled intents (GENERAL_QUESTION, EXPLANATION, SPAM, etc.)
+    #
+    # The skip is correct — these are not cancellations — but until 2026-09-10
+    # it left NO trace on the ticket at all (#193082). An agent opening the
+    # ticket could not tell whether the bot had triaged it and stepped back or
+    # had never seen it, and the bot-processed counters (which read Zendesk
+    # tags, not BigQuery) missed the ~870 tickets a month that land here.
+    #
+    # The marker is deliberately NOT `bot_handled`: that tag is a hard
+    # idempotency lock (`2a` above blocks all re-processing) AND the 24h
+    # per-requester spam guard in `was_recently_handled`. Tagging a skip with it
+    # would mean a customer whose "what is my IQ score?" question was skipped
+    # could no longer get an automatic cancellation on that same ticket, or on
+    # any ticket they open in the next 24 hours. `bot_skipped` is a marker only
+    # — nothing reads it as a lock.
     if intent not in HANDLED_INTENTS:
         log.info(f"[{ticket_id}] Skip — not a cancellation ({intent})")
+        # Write it only when it is not already there. Every add_tag fires
+        # another Zendesk webhook (see the note at the top of _process), and
+        # unlike `bot_handled` this marker does not short-circuit the next run
+        # — so an unconditional write would re-tag on every re-fire. The tags
+        # are already on the ticket we fetched; no extra API read.
+        if "bot_skipped" not in tags:
+            try:
+                zendesk.add_tag(ticket_id, "bot_skipped")
+            except Exception as e:  # noqa: BLE001 — a missing marker must never
+                # turn a clean skip into a failed run
+                log.warning(f"[{ticket_id}] bot_skipped tag failed: {e}")
         result["status"] = "skipped_not_handled"
         log_result(result)
         return result
@@ -3648,7 +3987,7 @@ def _process(ticket_id: str) -> dict:
             and _contains_cancel_signal(_all_text_for_refund)
             and not _contains_strong_refund_signal(_all_text_for_refund)
             and not _contains_delete_account_signal(_all_text_for_refund)
-            and not _contains_amount_with_currency(_customer_text_only)
+            and not _contains_amount_with_currency(_money_scan_text)
             and not classification.get("chargeback_risk")):
         _orig_conf = confidence
         confidence = 0.85
@@ -3700,7 +4039,7 @@ def _process(ticket_id: str) -> dict:
             and confidence < 0.80
             and not _contains_strong_refund_signal(_all_text_for_refund)
             and not _contains_delete_account_signal(_all_text_for_refund)
-            and not _contains_amount_with_currency(_customer_text_only)
+            and not _contains_amount_with_currency(_money_scan_text)
             and not classification.get("chargeback_risk")):
         _orig_conf = confidence
         confidence = 0.85
@@ -3744,7 +4083,7 @@ def _process(ticket_id: str) -> dict:
             and _contains_cancel_signal(_all_text_for_refund)
             and not _contains_strong_refund_signal(_all_text_for_refund)
             and not _contains_delete_account_signal(_all_text_for_refund)
-            and not _contains_amount_with_currency(_customer_text_only)
+            and not _contains_amount_with_currency(_money_scan_text)
             and not classification.get("chargeback_risk")):
         _sub_check = _quick_subscription_check(email, ticket_id)
         if _sub_check == "exists":
@@ -4013,46 +4352,8 @@ def _process(ticket_id: str) -> dict:
         if alt_found:
             return alt_found
 
-        # ── Stripe fallback for no_active_sub ─────────────────────────── #
-        # WC found the customer but no active subscription. Try Stripe —
-        # the sub might be managed in Stripe but not reflected in WC.
-        # Try primary email first, then alt emails from ticket body/comments.
-        emails_to_try_stripe = [email] + _extract_emails(search_text, exclude=email)
-        stripe_result = None
-        stripe_status = ""
-        tried_stripe_email = email
-        for stripe_email in emails_to_try_stripe:
-            log.info(f"[{ticket_id}] No alt email in WC → trying Stripe by email: {stripe_email}")
-            stripe_result = stripe_cli.cancel_subscription(stripe_email)
-            stripe_status = stripe_result.get("status", "")
-            tried_stripe_email = stripe_email
-            if stripe_status not in ("not_found", "no_active_sub", "error"):
-                break  # found it
-
-        if stripe_status not in ("not_found", "no_active_sub", "error"):
-            alt_note = ""
-            if tried_stripe_email != email:
-                alt_note = f" (via alt email {tried_stripe_email} found in ticket)"
-            log.info(
-                f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
-                f"sub {stripe_result.get('subscription_id')} for {tried_stripe_email}"
-            )
-            cancel_result = {**stripe_result, "source": "stripe"}
-            result["cancel_source"] = "stripe"
-            final_intent = _resolve_intent(intent, cancel_result)
-            result["intent"] = final_intent
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: found in WooCommerce but no active sub. "
-                f"Cancelled in Stripe directly{alt_note} "
-                f"(sub={stripe_result.get('subscription_id')}).",
-            )
-            return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result
-            )
-
-        # No working alt email and Stripe didn't help → Slack alert for manual review
-        log.info(f"[{ticket_id}] No alt email / Stripe worked → Slack alert + escalate to agent")
+        # No working alt email → Slack alert for manual review.
+        log.info(f"[{ticket_id}] No alt email found → Slack alert + escalate to agent")
 
         # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
         # when Zendesk fires multiple webhooks in rapid succession (same fix as card-digits).
@@ -4099,50 +4400,6 @@ def _process(ticket_id: str) -> dict:
         alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
         if alt_found:
             return alt_found
-
-        # ── Stripe email-based fallback ──────────────────────────────── #
-        # Before asking for card digits, try Stripe directly by email.
-        # Stripe Customer.list(email=) is fast and reliable, and may find
-        # the subscription even when WooCommerce billing_email lookup fails
-        # (common when WC stores the email only in _billing_email post meta).
-        # Try primary email first, then alt emails from ticket body/comments.
-        emails_to_try_stripe = [email] + _extract_emails(search_text, exclude=email)
-        stripe_result = None
-        stripe_status = ""
-        tried_stripe_email = email
-        for stripe_email in emails_to_try_stripe:
-            log.info(f"[{ticket_id}] WC not found → trying Stripe by email: {stripe_email}")
-            stripe_result = stripe_cli.cancel_subscription(stripe_email)
-            stripe_status = stripe_result.get("status", "")
-            tried_stripe_email = stripe_email
-            if stripe_status not in ("not_found", "no_active_sub", "error"):
-                break  # found it
-
-        if stripe_status not in ("not_found", "no_active_sub", "error"):
-            # ✅ Stripe found and cancelled the subscription
-            alt_note = ""
-            if tried_stripe_email != email:
-                alt_note = f" (via alt email {tried_stripe_email} found in ticket)"
-            log.info(
-                f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
-                f"sub {stripe_result.get('subscription_id')} for {tried_stripe_email}"
-            )
-            cancel_result = {**stripe_result, "source": "stripe"}
-            result["cancel_source"] = "stripe"
-            final_intent = _resolve_intent(intent, cancel_result)
-            result["intent"] = final_intent
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: not found in WooCommerce by email ({email}). "
-                f"Found and cancelled in Stripe directly{alt_note} "
-                f"(sub={stripe_result.get('subscription_id')}).",
-            )
-            return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result
-            )
-
-        if stripe_status == "no_active_sub":
-            log.info(f"[{ticket_id}] Stripe: no active sub for any email tried")
 
         # ── Not found anywhere → escalate to human (Slack only, NO customer reply) ──
         # Previously this asked the customer for last 4 card digits, but that flow
@@ -4203,35 +4460,25 @@ def _process(ticket_id: str) -> dict:
         result["intent"] = intent
         log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
 
-    # ── Payment-gateway safety net (#147892) ──────────────────────────── #
-    # WooCommerce reporting "cancelled" does NOT prove the money actually
-    # stopped: the WC subscription record and the Stripe subscription object
-    # can desync — WC cancels locally (and answers our PUT with
-    # status=cancelled, so the sanity check in _cancel_sub_by_id passes) while
-    # the Stripe subscription keeps renewing on its own schedule.
+    # ── Payment-gateway safety net (#147892) — REMOVED 2026-09-10 ─────── #
+    # This used to re-check Stripe after a WooCommerce cancellation, because
+    # the two can desync: WC cancels locally while the Stripe subscription
+    # keeps renewing (incident #147892 — two 5490 JPY charges after the bot
+    # had promised none).
     #
-    # Live incident #147892: bot cancelled WC sub #3522734 on 2026-06-23 and
-    # told the customer "no further charges will be made"; Stripe then charged
-    # 5490 JPY on 2026-07-12 AND again on 2026-08-09 (provider=Stripe, host
-    # jap.wwiqtest.com). A human found it two months later and had to refund
-    # both cycles. The bot never looked at Stripe because that lookup only runs
-    # as a FALLBACK when WC finds nothing.
+    # It was removed with the rest of the Stripe integration. The live API key
+    # had expired, so every ticket logged "Expired API Key provided" and the
+    # check had in fact been dead for some time: over the 180 days to
+    # 2026-09-10, zero cancellations came from Stripe and zero desyncs were
+    # caught. Disputes and charge state now come from the refund API
+    # (Yaroslav, 2026-09-10), which is the one source the bot still reads.
     #
-    # The reply we are about to send promises no further charges, so verify
-    # that promise before making it: if Stripe still has an active/trialing
-    # subscription for this customer, cancel it too (same graceful
-    # cancel_at_period_end the Stripe path already uses, which matches the
-    # reply's "you keep access until the paid period ends" wording).
-    #
-    # Strictly additive and fail-open: any error here is logged and ignored,
-    # leaving the pre-existing behaviour exactly as it was.
-    _cancel_leftover_stripe_sub(
-        ticket_id, cancel_result.get("email") or email, cancel_result, result
-    )
-
     # 9. Found → generate reply, tag, solve
     # (order count gate is inside _finish_cancellation — covers all paths)
-    return _finish_cancellation(ticket_id, name, language, intent, cancel_result, result)
+    return _finish_cancellation(
+        ticket_id, name, language, intent, cancel_result, result,
+        zendesk_brand=_zendesk_brand_key(ticket),
+    )
 
 
 # ── Card digits handler ───────────────────────────────────────────────── #
@@ -4409,97 +4656,6 @@ def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
     return text_intent
 
 
-def _cancel_leftover_stripe_sub(
-    ticket_id: str, email: str, cancel_result: dict, result: dict
-) -> None:
-    """After WooCommerce reports the subscription cancelled, make sure Stripe
-    isn't still billing it (#147892 — see the call site for the incident).
-
-    WC and the gateway can desync, and the customer is about to be told "no
-    further charges will be made". If Stripe still holds an active/trialing
-    subscription for this customer, cancel it too and record what happened on
-    the ticket + in `result` (BQ) so a human can audit it — a customer with a
-    genuinely separate second subscription would show up here too, and the note
-    is what lets support spot that case.
-
-    Never raises: on any error the WC cancellation stands exactly as before."""
-    if not email:
-        return
-    try:
-        found = stripe_cli.find_active_subscription(email)   # READ-ONLY
-    except Exception as e:  # noqa: BLE001 — safety net must never break the flow
-        log.warning(f"[{ticket_id}] Stripe leftover check failed (non-blocking): {e}")
-        return
-
-    status = (found or {}).get("status", "")
-    # Healthy cases — the gateway agrees with WooCommerce:
-    #   not_found      → no Stripe customer at all
-    #   no_active_sub  → nothing live, or everything live is already scheduled
-    #                    to end (cancel_at_period_end — a gracefully cancelled
-    #                    Stripe sub STAYS status=active until the period ends,
-    #                    which is exactly why we check that flag and not status)
-    if status in ("not_found", "no_active_sub"):
-        return
-    if status == "error":
-        log.warning(
-            f"[{ticket_id}] Stripe leftover check errored for {email}: "
-            f"{str((found or {}).get('error', ''))[:200]}"
-        )
-        return
-
-    # status == "billing": a subscription that will KEEP renewing, even though
-    # WooCommerce just said the customer is cancelled. Cancel that exact one.
-    stripe_sub_id = (found or {}).get("subscription_id", "")
-    try:
-        cancelled = stripe_cli.cancel_subscription_by_id(stripe_sub_id)
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"[{ticket_id}] Stripe leftover cancel failed (non-blocking): {e}")
-        return
-    if (cancelled or {}).get("status") == "error":
-        log.error(
-            f"[{ticket_id}] GATEWAY DESYNC but Stripe cancel FAILED for "
-            f"{stripe_sub_id} — customer may keep being charged"
-        )
-        try:
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖🚨 WooCommerce reported the subscription cancelled, but Stripe "
-                f"still has an ACTIVE subscription ({stripe_sub_id}) for {email} "
-                f"that will keep charging — and the bot could NOT cancel it "
-                f"({str((cancelled or {}).get('error', ''))[:200]}). The customer "
-                f"has been told there will be no further charges. Please cancel it "
-                f"in Stripe manually.",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        result["stripe_leftover_cancel_failed"] = True
-        return
-
-    result["stripe_leftover_cancelled"] = True
-    result["stripe_leftover_subscription_id"] = stripe_sub_id
-    log.warning(
-        f"[{ticket_id}] GATEWAY DESYNC: WC reported the subscription cancelled "
-        f"(#{cancel_result.get('subscription_id')}) but Stripe still had an "
-        f"active/trialing subscription ({stripe_sub_id}) for {email} — "
-        f"cancelled it too so the 'no further charges' promise holds"
-    )
-    try:
-        zendesk.add_internal_note(
-            ticket_id,
-            f"🤖⚠️ Gateway desync caught: WooCommerce reported subscription "
-            f"#{cancel_result.get('subscription_id')} as cancelled, but Stripe "
-            f"still had an ACTIVE subscription ({stripe_sub_id}) for {email}. "
-            f"The bot cancelled the Stripe one as well, so billing really stops "
-            f"(this is the #147892 failure mode: WC cancelled, Stripe kept "
-            f"charging for two more months).\n\n"
-            f"If this customer intentionally had a SECOND, separate "
-            f"subscription, please re-activate it — the bot cannot tell the two "
-            f"cases apart.",
-        )
-    except Exception as e:  # noqa: BLE001 — note is best-effort
-        log.warning(f"[{ticket_id}] gateway-desync note failed: {e}")
-
-
 def _finish_cancellation(
     ticket_id: str,
     name: str,
@@ -4507,6 +4663,7 @@ def _finish_cancellation(
     intent: str,
     cancel_result: dict,
     result: dict,
+    zendesk_brand: str = "",
 ) -> dict:
     """Generate reply, tag, and solve the ticket after a successful cancellation.
 
@@ -4574,6 +4731,43 @@ def _finish_cancellation(
         })
         log_result(result)
         return result
+
+    # ── Name the product the customer actually owns ───────────────────── #
+    # The lookup is cross-brand (Nexus searches an email across every brand),
+    # so the subscription just cancelled may live on a different site than the
+    # inbox the customer wrote to. Resolve the product from the subscription
+    # itself and let the reply name THAT, the way the refund path already
+    # names the product from the charge host. Only brands with a phrase Anna
+    # has confirmed are substituted — anything else keeps the deployment
+    # default, so an unconfirmed brand can never invent a product name.
+    _product_brand, _brand_via = _cancelled_product_brand(cancel_result, zendesk_brand)
+    _brand_phrase = _BRAND_PHRASE.get(_product_brand)
+    if _brand_phrase:
+        cancel_result["brand_phrase"] = _brand_phrase
+    if _product_brand and zendesk_brand and _product_brand != zendesk_brand:
+        # Anna 2026-09-10 (#191696): the agent must see that the customer wrote
+        # to one brand and owns a subscription on another — that mismatch is
+        # exactly what made the old reply read as nonsense to the customer.
+        log.info(
+            f"[{ticket_id}] cross-brand cancellation: contacted "
+            f"{zendesk_brand!r}, subscription belongs to {_product_brand!r} "
+            f"(via {_brand_via}, plan={cancel_result.get('plan')!r}) — "
+            f"reply names {_brand_phrase or 'the deployment default'}"
+        )
+        try:
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: the customer wrote to {zendesk_brand}, but the "
+                f"subscription found and cancelled belongs to {_product_brand} "
+                f"(plan: {cancel_result.get('plan') or 'unknown'}). They have no "
+                f"subscription on {zendesk_brand}. The reply names the product "
+                f"they actually own."
+                + ("" if _brand_phrase else
+                   f" NOTE: no confirmed product name for {_product_brand} yet, "
+                   f"so the reply used the default wording — worth confirming.")
+            )
+        except Exception as e:  # noqa: BLE001 — visibility must not block the reply
+            log.warning(f"[{ticket_id}] cross-brand note failed: {e}")
 
     reply_text = generate_reply(
         intent=intent,

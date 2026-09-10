@@ -1,12 +1,11 @@
 Zendesk Cancellation Bot
 Автоматично обробляє тікети скасування підписки через Claude AI.
-Флоу: Zendesk → webhook → Cloud Function → Stripe cancel → Claude reply → Zendesk solved
+Флоу: Zendesk → webhook → Cloud Function → WooCommerce/Nexus cancel → Claude reply → Zendesk solved
 
 Структура репозиторію
 ├── main.py              ← Cloud Function entry point
 ├── classifier.py        ← Claude Haiku → intent + language
 ├── zendesk_client.py    ← Zendesk API (read / reply / tag / solve)
-├── stripe_client.py     ← Stripe cancel subscription
 ├── reply_generator.py   ← Claude Sonnet → EN/JP/KR reply
 ├── bq_logger.py         ← BigQuery logging
 ├── requirements.txt

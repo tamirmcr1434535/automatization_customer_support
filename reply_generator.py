@@ -54,19 +54,32 @@ def _notify_api_failure(error_msg: str):
 # These are the EXACT texts approved for each scenario.
 # Claude translates them into the customer's language — never rewrites them.
 
-def _master_trial_cancel() -> str:
+# Product named in a cancellation confirmation. `BRAND_NAME` is one env var for
+# the entire deployment, but the subscription lookup is cross-brand (Nexus
+# searches an email across every brand), so the product the bot cancels is not
+# always the brand whose inbox the customer wrote to. main.py resolves the real
+# product and passes it in as `brand_phrase`; None keeps the deployment default.
+# (#191696 — emailed IQ Pro, owned a 16 Types Growth Plan, was told their
+# "IQ Booster subscription" was cancelled.)
+def _product_name(brand_phrase: str | None = None) -> str:
+    return (brand_phrase or "").strip() or BRAND_NAME
+
+
+def _master_trial_cancel(brand_phrase: str | None = None) -> str:
     return (
         "Hello,\n\n"
-        f"Thank you for your email. We confirm that your {BRAND_NAME} 7-day free trial has been "
+        f"Thank you for your email. We confirm that your {_product_name(brand_phrase)} "
+        "7-day free trial has been "
         "successfully cancelled. No further charges will be applied to your account.\n\n"
         "If you have any other questions or need further assistance, please don't hesitate "
         "to contact us."
     )
 
-def _master_sub_cancel() -> str:
+def _master_sub_cancel(brand_phrase: str | None = None) -> str:
     return (
         "Hello,\n\n"
-        f"Thank you for your email. We're sorry to hear you'd like to cancel your {BRAND_NAME} "
+        "Thank you for your email. We're sorry to hear you'd like to cancel your "
+        f"{_product_name(brand_phrase)} "
         "subscription. As requested, your subscription has been canceled and no additional "
         "payments will occur. You will, however, continue to have access to the service "
         "until the end of the period you have already paid for. After that, the plan will "
@@ -96,7 +109,8 @@ Rules:
     • VI: Xin chào,
     • TH: สวัสดีค่ะ
   The customer should see the greeting as a clear first line before the body.
-- Replace "{BRAND_NAME}" with "{BRAND_NAME}" as-is (brand name stays unchanged)
+- Product and brand names (e.g. "{BRAND_NAME}", "16 Types Growth Plan") stay
+  EXACTLY as written in the source — never translate or transliterate them
 - Use the appropriate formal register for the target language:
   • JP: polite keigo (〜でございます, いただきありがとうございます).
        FORMATTING (Japanese reading conventions):
@@ -254,10 +268,11 @@ def validate_reply(reply_text: str, language: str = "EN") -> tuple[bool, str]:
 def generate_reply(intent: str, language: str, customer_name: str, cancel_result: dict) -> str:
     """Cancellation confirmation reply — exact master template, translated."""
     sub_type = cancel_result.get("subscription_type")
+    brand_phrase = cancel_result.get("brand_phrase")
     if sub_type == "trial" or intent == "TRIAL_CANCELLATION":
-        master = _master_trial_cancel()
+        master = _master_trial_cancel(brand_phrase)
     else:
-        master = _master_sub_cancel()
+        master = _master_sub_cancel(brand_phrase)
     return _translate(master, language)
 
 
@@ -270,9 +285,10 @@ def english_fallback_reply(intent: str, cancel_result: dict) -> str:
     wondering whether their cancellation went through.
     """
     sub_type = cancel_result.get("subscription_type")
+    brand_phrase = cancel_result.get("brand_phrase")
     if sub_type == "trial" or intent == "TRIAL_CANCELLATION":
-        return _master_trial_cancel()
-    return _master_sub_cancel()
+        return _master_trial_cancel(brand_phrase)
+    return _master_sub_cancel(brand_phrase)
 
 
 # ── AN-192 refund reply templates (would-be / shadow) ──────────────────── #

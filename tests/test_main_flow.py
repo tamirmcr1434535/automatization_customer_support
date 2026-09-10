@@ -10,8 +10,8 @@ Scenarios:
   C. Intent not handled (REFUND_REQUEST) → skipped_not_handled
   D. Low confidence → escalated_low_confidence
   E. WooCommerce handles trial → success, cancel_source=woocommerce
-  F. WooCommerce not_found → Stripe success → cancel_source=stripe
-  G. WooCommerce no_active_sub → Stripe success → cancel_source=stripe
+  F. WooCommerce not_found → escalated (Stripe fallback removed 2026-09-10)
+  G. WooCommerce no_active_sub → escalated (Stripe fallback removed 2026-09-10)
   H. Full SUB_CANCELLATION via WooCommerce paid sub → success
   I. Not found anywhere → ask for card digits, ticket set to pending
   J. Not found anywhere → awaiting_card_digits tag added, ticket NOT solved
@@ -588,41 +588,41 @@ class TestProcess:
         assert result["status"] == "success"
         assert result["cancel_source"] == "woocommerce"
 
-    # F. WooCommerce not_found → Stripe success
+    # F/G. WooCommerce not_found / no_active_sub → escalate.
+    # These two used to assert a Stripe fallback. The Stripe integration was
+    # removed on 2026-09-10: its live key had expired, and over the previous
+    # 180 days it produced zero cancellations and caught zero gateway
+    # desyncs. Both outcomes now go straight to a human.
     @patch.object(main, "log_result")
-    @patch.object(main, "validate_reply", return_value=(True, ""))
-    @patch.object(main, "generate_reply", return_value="Subscription cancelled.")
-    @patch.object(main, "stripe_cli")
+    @patch.object(main, "slack")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification(intent="SUB_CANCELLATION"))
     @patch.object(main, "zendesk")
-    def test_woo_not_found_stripe_fallback(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_validate, mock_log
+    def test_woo_not_found_escalates_without_stripe(
+        self, mock_zd, mock_cls, mock_woo, mock_slack, mock_log
     ):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_not_found()
-        mock_stripe.cancel_subscription.return_value = _stripe_cancelled()
         result = main._process("1005")
-        assert result["status"] == "success"
-        assert result["cancel_source"] == "stripe"
+        assert result["status"] == "escalated_not_found"
+        assert result.get("cancel_source") != "stripe"
+        mock_zd.post_reply.assert_not_called()
 
-    # G. WooCommerce no_active_sub → Stripe success
     @patch.object(main, "log_result")
-    @patch.object(main, "validate_reply", return_value=(True, ""))
-    @patch.object(main, "generate_reply", return_value="Subscription cancelled.")
-    @patch.object(main, "stripe_cli")
+    @patch.object(main, "slack")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification(intent="SUB_CANCELLATION"))
     @patch.object(main, "zendesk")
-    def test_woo_no_active_sub_stripe_fallback(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_reply, mock_validate, mock_log
+    def test_woo_no_active_sub_escalates_without_stripe(
+        self, mock_zd, mock_cls, mock_woo, mock_slack, mock_log
     ):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_no_active()
-        mock_stripe.cancel_subscription.return_value = _stripe_cancelled()
         result = main._process("1006")
-        assert result["cancel_source"] == "stripe"
-        assert result["status"] == "success"
+        assert result.get("cancel_source") != "stripe"
+        # WC knows the customer but has nothing live for them — a human decides.
+        assert result["status"] == "manual_review_required"
+        mock_zd.post_reply.assert_not_called()
 
     # H. Full SUB_CANCELLATION via WooCommerce paid sub
     @patch.object(main, "log_result")
@@ -650,16 +650,14 @@ class TestProcess:
     # gets NO reply; a human picks the ticket up from Slack.
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
-    @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
     def test_not_found_anywhere_escalates_silently(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
+        self, mock_zd, mock_cls, mock_woo, mock_slack, mock_log
     ):
         _setup_zd(mock_zd, ticket=make_zendesk_ticket(email="ghost@example.com"))
         mock_woo.cancel_subscription.return_value = _woo_not_found("ghost@example.com")
-        mock_stripe.cancel_subscription.return_value = _stripe_not_found("ghost@example.com")
         result = main._process("1008")
         assert result["status"] == "escalated_not_found"
         assert result["action"] == "slack_alerted_not_found"
@@ -672,16 +670,14 @@ class TestProcess:
     #    opened (no customer reply → Open would hurt agent reply-rate; Anna 2026-08-05).
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
-    @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
     def test_not_found_reopens_ticket_with_escalation_tags(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
+        self, mock_zd, mock_cls, mock_woo, mock_slack, mock_log
     ):
         _setup_zd(mock_zd)
         mock_woo.cancel_subscription.return_value = _woo_not_found()
-        mock_stripe.cancel_subscription.return_value = _stripe_not_found()
         main._process("1009")
         mock_zd.solve_ticket.assert_not_called()
         mock_zd.post_reply.assert_not_called()
@@ -697,18 +693,16 @@ class TestProcess:
     # escalation path (internal note + set_open + tags all target the same id).
     @patch.object(main, "log_result")
     @patch.object(main, "slack")
-    @patch.object(main, "stripe_cli")
     @patch.object(main, "woo")
     @patch.object(main, "classify_ticket", return_value=_classification())
     @patch.object(main, "zendesk")
     def test_not_found_escalation_uses_correct_ticket_id(
-        self, mock_zd, mock_cls, mock_woo, mock_stripe, mock_slack, mock_log
+        self, mock_zd, mock_cls, mock_woo, mock_slack, mock_log
     ):
         _setup_zd(mock_zd, ticket=make_zendesk_ticket(
             ticket_id="5555", email="specific@example.com"
         ))
         mock_woo.cancel_subscription.return_value = _woo_not_found("specific@example.com")
-        mock_stripe.cancel_subscription.return_value = _stripe_not_found("specific@example.com")
         result = main._process("5555")
         assert result["status"] == "escalated_not_found"
         # No customer reply → leave the ticket NEW, do NOT set Open (Anna 2026-08-05).
@@ -2198,9 +2192,22 @@ def test_llm_disambiguated_refund_not_auto_executed():
     assert result["refund_decision"] == "YES"                      # engine still says would-refund
     assert result["refund_disambig_charge"] == "ch_sub"
     assert result.get("refund_reply_suppressed") == "cross_sale_ambiguous_route"
+    # The two inputs the guard fired on are recorded, so the log can be asked
+    # whether the guard's premise holds instead of only whether it fired.
+    assert result.get("refund_has_cross_or_first") is True
+    assert result.get("refund_soft_routed") is True
     assert "refund_draft_reply" not in result                      # suppressed → no draft
     rcm.create_refund.assert_not_called()                          # no auto money move
     zd.post_reply.assert_not_called()                              # no auto approve reply
+    # TRIPWIRE on the DEFAULT. Guard 2b runs before any draft is built, so with
+    # REFUND_SOFT_ROUTE_APPROVE_LANGS empty — which is the shipped default, and
+    # what this test runs under — nothing reaches the execution gate at all.
+    # Both gates now key off the same `_soft_route_ok` predicate, so a language
+    # added to that allowlist opens them together and deliberately (see
+    # tests/test_soft_route_approve_relaxation.py). If this assertion fails, the
+    # DEFAULT changed: the cohort would be auto-answered everywhere, including
+    # the JP/DE slice measured at 17/26, without anyone choosing that.
+    assert "refund_execution_status" not in result
 
 
 def test_refund_explanation_question_uses_explained_template():
@@ -2226,6 +2233,10 @@ def test_refund_explanation_question_uses_explained_template():
             as_of_date="2026-07-24T00:00:00Z")
     assert result["refund_reason_code"] == "OUTSIDE_REFUND_WINDOW"  # engine unchanged
     assert "refund_reply_suppressed" not in result                  # NOT suppressed — explained instead
+    # Recorded even when nothing is suppressed — a guard input is only useful as
+    # a measurement if the negative case is in the log too.
+    assert result.get("refund_soft_routed") is False
+    assert result.get("refund_has_cross_or_first") is False
     assert result.get("refund_draft_reply") == "DRAFT"              # explained draft generated
     # the explained variant was requested (explain_charge flag passed through)
     _rc, _lang, _data = gen.call_args.args
