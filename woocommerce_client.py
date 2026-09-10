@@ -1424,6 +1424,15 @@ class WooCommerceClient:
         nexus_signals = {
             "nexus_sub_started": sub_started,
             "nexus_renewals": n_renewals,
+            # Product SITE the subscription lives on, e.g. "16types.ai/ja".
+            # Nexus searches by email across EVERY brand, so the sub it returns
+            # is not necessarily on the site the customer emailed — this host is
+            # how main.py names the right product in the cancellation reply
+            # (#191696: emailed IQ Pro, subscription was a 16 Types Growth Plan,
+            # reply said "IQ Booster"). May be absent on older WC/PayPal
+            # records; main.py falls back to the plan name, then to the Zendesk
+            # brand.
+            "nexus_host": (nexus_data.get("host") or ""),
         }
 
         # `order_count` for downstream code mirrors legacy WC semantics:

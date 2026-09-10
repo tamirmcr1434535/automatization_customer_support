@@ -295,6 +295,65 @@ def _host_to_brand(host: str) -> str:
     return ""
 
 
+# ── Subscription plan name → brand_key (cancellation product resolution) ── #
+# Fallback for the cancel path when Nexus returns no `host` (older WooCommerce /
+# PayPal records). The WC line-item name IS the product the customer bought,
+# e.g. "16 Types Growth Plan", so it identifies the brand even when the host is
+# missing. Matched on a marker substring, never shown to the customer verbatim —
+# an unrecognised plan name resolves to "" and the reply keeps its default
+# wording rather than quoting an internal SKU at the customer.
+_PLAN_BRAND_MARKERS = [
+    ("16 types",     "16types"),
+    ("16types",      "16types"),
+    ("16 person",    "16personas"),
+    ("16personas",   "16personas"),
+    ("16 persons",   "16personas"),
+    ("personality",  "wwpersonalitytest"),
+    ("iq pro",       "iqpro"),
+    ("iqpro",        "iqpro"),
+    ("iq booster",   "iqbooster"),
+    ("iqbooster",    "iqbooster"),
+]
+
+
+def _plan_to_brand(plan: str) -> str:
+    """Map a WooCommerce subscription plan name to our brand_key, or ""."""
+    p = (plan or "").lower()
+    for marker, brand in _PLAN_BRAND_MARKERS:
+        if marker in p:
+            return brand
+    return ""
+
+
+def _cancelled_product_brand(cancel_result: dict, zendesk_brand: str) -> tuple[str, str]:
+    """Brand_key of the subscription that was actually cancelled, and where it
+    came from.
+
+    Nexus `search-subscription` looks an email up across EVERY brand, so the
+    subscription the bot cancels is not necessarily on the site the customer
+    wrote to. Until 2026-09-10 the cancellation reply ignored that completely:
+    the product name came from the module-level BRAND_NAME env var, one value
+    for the whole deployment. #191696 — customer emailed IQ Pro, had no IQ Pro
+    registration at all, owned a 16 Types Growth Plan, and was told their
+    "IQ Booster subscription" had been cancelled: three different brands in one
+    exchange.
+
+    Resolution order mirrors the refund path (`_host_to_brand` on the charge
+    host), with the plan name as the fallback the refund path doesn't need:
+      1. Nexus `host`   — authoritative product site, absent on old records
+      2. WC plan name   — the product the customer actually bought
+      3. Zendesk brand  — the inbox they wrote to (previous behaviour)
+    """
+    host = (cancel_result or {}).get("nexus_host") or ""
+    brand = _host_to_brand(host)
+    if brand:
+        return brand, "nexus_host"
+    brand = _plan_to_brand((cancel_result or {}).get("plan") or "")
+    if brand:
+        return brand, "plan_name"
+    return (zendesk_brand or ""), "zendesk_brand"
+
+
 def _charge_host_brand(nexus_data, candidate_charge_id: str) -> str:
     """Brand_key from the refunded charge's `host` — prefer the candidate charge
     (the one being refunded), else any charge, else the subscription-level host.
@@ -1595,6 +1654,22 @@ HANDLED_INTENTS = {
 _PURE_DISPUTE_INTENTS = {
     "CHARGEBACK_THREAT",  # customer threatening / filing chargeback, or legal threat
     "PAYPAL_DISPUTE",     # PayPal dispute already opened
+}
+
+# Account/data-deletion intents (GDPR). The classifier emits DELETE_ALL_DATA
+# (see classifier.py "ALWAYS → DELETE_ALL_DATA"); the UNKNOWN safety net below
+# emits DELETE_ACCOUNT. Both mean the same thing and both must reach the
+# escalation branch.
+#
+# 2026-09-10 (#193095): only DELETE_ACCOUNT was ever checked, so every
+# classifier-produced DELETE_ALL_DATA fell through to the "not a cancellation"
+# silent skip — no tag, no note, no escalation. Over the 90 days to 2026-09-10
+# that was 1107 data-deletion requests handled by nobody, against 57 that
+# reached this branch via the safety net. Matching on a SET rather than a single
+# literal is what keeps a future third spelling from re-opening the same hole.
+_DELETE_INTENTS = {
+    "DELETE_ACCOUNT",
+    "DELETE_ALL_DATA",
 }
 
 # Tags set by the retired card-digits flow. A ticket carrying any of these
@@ -3319,6 +3394,27 @@ def _process(ticket_id: str) -> dict:
                 _customer_text_only += " " + all_comments
         except Exception:
             log.warning(f"[{ticket_id}] Failed to fetch comments for refund check")
+
+    # Text the money-disqualifier guards scan: EVERYTHING the customer wrote,
+    # subject included.
+    #
+    # `_customer_text_only` deliberately drops the subject, because the cancel-
+    # signal checks would over-fire on contact-form subjects ("IQ Booster
+    # Help Form"). But the amount+currency check is a DISQUALIFIER — the more
+    # of the customer's text it reads, the more conservative the bot gets — and
+    # running it on the body alone made it blind to the one place customers most
+    # often name a charge.
+    #
+    # #192984 (2026-09-09): subject "1990원 결제했는데 14990은 뭐죠?" — paid 1,990
+    # KRW, charged 14,990, "what is this?". Body carried only the cancel demand.
+    # The classifier read it correctly as REFUND_REQUEST (88%), but the
+    # already-cancelled remap below saw no refund word (the customer never wrote
+    # 환불) and no amount (it was in the subject this guard never received), so
+    # it auto-cancelled and sent a plain trial-cancellation confirmation that
+    # said nothing about the 14,990 the customer was asking about. `원` was in
+    # the currency list all along — the text just never reached the regex.
+    _money_scan_text = subject + " " + _customer_text_only
+
     _has_refund_kw = intent in HANDLED_INTENTS and _contains_refund_request(_all_text_for_refund)
 
     # ── Carve-out (#169289): unauthorized-signup, STOP-FUTURE-ONLY cancellation ──
@@ -3631,7 +3727,7 @@ def _process(ticket_id: str) -> dict:
         # a money question in play, even if some future phrasing slips past the
         # keyword list — fail toward escalation, not an incomplete auto-reply.
         if (not result["refund_ask_in_text"]
-                and not _contains_amount_with_currency(_customer_text_only)
+                and not _contains_amount_with_currency(_money_scan_text)
                 and _contains_cancel_signal(_customer_text_only)):
             log.info(
                 f"[{ticket_id}] {intent}: no refund ask, but customer wants the "
@@ -3681,10 +3777,11 @@ def _process(ticket_id: str) -> dict:
 
     # ── NORMAL CANCELLATION FLOW ──────────────────────────────────────── #
 
-    # 3d. DELETE_ACCOUNT — customer wants account/data deletion (GDPR/privacy).
-    # Bot cannot handle this automatically — escalate to human agent.
-    if intent == "DELETE_ACCOUNT":
-        log.info(f"[{ticket_id}] DELETE_ACCOUNT — escalating to agent for data deletion")
+    # 3d. Account/data deletion (GDPR/privacy) — DELETE_ACCOUNT from the safety
+    # net, DELETE_ALL_DATA from the classifier. Bot cannot handle this
+    # automatically — escalate to human agent.
+    if intent in _DELETE_INTENTS:
+        log.info(f"[{ticket_id}] {intent} — escalating to agent for data deletion")
 
         current_tags = zendesk.get_ticket_tags(ticket_id)
         if "bot_handled" in current_tags:
@@ -3697,7 +3794,7 @@ def _process(ticket_id: str) -> dict:
         zendesk.add_tag(ticket_id, "needs_manual_review")
         zendesk.add_internal_note(
             ticket_id,
-            f"🤖 Bot: customer requests account deletion (DELETE_ACCOUNT, "
+            f"🤖 Bot: customer requests account deletion ({intent}, "
             f"confidence {confidence:.0%}). Requires manual handling — "
             f"data deletion per privacy policy.",
         )
@@ -3743,8 +3840,27 @@ def _process(ticket_id: str) -> dict:
         return result
 
     # 4b. Skip other unhandled intents (GENERAL_QUESTION, EXPLANATION, SPAM, etc.)
+    #
+    # The skip is correct — these are not cancellations — but until 2026-09-10
+    # it left NO trace on the ticket at all (#193082). An agent opening the
+    # ticket could not tell whether the bot had triaged it and stepped back or
+    # had never seen it, and the bot-processed counters (which read Zendesk
+    # tags, not BigQuery) missed the ~870 tickets a month that land here.
+    #
+    # The marker is deliberately NOT `bot_handled`: that tag is a hard
+    # idempotency lock (`2a` above blocks all re-processing) AND the 24h
+    # per-requester spam guard in `was_recently_handled`. Tagging a skip with it
+    # would mean a customer whose "what is my IQ score?" question was skipped
+    # could no longer get an automatic cancellation on that same ticket, or on
+    # any ticket they open in the next 24 hours. `bot_skipped` is a marker only
+    # — nothing reads it as a lock.
     if intent not in HANDLED_INTENTS:
         log.info(f"[{ticket_id}] Skip — not a cancellation ({intent})")
+        try:
+            zendesk.add_tag(ticket_id, "bot_skipped")
+        except Exception as e:  # noqa: BLE001 — a missing marker must never
+            # turn a clean skip into a failed run
+            log.warning(f"[{ticket_id}] bot_skipped tag failed: {e}")
         result["status"] = "skipped_not_handled"
         log_result(result)
         return result
@@ -3780,7 +3896,7 @@ def _process(ticket_id: str) -> dict:
             and _contains_cancel_signal(_all_text_for_refund)
             and not _contains_strong_refund_signal(_all_text_for_refund)
             and not _contains_delete_account_signal(_all_text_for_refund)
-            and not _contains_amount_with_currency(_customer_text_only)
+            and not _contains_amount_with_currency(_money_scan_text)
             and not classification.get("chargeback_risk")):
         _orig_conf = confidence
         confidence = 0.85
@@ -3832,7 +3948,7 @@ def _process(ticket_id: str) -> dict:
             and confidence < 0.80
             and not _contains_strong_refund_signal(_all_text_for_refund)
             and not _contains_delete_account_signal(_all_text_for_refund)
-            and not _contains_amount_with_currency(_customer_text_only)
+            and not _contains_amount_with_currency(_money_scan_text)
             and not classification.get("chargeback_risk")):
         _orig_conf = confidence
         confidence = 0.85
@@ -3876,7 +3992,7 @@ def _process(ticket_id: str) -> dict:
             and _contains_cancel_signal(_all_text_for_refund)
             and not _contains_strong_refund_signal(_all_text_for_refund)
             and not _contains_delete_account_signal(_all_text_for_refund)
-            and not _contains_amount_with_currency(_customer_text_only)
+            and not _contains_amount_with_currency(_money_scan_text)
             and not classification.get("chargeback_risk")):
         _sub_check = _quick_subscription_check(email, ticket_id)
         if _sub_check == "exists":
@@ -4180,7 +4296,8 @@ def _process(ticket_id: str) -> dict:
                 f"(sub={stripe_result.get('subscription_id')}).",
             )
             return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result
+                ticket_id, name, language, final_intent, cancel_result, result,
+                zendesk_brand=_zendesk_brand_key(ticket),
             )
 
         # No working alt email and Stripe didn't help → Slack alert for manual review
@@ -4270,7 +4387,8 @@ def _process(ticket_id: str) -> dict:
                 f"(sub={stripe_result.get('subscription_id')}).",
             )
             return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result
+                ticket_id, name, language, final_intent, cancel_result, result,
+                zendesk_brand=_zendesk_brand_key(ticket),
             )
 
         if stripe_status == "no_active_sub":
@@ -4363,7 +4481,10 @@ def _process(ticket_id: str) -> dict:
 
     # 9. Found → generate reply, tag, solve
     # (order count gate is inside _finish_cancellation — covers all paths)
-    return _finish_cancellation(ticket_id, name, language, intent, cancel_result, result)
+    return _finish_cancellation(
+        ticket_id, name, language, intent, cancel_result, result,
+        zendesk_brand=_zendesk_brand_key(ticket),
+    )
 
 
 # ── Card digits handler ───────────────────────────────────────────────── #
@@ -4639,6 +4760,7 @@ def _finish_cancellation(
     intent: str,
     cancel_result: dict,
     result: dict,
+    zendesk_brand: str = "",
 ) -> dict:
     """Generate reply, tag, and solve the ticket after a successful cancellation.
 
@@ -4706,6 +4828,43 @@ def _finish_cancellation(
         })
         log_result(result)
         return result
+
+    # ── Name the product the customer actually owns ───────────────────── #
+    # The lookup is cross-brand (Nexus searches an email across every brand),
+    # so the subscription just cancelled may live on a different site than the
+    # inbox the customer wrote to. Resolve the product from the subscription
+    # itself and let the reply name THAT, the way the refund path already
+    # names the product from the charge host. Only brands with a phrase Anna
+    # has confirmed are substituted — anything else keeps the deployment
+    # default, so an unconfirmed brand can never invent a product name.
+    _product_brand, _brand_via = _cancelled_product_brand(cancel_result, zendesk_brand)
+    _brand_phrase = _BRAND_PHRASE.get(_product_brand)
+    if _brand_phrase:
+        cancel_result["brand_phrase"] = _brand_phrase
+    if _product_brand and zendesk_brand and _product_brand != zendesk_brand:
+        # Anna 2026-09-10 (#191696): the agent must see that the customer wrote
+        # to one brand and owns a subscription on another — that mismatch is
+        # exactly what made the old reply read as nonsense to the customer.
+        log.info(
+            f"[{ticket_id}] cross-brand cancellation: contacted "
+            f"{zendesk_brand!r}, subscription belongs to {_product_brand!r} "
+            f"(via {_brand_via}, plan={cancel_result.get('plan')!r}) — "
+            f"reply names {_brand_phrase or 'the deployment default'}"
+        )
+        try:
+            zendesk.add_internal_note(
+                ticket_id,
+                f"🤖 Bot: the customer wrote to {zendesk_brand}, but the "
+                f"subscription found and cancelled belongs to {_product_brand} "
+                f"(plan: {cancel_result.get('plan') or 'unknown'}). They have no "
+                f"subscription on {zendesk_brand}. The reply names the product "
+                f"they actually own."
+                + ("" if _brand_phrase else
+                   f" NOTE: no confirmed product name for {_product_brand} yet, "
+                   f"so the reply used the default wording — worth confirming.")
+            )
+        except Exception as e:  # noqa: BLE001 — visibility must not block the reply
+            log.warning(f"[{ticket_id}] cross-brand note failed: {e}")
 
     reply_text = generate_reply(
         intent=intent,
