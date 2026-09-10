@@ -46,7 +46,6 @@ from refund_client import RefundClient
 from nexus_client import NexusLookupError
 from zendesk_client import ZendeskClient, TicketNotWritableError
 from woocommerce_client import WooCommerceClient
-from stripe_client import StripeClient
 from slack_client import SlackClient
 import ticket_merger
 import reply_generator
@@ -2325,10 +2324,6 @@ if USE_NEXUS_FOR_LOOKUP:
         USE_NEXUS_FOR_LOOKUP = False
     else:
         log.info("Nexus lookup enabled — using apinexus.cellon.ai for subscription search")
-stripe_cli = StripeClient(
-    api_key=os.getenv("STRIPE_SECRET_KEY"),
-    dry_run=DRY_RUN,
-)
 slack = SlackClient(
     bot_token=os.getenv("SLACK_BOT_TOKEN", ""),
     target_email=os.getenv("SLACK_TARGET_EMAIL", ""),
@@ -4261,47 +4256,8 @@ def _process(ticket_id: str) -> dict:
         if alt_found:
             return alt_found
 
-        # ── Stripe fallback for no_active_sub ─────────────────────────── #
-        # WC found the customer but no active subscription. Try Stripe —
-        # the sub might be managed in Stripe but not reflected in WC.
-        # Try primary email first, then alt emails from ticket body/comments.
-        emails_to_try_stripe = [email] + _extract_emails(search_text, exclude=email)
-        stripe_result = None
-        stripe_status = ""
-        tried_stripe_email = email
-        for stripe_email in emails_to_try_stripe:
-            log.info(f"[{ticket_id}] No alt email in WC → trying Stripe by email: {stripe_email}")
-            stripe_result = stripe_cli.cancel_subscription(stripe_email)
-            stripe_status = stripe_result.get("status", "")
-            tried_stripe_email = stripe_email
-            if stripe_status not in ("not_found", "no_active_sub", "error"):
-                break  # found it
-
-        if stripe_status not in ("not_found", "no_active_sub", "error"):
-            alt_note = ""
-            if tried_stripe_email != email:
-                alt_note = f" (via alt email {tried_stripe_email} found in ticket)"
-            log.info(
-                f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
-                f"sub {stripe_result.get('subscription_id')} for {tried_stripe_email}"
-            )
-            cancel_result = {**stripe_result, "source": "stripe"}
-            result["cancel_source"] = "stripe"
-            final_intent = _resolve_intent(intent, cancel_result)
-            result["intent"] = final_intent
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: found in WooCommerce but no active sub. "
-                f"Cancelled in Stripe directly{alt_note} "
-                f"(sub={stripe_result.get('subscription_id')}).",
-            )
-            return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result,
-                zendesk_brand=_zendesk_brand_key(ticket),
-            )
-
-        # No working alt email and Stripe didn't help → Slack alert for manual review
-        log.info(f"[{ticket_id}] No alt email / Stripe worked → Slack alert + escalate to agent")
+        # No working alt email → Slack alert for manual review.
+        log.info(f"[{ticket_id}] No alt email found → Slack alert + escalate to agent")
 
         # Race condition guard: re-fetch tags to prevent duplicate Slack alerts
         # when Zendesk fires multiple webhooks in rapid succession (same fix as card-digits).
@@ -4348,51 +4304,6 @@ def _process(ticket_id: str) -> dict:
         alt_found = _try_alt_emails(ticket_id, email, search_text, intent, name, language, result)
         if alt_found:
             return alt_found
-
-        # ── Stripe email-based fallback ──────────────────────────────── #
-        # Before asking for card digits, try Stripe directly by email.
-        # Stripe Customer.list(email=) is fast and reliable, and may find
-        # the subscription even when WooCommerce billing_email lookup fails
-        # (common when WC stores the email only in _billing_email post meta).
-        # Try primary email first, then alt emails from ticket body/comments.
-        emails_to_try_stripe = [email] + _extract_emails(search_text, exclude=email)
-        stripe_result = None
-        stripe_status = ""
-        tried_stripe_email = email
-        for stripe_email in emails_to_try_stripe:
-            log.info(f"[{ticket_id}] WC not found → trying Stripe by email: {stripe_email}")
-            stripe_result = stripe_cli.cancel_subscription(stripe_email)
-            stripe_status = stripe_result.get("status", "")
-            tried_stripe_email = stripe_email
-            if stripe_status not in ("not_found", "no_active_sub", "error"):
-                break  # found it
-
-        if stripe_status not in ("not_found", "no_active_sub", "error"):
-            # ✅ Stripe found and cancelled the subscription
-            alt_note = ""
-            if tried_stripe_email != email:
-                alt_note = f" (via alt email {tried_stripe_email} found in ticket)"
-            log.info(
-                f"[{ticket_id}] ✅ Stripe fallback: cancelled {stripe_result.get('subscription_type')} "
-                f"sub {stripe_result.get('subscription_id')} for {tried_stripe_email}"
-            )
-            cancel_result = {**stripe_result, "source": "stripe"}
-            result["cancel_source"] = "stripe"
-            final_intent = _resolve_intent(intent, cancel_result)
-            result["intent"] = final_intent
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖 Bot: not found in WooCommerce by email ({email}). "
-                f"Found and cancelled in Stripe directly{alt_note} "
-                f"(sub={stripe_result.get('subscription_id')}).",
-            )
-            return _finish_cancellation(
-                ticket_id, name, language, final_intent, cancel_result, result,
-                zendesk_brand=_zendesk_brand_key(ticket),
-            )
-
-        if stripe_status == "no_active_sub":
-            log.info(f"[{ticket_id}] Stripe: no active sub for any email tried")
 
         # ── Not found anywhere → escalate to human (Slack only, NO customer reply) ──
         # Previously this asked the customer for last 4 card digits, but that flow
@@ -4453,32 +4364,19 @@ def _process(ticket_id: str) -> dict:
         result["intent"] = intent
         log.info(f"[{ticket_id}] Final intent after data lookup: {intent}")
 
-    # ── Payment-gateway safety net (#147892) ──────────────────────────── #
-    # WooCommerce reporting "cancelled" does NOT prove the money actually
-    # stopped: the WC subscription record and the Stripe subscription object
-    # can desync — WC cancels locally (and answers our PUT with
-    # status=cancelled, so the sanity check in _cancel_sub_by_id passes) while
-    # the Stripe subscription keeps renewing on its own schedule.
+    # ── Payment-gateway safety net (#147892) — REMOVED 2026-09-10 ─────── #
+    # This used to re-check Stripe after a WooCommerce cancellation, because
+    # the two can desync: WC cancels locally while the Stripe subscription
+    # keeps renewing (incident #147892 — two 5490 JPY charges after the bot
+    # had promised none).
     #
-    # Live incident #147892: bot cancelled WC sub #3522734 on 2026-06-23 and
-    # told the customer "no further charges will be made"; Stripe then charged
-    # 5490 JPY on 2026-07-12 AND again on 2026-08-09 (provider=Stripe, host
-    # jap.wwiqtest.com). A human found it two months later and had to refund
-    # both cycles. The bot never looked at Stripe because that lookup only runs
-    # as a FALLBACK when WC finds nothing.
+    # It was removed with the rest of the Stripe integration. The live API key
+    # had expired, so every ticket logged "Expired API Key provided" and the
+    # check had in fact been dead for some time: over the 180 days to
+    # 2026-09-10, zero cancellations came from Stripe and zero desyncs were
+    # caught. Disputes and charge state now come from the refund API
+    # (Yaroslav, 2026-09-10), which is the one source the bot still reads.
     #
-    # The reply we are about to send promises no further charges, so verify
-    # that promise before making it: if Stripe still has an active/trialing
-    # subscription for this customer, cancel it too (same graceful
-    # cancel_at_period_end the Stripe path already uses, which matches the
-    # reply's "you keep access until the paid period ends" wording).
-    #
-    # Strictly additive and fail-open: any error here is logged and ignored,
-    # leaving the pre-existing behaviour exactly as it was.
-    _cancel_leftover_stripe_sub(
-        ticket_id, cancel_result.get("email") or email, cancel_result, result
-    )
-
     # 9. Found → generate reply, tag, solve
     # (order count gate is inside _finish_cancellation — covers all paths)
     return _finish_cancellation(
@@ -4660,97 +4558,6 @@ def _resolve_intent(text_intent: str, cancel_result: dict) -> str:
         return "SUB_CANCELLATION"
     # Fallback: use whatever the text classifier said
     return text_intent
-
-
-def _cancel_leftover_stripe_sub(
-    ticket_id: str, email: str, cancel_result: dict, result: dict
-) -> None:
-    """After WooCommerce reports the subscription cancelled, make sure Stripe
-    isn't still billing it (#147892 — see the call site for the incident).
-
-    WC and the gateway can desync, and the customer is about to be told "no
-    further charges will be made". If Stripe still holds an active/trialing
-    subscription for this customer, cancel it too and record what happened on
-    the ticket + in `result` (BQ) so a human can audit it — a customer with a
-    genuinely separate second subscription would show up here too, and the note
-    is what lets support spot that case.
-
-    Never raises: on any error the WC cancellation stands exactly as before."""
-    if not email:
-        return
-    try:
-        found = stripe_cli.find_active_subscription(email)   # READ-ONLY
-    except Exception as e:  # noqa: BLE001 — safety net must never break the flow
-        log.warning(f"[{ticket_id}] Stripe leftover check failed (non-blocking): {e}")
-        return
-
-    status = (found or {}).get("status", "")
-    # Healthy cases — the gateway agrees with WooCommerce:
-    #   not_found      → no Stripe customer at all
-    #   no_active_sub  → nothing live, or everything live is already scheduled
-    #                    to end (cancel_at_period_end — a gracefully cancelled
-    #                    Stripe sub STAYS status=active until the period ends,
-    #                    which is exactly why we check that flag and not status)
-    if status in ("not_found", "no_active_sub"):
-        return
-    if status == "error":
-        log.warning(
-            f"[{ticket_id}] Stripe leftover check errored for {email}: "
-            f"{str((found or {}).get('error', ''))[:200]}"
-        )
-        return
-
-    # status == "billing": a subscription that will KEEP renewing, even though
-    # WooCommerce just said the customer is cancelled. Cancel that exact one.
-    stripe_sub_id = (found or {}).get("subscription_id", "")
-    try:
-        cancelled = stripe_cli.cancel_subscription_by_id(stripe_sub_id)
-    except Exception as e:  # noqa: BLE001
-        log.warning(f"[{ticket_id}] Stripe leftover cancel failed (non-blocking): {e}")
-        return
-    if (cancelled or {}).get("status") == "error":
-        log.error(
-            f"[{ticket_id}] GATEWAY DESYNC but Stripe cancel FAILED for "
-            f"{stripe_sub_id} — customer may keep being charged"
-        )
-        try:
-            zendesk.add_internal_note(
-                ticket_id,
-                f"🤖🚨 WooCommerce reported the subscription cancelled, but Stripe "
-                f"still has an ACTIVE subscription ({stripe_sub_id}) for {email} "
-                f"that will keep charging — and the bot could NOT cancel it "
-                f"({str((cancelled or {}).get('error', ''))[:200]}). The customer "
-                f"has been told there will be no further charges. Please cancel it "
-                f"in Stripe manually.",
-            )
-        except Exception:  # noqa: BLE001
-            pass
-        result["stripe_leftover_cancel_failed"] = True
-        return
-
-    result["stripe_leftover_cancelled"] = True
-    result["stripe_leftover_subscription_id"] = stripe_sub_id
-    log.warning(
-        f"[{ticket_id}] GATEWAY DESYNC: WC reported the subscription cancelled "
-        f"(#{cancel_result.get('subscription_id')}) but Stripe still had an "
-        f"active/trialing subscription ({stripe_sub_id}) for {email} — "
-        f"cancelled it too so the 'no further charges' promise holds"
-    )
-    try:
-        zendesk.add_internal_note(
-            ticket_id,
-            f"🤖⚠️ Gateway desync caught: WooCommerce reported subscription "
-            f"#{cancel_result.get('subscription_id')} as cancelled, but Stripe "
-            f"still had an ACTIVE subscription ({stripe_sub_id}) for {email}. "
-            f"The bot cancelled the Stripe one as well, so billing really stops "
-            f"(this is the #147892 failure mode: WC cancelled, Stripe kept "
-            f"charging for two more months).\n\n"
-            f"If this customer intentionally had a SECOND, separate "
-            f"subscription, please re-activate it — the bot cannot tell the two "
-            f"cases apart.",
-        )
-    except Exception as e:  # noqa: BLE001 — note is best-effort
-        log.warning(f"[{ticket_id}] gateway-desync note failed: {e}")
 
 
 def _finish_cancellation(

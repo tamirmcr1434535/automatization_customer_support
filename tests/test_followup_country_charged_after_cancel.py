@@ -183,16 +183,13 @@ def _process_ticket(ticket_id, subject, body, intent="TRIAL_CANCELLATION",
         "plan": "IQ Test Monthly", "source": "woocommerce", "country": wc_country,
         "order_count": 1,
     }
-    stripe = MagicMock()
-    stripe.find_active_subscription.return_value = {"status": "no_active_sub"}
-    _MOCKS.update(zd=zd, woo=woo, stripe=stripe)
+    _MOCKS.update(zd=zd, woo=woo)
 
     classification = {"intent": intent, "confidence": 0.95, "language": language,
                       "chargeback_risk": False, "reasoning": "test"}
 
     with patch.object(main, "zendesk", zd), \
          patch.object(main, "woo", woo), \
-         patch.object(main, "stripe_cli", stripe), \
          patch.object(main, "classify_ticket", return_value=classification), \
          patch.object(main, "generate_reply", return_value="Cancelled."), \
          patch.object(main, "validate_reply", return_value=(True, "")), \
