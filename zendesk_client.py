@@ -404,6 +404,27 @@ class ZendeskClient:
             }},
         )
 
+    def get_brands(self) -> list:
+        """Every brand on this Zendesk (id, name, brand_url, subdomain).
+
+        Lets main.py resolve a ticket's numeric `brand_id` to our brand_key
+        without anyone hand-copying ids out of the admin UI — a new brand only
+        has to have a domain the marker list already knows. Same shape as
+        get_ticket_field: fetched once, lazily, and returns [] on any error so
+        the caller falls back to its hard-coded table.
+        """
+        try:
+            resp = self._request_with_retry(
+                "GET", f"{self.base}/brands.json?per_page=100",
+            )
+            if not resp.ok:
+                log.warning(f"get_brands → {resp.status_code}")
+                return []
+            return resp.json().get("brands") or []
+        except Exception as e:  # noqa: BLE001
+            log.warning(f"get_brands error: {e}")
+            return []
+
     def get_ticket_field(self, field_id: int) -> dict | None:
         """Fetch a ticket field definition (incl. custom_field_options).
 
