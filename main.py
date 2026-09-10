@@ -234,18 +234,80 @@ _ZENDESK_BRAND_TO_KEY = {
     27151310564636: "16types",
     18445895176860: "iqbooster",
     23720105185436: "iqpro",
+    29833389342108: "iqtestjp",
     18446370704284: "quickiqtest",
     16656108529948: "wwiqtest",
     18445181123996: "wwpersonalitytest",
 }
 
 
-def _zendesk_brand_key(ticket: dict) -> str:
-    """Brand_key from the Zendesk ticket's brand_id, or '' if absent/unmapped."""
+# Resolved lazily from the Zendesk API for brand_ids the table above does not
+# list. None = not fetched yet.
+_ZENDESK_BRAND_ID_TO_KEY_FETCHED: "dict[int, str] | None" = None
+
+
+def _load_zendesk_brand_ids() -> "dict[int, str]":
+    """{brand_id: brand_key} built from Zendesk's own brand list, once per process.
+
+    The table above has to be hand-maintained: someone reads a numeric id out of
+    the admin UI and pastes it in. A brand nobody pasted resolves to "", and then
+    the refund reply falls back to another brand's legal links — which is exactly
+    what would have happened to IQTEST.JP.
+
+    The bot already holds a Zendesk token, so it can just ask. Each brand's own
+    `brand_url` / `name` goes through the same marker lists that read the domain
+    out of a ticket, so a new brand is picked up automatically as long as its
+    domain is known. A brand that matches nothing stays unresolved — same as
+    today, never a wrong guess.
+
+    Same contract as _load_country_name_to_tag: cached, and {} on any failure so
+    callers fall back to the hard-coded table.
+    """
+    global _ZENDESK_BRAND_ID_TO_KEY_FETCHED
+    if _ZENDESK_BRAND_ID_TO_KEY_FETCHED is not None:
+        return _ZENDESK_BRAND_ID_TO_KEY_FETCHED
+    resolved: "dict[int, str]" = {}
     try:
-        return _ZENDESK_BRAND_TO_KEY.get(int(ticket.get("brand_id")), "")
+        for b in zendesk.get_brands() or []:
+            try:
+                bid = int(b.get("id"))
+            except (TypeError, ValueError):
+                continue
+            # brand_url is the authoritative domain ("https://iqtest.jp"),
+            # but only when it IS the product site: a brand whose url is the
+            # helpdesk itself ("wwiqtest1234.zendesk.com") carries the Zendesk
+            # ACCOUNT name, which here contains "wwiqtest" — matching on that
+            # would file every such brand under WW IQ Test. Skip those and fall
+            # back to the display name ("IQTEST.JP").
+            _url = str(b.get("brand_url") or "")
+            key = ""
+            if "zendesk.com" not in _url.lower():
+                key = _host_to_brand(_url)
+            key = key or _host_to_brand(str(b.get("name") or ""))
+            if key:
+                resolved[bid] = key
+        _ZENDESK_BRAND_ID_TO_KEY_FETCHED = resolved
+        log.info(f"Zendesk brands resolved from API: {len(resolved)} entries")
+    except Exception as e:  # noqa: BLE001 — reporting aid, never blocks a ticket
+        log.warning(f"Failed to load Zendesk brands: {e}")
+        _ZENDESK_BRAND_ID_TO_KEY_FETCHED = {}
+    return _ZENDESK_BRAND_ID_TO_KEY_FETCHED
+
+
+def _zendesk_brand_key(ticket: dict) -> str:
+    """Brand_key from the Zendesk ticket's brand_id, or '' if absent/unknown.
+
+    Hard-coded table first (no API call, correct for the seven brands already
+    listed), then Zendesk's own brand list for anything new.
+    """
+    try:
+        bid = int(ticket.get("brand_id"))
     except (TypeError, ValueError):
         return ""
+    key = _ZENDESK_BRAND_TO_KEY.get(bid, "")
+    if key:
+        return key
+    return _load_zendesk_brand_ids().get(bid, "")
 
 
 # ── Per-brand x-host for the refund API. The DEV API ignores x-host, but PROD
@@ -542,6 +604,11 @@ _REGISTERED_BY_BRAND = {
     "16personas":        ("16_persons_test", "16_persons_cross"),
     "iqpro":             ("iq_pro_test", "iq_pro_test__cross"),
     "16types":           ("16_types_test", "16_types_test_cross"),
+    # Options already existed in Zendesk (read from the field, 2026-09-10).
+    # NB the value really is dotted, unlike every other option here. iqtest.jp
+    # sells no add-on (Anna's pricing sheet: "Add-on: None"), so the +Cross
+    # variant should never fire — mapped anyway so it is right if that changes.
+    "iqtestjp":          ("iqtest.jp", "iqtest.jp_cross"),
 }
 
 
