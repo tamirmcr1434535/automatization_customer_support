@@ -2001,7 +2001,7 @@ def _load_country_name_to_tag() -> dict[str, str]:
 
 
 def _set_registered_for_ticket(
-    ticket_id: str, host_brand: str, cross_sale: bool
+    ticket_id: str, host_brand: str, cross_sale: bool | None
 ) -> None:
     """Set the Zendesk "Registered" field on a cancellation (AN-219).
 
@@ -2021,6 +2021,18 @@ def _set_registered_for_ticket(
     part of the cancellation guarantee.
     """
     if not _ZENDESK_REGISTERED_FIELD_ID:
+        return
+    if cross_sale is None:
+        # We do not know whether the account holds an add-on — the legacy
+        # WooCommerce lookup returns no charge list at all, and that path is
+        # exactly what a `USE_NEXUS_FOR_LOOKUP=false` rollback switches to.
+        # Guessing "no add-on" would write a base value that is wrong for every
+        # cross-sale customer, and a wrong tagger value is worse than a blank
+        # one: nobody re-checks a field that is already filled in.
+        log.info(
+            f"[{ticket_id}] Registered not set — no charge list for this "
+            f"lookup, cross-sale unknown (left to the agent)"
+        )
         return
     value = _registered_value(host_brand, cross_sale)
     if not value:
@@ -4941,9 +4953,13 @@ def _finish_cancellation(
         # after a tagger-field write races Zendesk's read-modify-write on the tag
         # set and can revert the field (#171200).
         zendesk_step = "set_registered"
+        # An ABSENT key means "we never looked" (legacy WC lookup); an empty
+        # list means "we looked and there is no add-on". Only the second is a
+        # fact we may write.
         _set_registered_for_ticket(
             ticket_id, _product_brand,
-            _has_cross_sale(cancel_result.get("nexus_charge_types")),
+            _has_cross_sale(cancel_result["nexus_charge_types"])
+            if "nexus_charge_types" in (cancel_result or {}) else None,
         )
         zendesk_step = "set_country"
         # WooCommerce is the primary source, but plenty of accounts have no
